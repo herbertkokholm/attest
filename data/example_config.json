@@ -1,0 +1,15 @@
+{
+  "vendors": ["anthropic", "openai", "google", "mistral"],
+  "models": {
+    "anthropic": "claude-sonnet-5",
+    "openai": "gpt-5",
+    "google": "gemini-3-pro",
+    "mistral": "mistral-large-3"
+  },
+  "prompts": {
+    "screening": "screening-prompt-v1"
+  },
+  "aggregation": "majority-with-escalation",
+  "tau": 0.6,
+  "x": 4
+}

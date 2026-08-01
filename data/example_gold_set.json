@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "project": "example-systematic-review",
+  "records": [
+    {
+      "id": "rec-001",
+      "title": "Ensemble LLM screening for systematic reviews: a feasibility study",
+      "abstract": "We evaluate whether an ensemble of large language models can perform title and abstract screening at recall comparable to dual human reviewers.",
+      "track": 1,
+      "ids": [{"kind": "doi", "value": "10.1000/example.001"}],
+      "gold_label": 1
+    },
+    {
+      "id": "rec-002",
+      "title": "A randomized trial of an unrelated cardiovascular intervention",
+      "abstract": "This trial evaluates a beta-blocker regimen in patients with heart failure and reports no relevance to evidence screening automation.",
+      "track": 1,
+      "ids": [{"kind": "pmid", "value": "12345678"}],
+      "gold_label": -1
+    },
+    {
+      "id": "rec-002-duplicate",
+      "title": "A randomized trial of an unrelated cardiovascular intervention (duplicate record)",
+      "abstract": "Duplicate database entry for the same trial, carrying the same DOI as rec-002.",
+      "track": 1,
+      "ids": [{"kind": "doi", "value": "10.1000/example.002"}],
+      "gold_label": -1
+    },
+    {
+      "id": "rec-002-original",
+      "title": "A randomized trial of an unrelated cardiovascular intervention",
+      "abstract": "This trial evaluates a beta-blocker regimen in patients with heart failure and reports no relevance to evidence screening automation.",
+      "track": 1,
+      "ids": [{"kind": "doi", "value": "10.1000/example.002"}],
+      "gold_label": -1
+    },
+    {
+      "id": "rec-003",
+      "title": "Conference abstract with no available abstract text",
+      "abstract": "",
+      "track": 1,
+      "ids": [{"kind": "arxiv", "value": "2401.00003"}],
+      "gold_label": 0
+    },
+    {
+      "id": "rec-004",
+      "title": "Active learning for reducing human screening burden in evidence synthesis",
+      "abstract": "We propose an active-learning strategy that prioritizes uncertain records for human review while holding out a random sample for recall auditing.",
+      "track": 2,
+      "ids": []
+    }
+  ]
+}
