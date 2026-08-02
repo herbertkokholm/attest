@@ -284,7 +284,7 @@ def _cmd_screen(args: argparse.Namespace) -> int:
     if args.mode == "sync":
         raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
         ensemble_run = run_ensemble(outcome.kept, raters, config)
-    else:
+    elif args.mode == "batch":
         batch_raters = _build_batch_raters(config, deterministic_seed=args.deterministic_seed)
         submit_batch(outcome.kept, batch_raters, config, store)
         if not args.wait:
