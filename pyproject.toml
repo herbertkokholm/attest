@@ -19,6 +19,10 @@ attest = "attest.cli:main"
 
 [project.optional-dependencies]
 dev = ["ruff", "mypy", "pytest"]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+google = ["google-generativeai>=0.8"]
+all = ["anthropic>=0.40", "openai>=1.50", "google-generativeai>=0.8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -34,6 +38,10 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 mypy_path = "src"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["anthropic.*", "openai.*", "google.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
