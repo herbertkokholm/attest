@@ -34,8 +34,7 @@ class Vote:
     def __post_init__(self) -> None:
         if self.rating not in VALID_RATINGS:
             raise VoteError(
-                f"vendor '{self.vendor}': rating must be one of {VALID_RATINGS}, "
-                f"got {self.rating}"
+                f"vendor '{self.vendor}': rating must be one of {VALID_RATINGS}, got {self.rating}"
             )
 
 
