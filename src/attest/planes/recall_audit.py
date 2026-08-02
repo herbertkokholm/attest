@@ -165,8 +165,7 @@ def ingest_audit_labels(rows: Sequence[AuditRow], labels: Mapping[str, int]) -> 
         label = labels[row.record_id]
         if label not in VALID_RATINGS:
             raise AuditError(
-                f"record '{row.record_id}': human_label must be one of {VALID_RATINGS}, "
-                f"got {label}"
+                f"record '{row.record_id}': human_label must be one of {VALID_RATINGS}, got {label}"
             )
         updated.append(replace(row, human_label=label))
     return updated
