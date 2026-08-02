@@ -60,6 +60,19 @@ decisions = {
 }
 ```
 
+By default every rater falls back to its own hardcoded
+`attest.vendors.base.DEFAULT_SCREENING_PROMPT`, which carries no
+review-specific eligibility criteria. To screen against a review's actual
+published criteria, set `Config.default_prompt` (applied to every record)
+and/or `Config.track_prompts` (a mapping of `record.track` to prompt text,
+overriding `default_prompt` for that track) -- `run_ensemble` and
+`submit_batch` resolve the right prompt per record automatically via
+`Config.prompt_for_track`, so one ensemble configuration can screen several
+reviews' records in a single run, each against its own criteria, while still
+voting with the same vendors/models/aggregation on all of them. Both fields
+are part of the hashed configuration content, so changing either changes
+`ensemble_config_id`.
+
 ## The two stable contracts
 
 `attest` exposes two versioned wire contracts. Treat both as frozen

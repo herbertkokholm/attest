@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -67,9 +68,11 @@ class _CountingBatchRater:
     def model(self) -> str:
         return self.inner.model
 
-    def submit(self, records: Any, ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+    ) -> BatchHandle:
         self.submit_calls += 1
-        return self.inner.submit(records, ensemble_config_id)
+        return self.inner.submit(records, ensemble_config_id, prompts=prompts)
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
         return self.inner.poll(handle)
@@ -94,8 +97,10 @@ class _ScriptedPollRater:
     def model(self) -> str:
         return self.inner.model
 
-    def submit(self, records: Any, ensemble_config_id: str) -> BatchHandle:
-        return self.inner.submit(records, ensemble_config_id)
+    def submit(
+        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+    ) -> BatchHandle:
+        return self.inner.submit(records, ensemble_config_id, prompts=prompts)
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
         self.poll_calls += 1
@@ -113,7 +118,9 @@ class _AlwaysFailingRater:
     vendor = "vendor-a"
     model = "model-a"
 
-    def submit(self, records: Any, ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+    ) -> BatchHandle:
         return BatchHandle(
             vendor=self.vendor,
             model=self.model,
@@ -143,6 +150,28 @@ def test_run_ensemble_batch_matches_run_ensemble_for_same_seed(tmp_path: Path) -
 
     assert batch_run.votes == sync_run.votes
     assert [v.record_id for v in batch_run.votes] == [v.record_id for v in sync_run.votes]
+
+
+def test_run_ensemble_batch_matches_run_ensemble_under_per_track_prompts(tmp_path: Path) -> None:
+    config = Config(
+        vendors={
+            "vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1"),
+            "vendor-b": VendorSpec(model="model-b", model_version="v1", prompt_version="p1"),
+        },
+        aggregation="boundary_dispersion",
+        tau=1.0,
+        track_prompts={"review-a": "criteria A", "review-b": "criteria B"},
+    )
+    records = [
+        Record(id="rec-1", title="title", abstract="abstract", track="review-a"),
+        Record(id="rec-2", title="title", abstract="abstract", track="review-b"),
+    ]
+
+    sync_run = run_ensemble(records, _sync_raters(), config)
+    store = RunStore(tmp_path / "run")
+    batch_run = run_ensemble_batch(records, _batch_raters(), config, store)
+
+    assert batch_run.votes == sync_run.votes
 
 
 def test_run_ensemble_batch_stamps_the_same_ensemble_config_id(tmp_path: Path) -> None:

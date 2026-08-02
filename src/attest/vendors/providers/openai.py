@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -51,11 +51,12 @@ class OpenAIRater:
             ) from exc
         return openai.OpenAI(api_key=self.api_key)
 
-    def rate(self, record: Record) -> tuple[int, dict[str, Any]]:
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the OpenAI Chat Completions API.
 
         Args:
             record: The record to rate.
+            prompt: Screening prompt to use, overriding `self.prompt`.
 
         Returns:
             The parsed ordinal rating and the raw response payload.
@@ -64,7 +65,7 @@ class OpenAIRater:
             model=self.model,
             max_completion_tokens=self.max_tokens,
             messages=[
-                {"role": "system", "content": self.prompt},
+                {"role": "system", "content": prompt if prompt is not None else self.prompt},
                 {
                     "role": "user",
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
@@ -111,7 +112,7 @@ class OpenAIBatchRater:
             ) from exc
         return openai.OpenAI(api_key=self.api_key)
 
-    def _request_line(self, record: Record, custom_id: str) -> dict[str, Any]:
+    def _request_line(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
         return {
             "custom_id": custom_id,
             "method": "POST",
@@ -120,7 +121,7 @@ class OpenAIBatchRater:
                 "model": self.model,
                 "max_completion_tokens": self.max_tokens,
                 "messages": [
-                    {"role": "system", "content": self.prompt},
+                    {"role": "system", "content": prompt},
                     {
                         "role": "user",
                         "content": f"Title: {record.title}\nAbstract: {record.abstract}",
@@ -129,20 +130,31 @@ class OpenAIBatchRater:
             },
         }
 
-    def submit(self, records: Sequence[Record], ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self,
+        records: Sequence[Record],
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+    ) -> BatchHandle:
         """Upload a JSONL request file and submit it as one OpenAI Batch job.
 
         Args:
             records: The records to rate in this batch.
             ensemble_config_id: The ensemble configuration id this batch's
                 eventual votes will be stamped with.
+            prompts: Mapping of record id to the screening prompt to use for
+                it, overriding `self.prompt`.
 
         Returns:
             A `BatchHandle` identifying the submitted batch.
         """
+        prompts = prompts or {}
         id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
         lines = "\n".join(
-            json.dumps(self._request_line(record, id_map[record.id])) for record in records
+            json.dumps(
+                self._request_line(record, id_map[record.id], prompts.get(record.id, self.prompt))
+            )
+            for record in records
         )
         client = self._client()
         upload = client.files.create(file=io.BytesIO(lines.encode("utf-8")), purpose="batch")

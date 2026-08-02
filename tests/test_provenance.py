@@ -45,6 +45,56 @@ def test_ensemble_config_id_is_independent_of_dict_construction_order() -> None:
     assert compute_ensemble_config_id(_config()) == compute_ensemble_config_id(reordered)
 
 
+def test_config_to_dict_omits_unset_prompt_fields() -> None:
+    payload = _config().to_dict()
+
+    assert "default_prompt" not in payload
+    assert "track_prompts" not in payload
+
+
+def test_default_prompt_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_prompt = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        default_prompt="Screen for inclusion in review X.",
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_prompt)
+
+
+def test_track_prompts_change_the_ensemble_config_id_but_not_when_equal() -> None:
+    base = _config()
+    with_track_prompt = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        track_prompts={"review-a": "Screen for review A."},
+    )
+    same_again = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        track_prompts={"review-a": "Screen for review A."},
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_track_prompt)
+    assert compute_ensemble_config_id(with_track_prompt) == compute_ensemble_config_id(same_again)
+
+
+def test_prompt_for_track_prefers_track_specific_over_default() -> None:
+    config = Config(
+        default_prompt="generic default",
+        track_prompts={"review-a": "review A criteria", "2": "int-keyed track criteria"},
+    )
+
+    assert config.prompt_for_track("review-a") == "review A criteria"
+    assert config.prompt_for_track(2) == "int-keyed track criteria"
+    assert config.prompt_for_track("review-b") == "generic default"
+    assert Config().prompt_for_track("review-a") is None
+
+
 def test_changed_field_yields_different_id_opens_epoch_and_logs_change() -> None:
     base = _config(tau=0.5)
     changed = _config(tau=0.6)

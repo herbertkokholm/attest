@@ -149,6 +149,21 @@ def test_config_write_rejects_conflicting_config(tmp_path: Path) -> None:
         store.write_config(_config(tau=0.9))
 
 
+def test_config_round_trips_with_track_prompts(tmp_path: Path) -> None:
+    config = Config(
+        vendors={"v1": VendorSpec(model="m", model_version="1", prompt_version="p")},
+        aggregation="boundary_dispersion",
+        tau=1.0,
+        default_prompt="generic default",
+        track_prompts={"review-a": "review A criteria"},
+    )
+    store = RunStore(tmp_path / "run")
+
+    store.write_config(config)
+
+    assert store.read_config() == config
+
+
 def test_read_config_without_a_write_raises(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
 

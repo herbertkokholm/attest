@@ -46,6 +46,49 @@ def test_deterministic_rater_differs_across_seeds_or_vendors() -> None:
     assert len(ratings) > 1
 
 
+def test_deterministic_rater_is_sensitive_to_an_explicit_prompt() -> None:
+    record = _record("rec-1")
+    rater = DeterministicRater(vendor="vendor-a", seed=42)
+
+    without_prompt = rater.rate(record)
+    with_prompt_a = rater.rate(record, prompt="criteria A")
+    with_prompt_b = rater.rate(record, prompt="criteria B")
+    with_prompt_a_again = rater.rate(record, prompt="criteria A")
+
+    # A prompt=None call must match pre-existing (pre-prompt-param) behavior exactly.
+    assert without_prompt[0] in (-1, 0, 1)
+    assert with_prompt_a == with_prompt_a_again
+    # Not guaranteed to differ for every possible pair, but these two shouldn't collide.
+    assert with_prompt_a != with_prompt_b
+
+
+def test_run_ensemble_resolves_prompt_per_record_track() -> None:
+    config = Config(
+        vendors={"vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1")},
+        aggregation="majority",
+        tau=0.5,
+        track_prompts={"review-a": "criteria A", "review-b": "criteria B"},
+    )
+    records = [
+        Record(id="rec-1", title="t", abstract="a", track="review-a"),
+        Record(id="rec-2", title="t", abstract="a", track="review-b"),
+        Record(id="rec-3", title="t", abstract="a", track="review-c"),  # no override, no default
+    ]
+    raters = [DeterministicRater(vendor="vendor-a", seed=1)]
+
+    result = run_ensemble(records, raters, config)
+
+    by_id = {vv.record_id: vv for vv in result.votes}
+    assert result.raw_responses["rec-1"]["vendor-a"]["prompt"] == "criteria A"
+    assert result.raw_responses["rec-2"]["vendor-a"]["prompt"] == "criteria B"
+    assert result.raw_responses["rec-3"]["vendor-a"]["prompt"] is None
+
+    direct_rec1 = DeterministicRater(vendor="vendor-a", seed=1).rate(
+        records[0], prompt="criteria A"
+    )
+    assert by_id["rec-1"].votes[0].rating == direct_rec1[0]
+
+
 def test_run_ensemble_produces_one_vote_per_rater_per_record_with_config_stamp() -> None:
     config = _config()
     expected_config_id = compute_ensemble_config_id(config)

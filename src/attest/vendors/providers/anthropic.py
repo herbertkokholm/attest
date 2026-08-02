@@ -7,7 +7,7 @@ imports cleanly without the extra installed.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -49,11 +49,12 @@ class AnthropicRater:
             ) from exc
         return anthropic.Anthropic(api_key=self.api_key)
 
-    def rate(self, record: Record) -> tuple[int, dict[str, Any]]:
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the Anthropic Messages API.
 
         Args:
             record: The record to rate.
+            prompt: Screening prompt to use, overriding `self.prompt`.
 
         Returns:
             The parsed ordinal rating and the raw response payload.
@@ -61,7 +62,7 @@ class AnthropicRater:
         response = self._client().messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self.prompt,
+            system=prompt if prompt is not None else self.prompt,
             messages=[
                 {
                     "role": "user",
@@ -109,13 +110,13 @@ class AnthropicBatchRater:
             ) from exc
         return anthropic.Anthropic(api_key=self.api_key)
 
-    def _request(self, record: Record, custom_id: str) -> dict[str, Any]:
+    def _request(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
         return {
             "custom_id": custom_id,
             "params": {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "system": self.prompt,
+                "system": prompt,
                 "messages": [
                     {
                         "role": "user",
@@ -125,19 +126,30 @@ class AnthropicBatchRater:
             },
         }
 
-    def submit(self, records: Sequence[Record], ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self,
+        records: Sequence[Record],
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+    ) -> BatchHandle:
         """Submit `records` as one Anthropic Message Batch.
 
         Args:
             records: The records to rate in this batch.
             ensemble_config_id: The ensemble configuration id this batch's
                 eventual votes will be stamped with.
+            prompts: Mapping of record id to the screening prompt to use for
+                it, overriding `self.prompt`.
 
         Returns:
             A `BatchHandle` identifying the submitted batch.
         """
+        prompts = prompts or {}
         id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
-        requests = [self._request(record, id_map[record.id]) for record in records]
+        requests = [
+            self._request(record, id_map[record.id], prompts.get(record.id, self.prompt))
+            for record in records
+        ]
         batch = self._client().messages.batches.create(requests=requests)
         return BatchHandle(
             vendor=self.vendor,

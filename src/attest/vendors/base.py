@@ -75,11 +75,16 @@ class Rater(Protocol):
     vendor: str
     model: str
 
-    def rate(self, record: Record) -> tuple[int, Any]:
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, Any]:
         """Rate `record`, returning `(ordinal, raw_response)`.
 
         Args:
             record: The record to rate.
+            prompt: Screening prompt text to use for this call, overriding
+                this rater's own configured prompt. `None` (the default)
+                means use this rater's own prompt, unchanged -- so existing
+                callers that never pass `prompt` see identical behavior to
+                before this parameter existed.
 
         Returns:
             A tuple of the ordinal rating (-1, 0, or 1) and the rater's raw,
@@ -110,11 +115,19 @@ class DeterministicRater:
     model: str = "deterministic-v1"
     seed: int = 0
 
-    def rate(self, record: Record) -> tuple[int, dict[str, Any]]:
-        """Deterministically derive an ordinal rating from `record.id` and this rater's seed."""
-        digest = hashlib.sha256(
-            f"{self.seed}:{self.vendor}:{self.model}:{record.id}".encode()
-        ).digest()
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
+        """Deterministically derive an ordinal rating from `record.id`, this rater's
+        seed, and (if given) `prompt`.
+
+        `prompt` only enters the digest when explicitly passed, so every
+        pre-existing caller that never passed one (i.e. always called with
+        `prompt=None`) gets the exact same ratings as before this parameter
+        existed -- calibrated seeds in existing tests stay valid.
+        """
+        digest_input = f"{self.seed}:{self.vendor}:{self.model}:{record.id}"
+        if prompt is not None:
+            digest_input = f"{digest_input}:{prompt}"
+        digest = hashlib.sha256(digest_input.encode()).digest()
         ordinal = VALID_RATINGS[digest[0] % len(VALID_RATINGS)]
         raw_response = {
             "vendor": self.vendor,
@@ -122,6 +135,7 @@ class DeterministicRater:
             "seed": self.seed,
             "record_id": record.id,
             "digest": digest.hex(),
+            "prompt": prompt,
         }
         return ordinal, raw_response
 
@@ -157,7 +171,8 @@ def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Con
             recorded into each record's vote vector.
         config: The ensemble configuration in force for this run, used to
             compute the `ensemble_config_id` every resulting vote vector is
-            stamped with.
+            stamped with, and -- via `config.prompt_for_track` -- to resolve
+            each record's screening prompt from its `track`.
 
     Returns:
         An `EnsembleRun` holding one `VoteVector` per record and the raw,
@@ -168,10 +183,11 @@ def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Con
     raw_responses: dict[str, dict[str, Any]] = {}
 
     for record in records:
+        prompt = config.prompt_for_track(record.track)
         record_votes: list[Vote] = []
         record_raw: dict[str, Any] = {}
         for rater in raters:
-            ordinal, raw = rater.rate(record)
+            ordinal, raw = rater.rate(record, prompt=prompt)
             record_votes.append(Vote(vendor=rater.vendor, rating=ordinal))
             record_raw[rater.vendor] = raw
         votes.append(

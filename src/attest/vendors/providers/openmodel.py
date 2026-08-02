@@ -40,11 +40,12 @@ class OpenModelRater:
     timeout: float = 30.0
     vendor: str = field(default="openmodel", init=False)
 
-    def rate(self, record: Record) -> tuple[int, dict[str, Any]]:
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by POSTing a chat completion request to `base_url`.
 
         Args:
             record: The record to rate.
+            prompt: Screening prompt to use, overriding `self.prompt`.
 
         Returns:
             The parsed ordinal rating and the raw decoded JSON response.
@@ -53,7 +54,7 @@ class OpenModelRater:
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [
-                {"role": "system", "content": self.prompt},
+                {"role": "system", "content": prompt if prompt is not None else self.prompt},
                 {
                     "role": "user",
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",

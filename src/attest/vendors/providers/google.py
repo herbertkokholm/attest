@@ -7,7 +7,7 @@ module itself imports cleanly without the extra installed.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -39,7 +39,7 @@ class GoogleRater:
     max_output_tokens: int = 8
     vendor: str = field(default="google", init=False)
 
-    def _client(self) -> Any:
+    def _client(self, prompt: str) -> Any:
         try:
             import google.generativeai as genai
         except ImportError as exc:
@@ -49,18 +49,19 @@ class GoogleRater:
             ) from exc
         if self.api_key is not None:
             genai.configure(api_key=self.api_key)
-        return genai.GenerativeModel(model_name=self.model, system_instruction=self.prompt)
+        return genai.GenerativeModel(model_name=self.model, system_instruction=prompt)
 
-    def rate(self, record: Record) -> tuple[int, dict[str, Any]]:
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the Gemini `generate_content` API.
 
         Args:
             record: The record to rate.
+            prompt: Screening prompt to use, overriding `self.prompt`.
 
         Returns:
             The parsed ordinal rating and the raw response payload.
         """
-        response = self._client().generate_content(
+        response = self._client(prompt if prompt is not None else self.prompt).generate_content(
             f"Title: {record.title}\nAbstract: {record.abstract}",
             generation_config={"max_output_tokens": self.max_output_tokens},
         )
@@ -112,32 +113,43 @@ class GoogleBatchRater:
             genai.configure(api_key=self.api_key)
         return genai
 
-    def _request(self, record: Record, custom_id: str) -> dict[str, Any]:
+    def _request(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
         return {
             "key": custom_id,
             "request": {
                 "contents": [
                     {"parts": [{"text": f"Title: {record.title}\nAbstract: {record.abstract}"}]}
                 ],
-                "system_instruction": {"parts": [{"text": self.prompt}]},
+                "system_instruction": {"parts": [{"text": prompt}]},
                 "generation_config": {"max_output_tokens": self.max_output_tokens},
             },
         }
 
-    def submit(self, records: Sequence[Record], ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self,
+        records: Sequence[Record],
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+    ) -> BatchHandle:
         """Submit `records` as one Gemini batch job.
 
         Args:
             records: The records to rate in this batch.
             ensemble_config_id: The ensemble configuration id this batch's
                 eventual votes will be stamped with.
+            prompts: Mapping of record id to the screening prompt to use for
+                it, overriding `self.prompt`.
 
         Returns:
             A `BatchHandle` identifying the submitted batch job.
         """
+        prompts = prompts or {}
         genai = self._client()
         id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
-        requests = [self._request(record, id_map[record.id]) for record in records]
+        requests = [
+            self._request(record, id_map[record.id], prompts.get(record.id, self.prompt))
+            for record in records
+        ]
         job = genai.GenerativeModel(model_name=self.model).batches.create(requests=requests)
         return BatchHandle(
             vendor=self.vendor,

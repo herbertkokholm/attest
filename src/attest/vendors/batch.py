@@ -59,6 +59,14 @@ class BatchHandle:
             votes will be stamped with.
         id_map: Mapping of attest record id to the vendor's per-item custom
             id, used to recover the record id a fetched result belongs to.
+        prompts: Mapping of attest record id to the screening prompt text
+            resolved for it at submission time. Real vendor batch adapters
+            leave this empty -- the vendor already baked each record's
+            prompt into its submitted request, so there is nothing to
+            replay at fetch time. `DeterministicBatchRater` is the
+            exception: it recomputes ratings on `fetch`, in a possibly
+            different process, so it needs this to reproduce the same
+            per-track prompt sensitivity `DeterministicRater.rate` has.
     """
 
     vendor: str
@@ -67,10 +75,15 @@ class BatchHandle:
     submitted_at: datetime
     ensemble_config_id: str
     id_map: Mapping[str, str]
+    prompts: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Return this handle as a plain, JSON-serializable dict."""
-        return {
+        """Return this handle as a plain, JSON-serializable dict.
+
+        `prompts` is omitted when empty, so a handle that does not use it
+        serializes identically to one built before this field existed.
+        """
+        payload: dict[str, Any] = {
             "vendor": self.vendor,
             "model": self.model,
             "provider_batch_id": self.provider_batch_id,
@@ -78,6 +91,9 @@ class BatchHandle:
             "ensemble_config_id": self.ensemble_config_id,
             "id_map": dict(self.id_map),
         }
+        if self.prompts:
+            payload["prompts"] = dict(self.prompts)
+        return payload
 
     @staticmethod
     def from_dict(payload: Mapping[str, Any]) -> BatchHandle:
@@ -89,6 +105,7 @@ class BatchHandle:
             submitted_at=datetime.fromisoformat(payload["submitted_at"]),
             ensemble_config_id=payload["ensemble_config_id"],
             id_map=dict(payload["id_map"]),
+            prompts=dict(payload.get("prompts", {})),
         )
 
 
@@ -112,13 +129,24 @@ class BatchRater(Protocol):
     vendor: str
     model: str
 
-    def submit(self, records: Sequence[Record], ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self,
+        records: Sequence[Record],
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+    ) -> BatchHandle:
         """Submit `records` as one vendor batch job.
 
         Args:
             records: The records to rate in this batch.
             ensemble_config_id: The ensemble configuration id this batch's
                 eventual votes will be stamped with.
+            prompts: Mapping of record id to the screening prompt text
+                resolved for it, overriding this rater's own configured
+                prompt for that record. A record with no entry (or `None`)
+                uses this rater's own prompt, unchanged -- so existing
+                callers that never pass `prompts` see identical behavior to
+                before this parameter existed.
 
         Returns:
             A `BatchHandle` identifying the submitted job, ready to persist.
@@ -174,7 +202,12 @@ class DeterministicBatchRater:
     seed: int = 0
     fail_record_ids: frozenset[str] = field(default_factory=frozenset)
 
-    def submit(self, records: Sequence[Record], ensemble_config_id: str) -> BatchHandle:
+    def submit(
+        self,
+        records: Sequence[Record],
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+    ) -> BatchHandle:
         """Build a handle covering `records`; the simulated batch is already done."""
         id_map = {record.id: record.id for record in records}
         provider_batch_id = f"deterministic:{self.vendor}:{self.seed}:{ensemble_config_id}"
@@ -185,6 +218,7 @@ class DeterministicBatchRater:
             submitted_at=datetime.now(UTC),
             ensemble_config_id=ensemble_config_id,
             id_map=id_map,
+            prompts=dict(prompts) if prompts else {},
         )
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
@@ -192,14 +226,18 @@ class DeterministicBatchRater:
         return "completed"
 
     def fetch(self, handle: BatchHandle) -> dict[str, tuple[int, Any]]:
-        """Recompute each record's rating from `handle`'s record ids and this rater's seed."""
+        """Recompute each record's rating from `handle`'s record ids, this rater's
+        seed, and (if present) the prompt resolved for that record at submit time --
+        reproducing exactly what `DeterministicRater.rate` would have returned
+        synchronously, so batch/sync parity holds under per-track prompts too.
+        """
         rater = DeterministicRater(vendor=self.vendor, model=self.model, seed=self.seed)
         results: dict[str, tuple[int, Any]] = {}
         for record_id in handle.id_map:
             if record_id in self.fail_record_ids:
                 continue
             placeholder = Record(id=record_id, title="", abstract="", track="batch")
-            results[record_id] = rater.rate(placeholder)
+            results[record_id] = rater.rate(placeholder, prompt=handle.prompts.get(record_id))
         return results
 
 
@@ -221,7 +259,9 @@ def submit_batch(
         records: The records to submit for rating.
         batch_raters: The ensemble members to submit a batch to.
         config: The ensemble configuration in force, used to compute the
-            `ensemble_config_id` every submitted batch is stamped with.
+            `ensemble_config_id` every submitted batch is stamped with, and
+            -- via `config.prompt_for_track` -- to resolve each record's
+            screening prompt from its `track`.
         store: The run directory to persist handles into.
 
     Returns:
@@ -233,6 +273,11 @@ def submit_batch(
             with a different `ensemble_config_id` than `config`.
     """
     ensemble_config_id = compute_ensemble_config_id(config)
+    prompts = {
+        record.id: resolved
+        for record in records
+        if (resolved := config.prompt_for_track(record.track)) is not None
+    }
     existing = {
         vendor: BatchHandle.from_dict(payload)
         for vendor, payload in store.read_batch_handles().items()
@@ -247,7 +292,7 @@ def submit_batch(
                     f"the current configuration's id '{ensemble_config_id}'"
                 )
             continue
-        handle = rater.submit(records, ensemble_config_id)
+        handle = rater.submit(records, ensemble_config_id, prompts=prompts)
         store.write_batch_handle(handle.vendor, handle.to_dict())
     return ensemble_config_id
 

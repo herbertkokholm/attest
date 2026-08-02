@@ -131,7 +131,13 @@ def _config_to_dict(config: EnsembleConfig, ensemble_config_id: str) -> dict[str
 def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
     raw_vendors: dict[str, Any] = payload["vendors"]
     vendors = {name: VendorSpec(**spec) for name, spec in raw_vendors.items()}
-    return EnsembleConfig(vendors=vendors, aggregation=payload["aggregation"], tau=payload["tau"])
+    return EnsembleConfig(
+        vendors=vendors,
+        aggregation=payload["aggregation"],
+        tau=payload["tau"],
+        default_prompt=payload.get("default_prompt"),
+        track_prompts=dict(payload.get("track_prompts", {})),
+    )
 
 
 def _epoch_to_dict(epoch: Epoch) -> dict[str, Any]:

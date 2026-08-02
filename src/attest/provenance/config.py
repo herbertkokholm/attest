@@ -50,25 +50,63 @@ class Config:
             never set independently.
         aggregation: Name of the aggregation rule applied to ensemble votes.
         tau: Decision threshold used by the aggregation rule.
+        default_prompt: Screening prompt text sent to every vendor for a
+            record whose track has no entry in `track_prompts`. `None`
+            (the default) means every rater falls back to its own
+            hardcoded `attest.vendors.base.DEFAULT_SCREENING_PROMPT`,
+            exactly as before this field existed.
+        track_prompts: Mapping of record track (stringified) to the
+            screening prompt text to use for records on that track,
+            overriding `default_prompt`. Lets one ensemble configuration
+            screen records from several systematic reviews in a single run,
+            each against its own published eligibility criteria, while
+            still voting with the same vendors/models/aggregation on all of
+            them.
     """
 
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
+    default_prompt: str | None = None
+    track_prompts: dict[str, str] = field(default_factory=dict)
 
     @property
     def x(self) -> int:
         """Ensemble size, derived from the number of participating vendors."""
         return len(self.vendors)
 
+    def prompt_for_track(self, track: int | str) -> str | None:
+        """Resolve the screening prompt to use for a record on `track`.
+
+        Args:
+            track: A record's `track` field (see `attest.contracts.input.Record`).
+
+        Returns:
+            `track_prompts[str(track)]` if set, else `default_prompt`, else
+            `None` -- meaning the rater should fall back to its own
+            hardcoded default prompt.
+        """
+        return self.track_prompts.get(str(track), self.default_prompt)
+
     def to_dict(self) -> dict[str, Any]:
-        """Return this configuration as a plain dict, including the derived `x`."""
-        return {
+        """Return this configuration as a plain dict, including the derived `x`.
+
+        `default_prompt`/`track_prompts` are omitted when unset, so a
+        configuration that does not use them serializes -- and hashes into
+        `compute_ensemble_config_id` -- identically to one built before
+        these fields existed.
+        """
+        payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
             "aggregation": self.aggregation,
             "tau": self.tau,
             "x": self.x,
         }
+        if self.default_prompt is not None:
+            payload["default_prompt"] = self.default_prompt
+        if self.track_prompts:
+            payload["track_prompts"] = dict(self.track_prompts)
+        return payload
 
 
 def compute_ensemble_config_id(config: Config) -> str:

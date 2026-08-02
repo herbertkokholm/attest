@@ -73,7 +73,8 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
     Args:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
             an object with "model", "model_version", "prompt_version"),
-            "aggregation", and "tau" fields.
+            "aggregation", "tau", and optionally "default_prompt" (string)
+            and/or "track_prompts" (mapping of track to prompt text) fields.
 
     Returns:
         The parsed `EnsembleConfig`.
@@ -88,7 +89,11 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
         for name, spec in payload["vendors"].items()
     }
     return EnsembleConfig(
-        vendors=vendors, aggregation=payload["aggregation"], tau=float(payload["tau"])
+        vendors=vendors,
+        aggregation=payload["aggregation"],
+        tau=float(payload["tau"]),
+        default_prompt=payload.get("default_prompt"),
+        track_prompts=dict(payload.get("track_prompts", {})),
     )
 
 
