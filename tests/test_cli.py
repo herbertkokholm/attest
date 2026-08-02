@@ -56,6 +56,12 @@ def test_end_to_end_screen_audit_validate(
     assert screen_summary["prisma"]["passed"] == 4
     assert screen_summary["escalated"] == 0
 
+    votes_ids = set(json.loads((run_dir / "votes.json").read_text())["votes"])
+    raw_responses = json.loads((run_dir / "raw_responses.json").read_text())["raw_responses"]
+    assert set(raw_responses) == votes_ids
+    for by_vendor in raw_responses.values():
+        assert set(by_vendor) == {"v1", "v2"}
+
     draw_rc = main(
         [
             "audit-draw",

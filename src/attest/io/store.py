@@ -55,6 +55,7 @@ DECISIONS_FILENAME = "decisions.json"
 AUDIT_FILENAME = "audit.json"
 RUNS_FILENAME = "runs.json"
 BATCH_HANDLES_FILENAME = "batch_handles.json"
+RAW_RESPONSES_FILENAME = "raw_responses.json"
 
 
 class StoreError(ValueError):
@@ -300,6 +301,31 @@ class RunStore:
             for record_id, raw_votes in sorted(items.items())
         ]
 
+    def write_raw_responses(
+        self, ensemble_config_id: str, raw_responses: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Upsert raw per-vendor rater responses into `raw_responses.json`, keyed by record id.
+
+        Retained for audit and debugging, exactly as
+        `attest.vendors.base.EnsembleRun.raw_responses` documents them --
+        never part of the versioned vote contract in `votes.json`, and
+        opaque to this store: each vendor's payload shape is whatever that
+        vendor's `Rater.rate` returned.
+
+        Args:
+            ensemble_config_id: Configuration id these responses were
+                produced under; must match this file's existing stamp, if any.
+            raw_responses: Mapping of record id to a mapping of vendor name
+                to that vendor's raw, implementation-specific response payload.
+        """
+        items = {record_id: dict(by_vendor) for record_id, by_vendor in raw_responses.items()}
+        self._write_stamped(RAW_RESPONSES_FILENAME, "raw_responses", ensemble_config_id, items)
+
+    def read_raw_responses(self) -> dict[str, dict[str, Any]]:
+        """Read all stored raw per-vendor responses, keyed by record id."""
+        _ensemble_config_id, items = self._read_stamped(RAW_RESPONSES_FILENAME, "raw_responses")
+        return {record_id: dict(by_vendor) for record_id, by_vendor in items.items()}
+
     def write_decisions(self, ensemble_config_id: str, decisions: Mapping[str, Decision]) -> None:
         """Upsert aggregation decisions into `decisions.json`, keyed by record id.
 
@@ -544,6 +570,7 @@ __all__ = [
     "BATCH_HANDLES_FILENAME",
     "DECISIONS_FILENAME",
     "EPOCH_FILENAME",
+    "RAW_RESPONSES_FILENAME",
     "RUNS_FILENAME",
     "VOTES_FILENAME",
     "RunStore",

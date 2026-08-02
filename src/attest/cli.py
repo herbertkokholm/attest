@@ -146,12 +146,14 @@ def _persist_ensemble_run(
     outcome: PrefilterOutcome,
     track: str,
 ) -> dict[str, Any]:
-    """Write an ensemble run's votes, decisions, and provenance record, and summarize them.
+    """Write an ensemble run's votes, raw responses, decisions, and provenance
+    record, and summarize them.
 
     Shared by `screen` (both sync and waited batch mode) and `batch-fetch`,
     so every path that produces an `EnsembleRun` persists it identically.
     """
     store.write_votes(ensemble_run.votes)
+    store.write_raw_responses(ensemble_config_id, ensemble_run.raw_responses)
 
     decisions = {
         vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau)

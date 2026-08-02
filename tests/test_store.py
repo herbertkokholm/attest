@@ -165,6 +165,38 @@ def test_epoch_round_trips(tmp_path: Path) -> None:
     assert store.read_epoch() == epoch
 
 
+# --- RunStore: raw responses -----------------------------------------------------
+
+
+def test_raw_responses_round_trip(tmp_path: Path) -> None:
+    responses = {
+        "r1": {"v1": {"text": "1", "id": "resp-1"}, "v2": {"text": "-1", "id": "resp-2"}},
+        "r2": {"v1": {"text": "0", "id": "resp-3"}},
+    }
+    store = RunStore(tmp_path / "run")
+
+    store.write_raw_responses("cfg-1", responses)
+
+    assert store.read_raw_responses() == responses
+
+
+def test_raw_responses_upsert_by_record_id(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    store.write_raw_responses("cfg-1", {"r1": {"v1": {"text": "1"}}})
+    store.write_raw_responses("cfg-1", {"r2": {"v1": {"text": "-1"}}})
+
+    assert set(store.read_raw_responses()) == {"r1", "r2"}
+
+
+def test_raw_responses_reject_conflicting_stamp(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_raw_responses("cfg-a", {"r1": {"v1": {"text": "1"}}})
+
+    with pytest.raises(StoreError):
+        store.write_raw_responses("cfg-b", {"r2": {"v1": {"text": "-1"}}})
+
+
 # --- RunStore: audit rows and run records ---------------------------------------
 
 
