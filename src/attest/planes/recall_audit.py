@@ -64,12 +64,22 @@ class AuditRow:
 
 
 class AuditPlaneRow(Protocol):
-    """Structural shape `build_strata` requires: enough to check the plane tag and count."""
+    """Structural shape `build_strata` requires: enough to check the plane tag and count.
 
-    record_id: str
-    stratum: str
-    human_label: int | None
-    plane: str
+    Declared as read-only properties, not plain attributes, so that frozen
+    dataclasses (e.g. `AuditRow` itself) satisfy this protocol: mypy treats a
+    frozen dataclass's fields as read-only, which is incompatible with a
+    Protocol's implicitly settable plain attributes.
+    """
+
+    @property
+    def record_id(self) -> str: ...
+    @property
+    def stratum(self) -> str: ...
+    @property
+    def human_label(self) -> int | None: ...
+    @property
+    def plane(self) -> str: ...
 
 
 def draw_audit_sample(

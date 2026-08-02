@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from attest.contracts.input import NormalizedInput, validate_and_normalize
 from attest.contracts.validation_record import (
@@ -33,7 +33,7 @@ from attest.contracts.validation_record import build as build_validation_record
 from attest.ensemble.aggregate import Decision
 from attest.ensemble.votes import Vote, VoteVector
 from attest.planes.adjudication import AdjudicationError, final_label
-from attest.planes.recall_audit import AuditPlaneRow, AuditRow, build_strata
+from attest.planes.recall_audit import AuditRow, build_strata
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 from attest.provenance.config import Config as EnsembleConfig
 from attest.provenance.config import VendorSpec, compute_ensemble_config_id
@@ -497,11 +497,7 @@ def assemble_validation_record(
 
     labeled_audit_rows = [row for row in audit_rows if row.human_label is not None]
     if labeled_audit_rows:
-        # AuditRow is a frozen dataclass, so mypy treats its attributes as
-        # read-only, while AuditPlaneRow's Protocol attributes are implicitly
-        # settable -- a structural false positive, not a real incompatibility
-        # (AuditRow does carry every attribute AuditPlaneRow requires).
-        strata = build_strata(cast(list[AuditPlaneRow], labeled_audit_rows), population_sizes)
+        strata = build_strata(labeled_audit_rows, population_sizes)
         true_positives = record.confusion["tp"]
         estimate = stratified_recall(strata, true_positives, confidence=confidence)
         audit_n = sum(s.n for s in strata)
