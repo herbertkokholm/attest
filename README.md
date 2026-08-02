@@ -133,9 +133,15 @@ imports cleanly.
 - **Vendors** (`attest.vendors`) — the `Rater` protocol, a network-free
   `DeterministicRater` for tests, and live provider adapters
   (`attest.vendors.providers`) — the sole path to the network.
-- **CLI** (`attest.cli`) — `screen`, `adjudicate`, `audit-draw`,
-  `audit-apply`, `validate`, `ablate`: file-based subcommands over a run
-  directory.
+  `attest.vendors.batch` adds a parallel `BatchRater` protocol driving
+  vendors' asynchronous Batch APIs (roughly 50% cheaper, without per-minute
+  rate-limit fragility): `run_ensemble_batch` submits, polls with backoff,
+  fetches, and assembles the exact same vote vectors `run_ensemble` would,
+  stamped with the same `ensemble_config_id`, so everything downstream of
+  `screen` is unaware of which execution strategy produced them.
+- **CLI** (`attest.cli`) — `screen`, `batch-fetch`, `adjudicate`,
+  `audit-draw`, `audit-apply`, `validate`, `ablate`: file-based subcommands
+  over a run directory.
 
 ## Running the CLI on the example data
 
@@ -185,10 +191,39 @@ against a frozen gold set:
 attest ablate --run-dir /tmp/attest-demo --input data/example_gold_set.json
 ```
 
-Every subcommand except `screen` runs entirely offline over files already
-written to the run directory; `screen` is the only one that may reach the
-network, and only through a `Rater` built by `attest.vendors` (bypassed here
-via `--deterministic-seed`).
+Every subcommand except `screen` and `batch-fetch` runs entirely offline
+over files already written to the run directory; `screen` and `batch-fetch`
+are the only ones that may reach the network, and only through a `Rater` or
+`BatchRater` built by `attest.vendors` (bypassed here via
+`--deterministic-seed`).
+
+### Batch mode
+
+For large jobs, `screen --mode batch` submits one vendor batch per rater
+instead of rating records synchronously, at each vendor's cheaper batch
+rate. `--wait` polls every batch to completion before persisting votes, just
+like `--mode sync` does synchronously; without it, `screen` exits right
+after submission and a later `batch-fetch` call resumes from the persisted
+batch handles:
+
+```bash
+attest screen \
+  --input data/example_gold_set.json \
+  --config data/example_config.json \
+  --run-dir /tmp/attest-batch-demo \
+  --deterministic-seed 42 \
+  --mode batch
+
+# ... later, possibly a different process invocation ...
+
+attest batch-fetch \
+  --run-dir /tmp/attest-batch-demo \
+  --input data/example_gold_set.json \
+  --deterministic-seed 42
+```
+
+This produces byte-for-byte the same `votes.json` and `decisions.json` as
+the synchronous path over the same input, config, and seed.
 
 ## Running the tests
 

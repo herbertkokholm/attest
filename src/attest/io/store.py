@@ -2,14 +2,17 @@
 
 This module is the only place in the kernel that touches a filesystem. It
 reads an input-contract payload into a `NormalizedInput`, persists one
-epoch's raw votes, decisions, config, audit sample, and run records as plain
-JSON files under a run directory, and assembles a full
+epoch's raw votes, decisions, config, audit sample, batch handles, and run
+records as plain JSON files under a run directory, and assembles a full
 `attest.contracts.validation_record.ValidationRecord` from that stored
 state. Writes are idempotent: writing the same content twice yields the same
 file, and re-running a write for the same record id upserts it rather than
 duplicating it. Every epoch-scoped artifact (votes, decisions, audit rows) is
 stamped with the `ensemble_config_id` it was produced under, and a run
-directory refuses to mix data stamped with two different ids.
+directory refuses to mix data stamped with two different ids. Batch handles
+(`attest.vendors.batch.BatchHandle`) are persisted as opaque JSON, keyed by
+vendor name, so `attest.vendors.batch` can round-trip them without this
+module importing it back.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ VOTES_FILENAME = "votes.json"
 DECISIONS_FILENAME = "decisions.json"
 AUDIT_FILENAME = "audit.json"
 RUNS_FILENAME = "runs.json"
+BATCH_HANDLES_FILENAME = "batch_handles.json"
 
 
 class StoreError(ValueError):
@@ -345,6 +349,27 @@ class RunStore:
         raw: list[dict[str, Any]] = _read_json(self.root / RUNS_FILENAME) or []
         return [RunRecord.from_dict(r) for r in raw]
 
+    def write_batch_handle(self, vendor: str, handle: Mapping[str, Any]) -> None:
+        """Upsert one vendor's batch handle into `batch_handles.json`, keyed by vendor name.
+
+        `handle` is persisted as an opaque, plain JSON-serializable dict --
+        this store is agnostic to `attest.vendors.batch.BatchHandle`'s shape,
+        so `attest.vendors.batch` (which depends on this module for
+        persistence) never has to be imported back here.
+
+        Args:
+            vendor: Name of the vendor this handle belongs to.
+            handle: The handle's content, e.g. `BatchHandle.to_dict()`.
+        """
+        existing: dict[str, Any] = _read_json(self.root / BATCH_HANDLES_FILENAME) or {}
+        existing[vendor] = dict(handle)
+        _write_json(self.root / BATCH_HANDLES_FILENAME, existing)
+
+    def read_batch_handles(self) -> dict[str, dict[str, Any]]:
+        """Read all persisted batch handles as plain dicts, keyed by vendor name."""
+        payload: dict[str, Any] = _read_json(self.root / BATCH_HANDLES_FILENAME) or {}
+        return {vendor: dict(handle) for vendor, handle in payload.items()}
+
 
 def _predictions_by_vendor(
     votes: Sequence[VoteVector], truths: Mapping[str, int]
@@ -516,6 +541,7 @@ def assemble_validation_record(
 __all__ = [
     "CONFIG_FILENAME",
     "AUDIT_FILENAME",
+    "BATCH_HANDLES_FILENAME",
     "DECISIONS_FILENAME",
     "EPOCH_FILENAME",
     "RUNS_FILENAME",

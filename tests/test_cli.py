@@ -100,6 +100,118 @@ def test_end_to_end_screen_audit_validate(
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
+def test_screen_batch_mode_then_batch_fetch_matches_sync(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    sync_dir = tmp_path / "sync-run"
+    sync_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(sync_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert sync_rc == 0
+    capsys.readouterr()
+
+    batch_dir = tmp_path / "batch-run"
+    submit_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(batch_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--mode",
+            "batch",
+        ]
+    )
+    assert submit_rc == 0
+    submit_summary = json.loads(capsys.readouterr().out)
+    assert submit_summary["mode"] == "batch"
+    assert submit_summary["submitted"] is True
+    assert submit_summary["waited"] is False
+    # Nothing to fetch yet: votes are only written once batch-fetch completes.
+    assert not (batch_dir / "votes.json").exists()
+
+    fetch_rc = main(
+        [
+            "batch-fetch",
+            "--run-dir",
+            str(batch_dir),
+            "--input",
+            _GOLD_SET,
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert fetch_rc == 0
+    fetch_summary = json.loads(capsys.readouterr().out)
+    assert fetch_summary["prisma"] == submit_summary["prisma"]
+
+    assert (batch_dir / "votes.json").read_text() == (sync_dir / "votes.json").read_text()
+    assert (batch_dir / "decisions.json").read_text() == (sync_dir / "decisions.json").read_text()
+
+
+def test_screen_batch_mode_with_wait_matches_sync(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    sync_dir = tmp_path / "sync-run"
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(sync_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    batch_dir = tmp_path / "batch-run"
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(batch_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--mode",
+            "batch",
+            "--wait",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    assert (batch_dir / "votes.json").read_text() == (sync_dir / "votes.json").read_text()
+    assert (batch_dir / "decisions.json").read_text() == (sync_dir / "decisions.json").read_text()
+
+
 def test_adjudicate_lists_and_resolves(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     run_dir = tmp_path / "run"
     config_path = tmp_path / "config.json"
@@ -164,7 +276,7 @@ def test_ablate_over_gold_labeled_votes(tmp_path: Path, capsys: pytest.CaptureFi
 
 @pytest.mark.parametrize(
     "command",
-    ["screen", "adjudicate", "audit-draw", "audit-apply", "validate", "ablate"],
+    ["screen", "batch-fetch", "adjudicate", "audit-draw", "audit-apply", "validate", "ablate"],
 )
 def test_help_works_for_every_command(command: str) -> None:
     with pytest.raises(SystemExit) as excinfo:
@@ -183,6 +295,7 @@ def test_build_parser_registers_every_command() -> None:
     subparsers_action = next(action for action in parser._actions if action.dest == "command")
     assert set(subparsers_action.choices) == {
         "screen",
+        "batch-fetch",
         "adjudicate",
         "audit-draw",
         "audit-apply",

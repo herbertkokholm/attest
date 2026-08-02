@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # the fallback distribution name is "attest-screening". The import package
 # name stays "attest" either way.
 name = "attest"
-version = "0.2.0"
+version = "0.3.0"
 description = "Screening-and-self-validation kernel for LLM-ensemble evidence screening."
 readme = "README.md"
 requires-python = ">=3.11"

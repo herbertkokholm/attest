@@ -3,11 +3,19 @@
 Wires the prefilter, ensemble, adjudication, recall-audit, validation, and
 ablation engine modules into file-based subcommands over a local run
 directory (`attest.io.store.RunStore`). Every subcommand reads and writes
-its state exclusively through `attest.io.store`; `screen` is the only one
-that may reach the network, and only through a `Rater` built by
-`attest.vendors`. All other subcommands -- `adjudicate`, `audit-draw`,
-`audit-apply`, `validate`, `ablate` -- run entirely offline over files
-already written to the run directory.
+its state exclusively through `attest.io.store`; `screen` and `batch-fetch`
+are the only ones that may reach the network, and only through a `Rater` or
+`BatchRater` built by `attest.vendors`. All other subcommands -- `adjudicate`,
+`audit-draw`, `audit-apply`, `validate`, `ablate` -- run entirely offline
+over files already written to the run directory.
+
+`screen --mode batch` submits one vendor batch per rater and persists the
+resulting handles; with `--wait` it then polls each to completion before
+writing votes, exactly as `--mode sync` (the default) does synchronously.
+Without `--wait`, it exits right after submission, and a later `batch-fetch`
+invocation resumes from the persisted handles -- polling, fetching, and
+writing the votes -- so a batch job started in one process invocation can be
+completed in another.
 """
 
 from __future__ import annotations
@@ -32,13 +40,19 @@ from attest.planes.recall_audit import (
     draw_audit_sample,
     ingest_audit_labels,
 )
-from attest.prefilter.framework import Prefilter, require_nonempty
+from attest.prefilter.framework import Prefilter, PrefilterOutcome, require_nonempty
 from attest.provenance.config import Config as EnsembleConfig
 from attest.provenance.config import VendorSpec, compute_ensemble_config_id
-from attest.provenance.epochs import maybe_open_epoch
+from attest.provenance.epochs import Epoch, maybe_open_epoch
 from attest.provenance.runs import start_run
-from attest.vendors.base import DeterministicRater, Rater, run_ensemble
-from attest.vendors.registry import build_raters
+from attest.vendors.base import DeterministicRater, EnsembleRun, Rater, run_ensemble
+from attest.vendors.batch import (
+    BatchRater,
+    DeterministicBatchRater,
+    poll_and_fetch_batch,
+    submit_batch,
+)
+from attest.vendors.registry import build_batch_raters, build_raters
 
 _RELEVANT_LABEL = 1
 
@@ -101,6 +115,67 @@ def _build_raters(config: EnsembleConfig, *, deterministic_seed: int | None) -> 
         DeterministicRater(vendor=name, model=spec.model, seed=deterministic_seed)
         for name, spec in config.vendors.items()
     ]
+
+
+def _build_batch_raters(
+    config: EnsembleConfig, *, deterministic_seed: int | None
+) -> list[BatchRater]:
+    """Build one `BatchRater` per vendor in `config`, live or network-free.
+
+    Args:
+        config: The ensemble configuration naming which vendors participate.
+        deterministic_seed: If given, build seeded `DeterministicBatchRater`s
+            instead of live vendor adapters, so batch mode never touches the
+            network. If None, build live batch raters via
+            `attest.vendors.registry`.
+    """
+    if deterministic_seed is None:
+        return build_batch_raters(config)
+    return [
+        DeterministicBatchRater(vendor=name, model=spec.model, seed=deterministic_seed)
+        for name, spec in config.vendors.items()
+    ]
+
+
+def _persist_ensemble_run(
+    store: RunStore,
+    config: EnsembleConfig,
+    ensemble_config_id: str,
+    epoch: Epoch,
+    ensemble_run: EnsembleRun,
+    outcome: PrefilterOutcome,
+    track: str,
+) -> dict[str, Any]:
+    """Write an ensemble run's votes, decisions, and provenance record, and summarize them.
+
+    Shared by `screen` (both sync and waited batch mode) and `batch-fetch`,
+    so every path that produces an `EnsembleRun` persists it identically.
+    """
+    store.write_votes(ensemble_run.votes)
+
+    decisions = {
+        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau)
+        for vv in ensemble_run.votes
+    }
+    store.write_decisions(ensemble_config_id, decisions)
+
+    run = start_run(type="screening", track=track, epoch_id=epoch.id)
+    run.counts.update(
+        {
+            "identified": outcome.prisma.identified,
+            "screened": outcome.prisma.passed,
+            "escalated": sum(1 for d in decisions.values() if d.escalate),
+        }
+    )
+    run.finish()
+    store.write_run_record(run)
+
+    return {
+        "ensemble_config_id": ensemble_config_id,
+        "epoch": epoch.id,
+        "prisma": outcome.prisma.to_dict(),
+        "escalated": run.counts["escalated"],
+    }
 
 
 def _screen_excluded_population(
@@ -182,7 +257,15 @@ def _write_or_print(payload: str, out: str | None) -> None:
 
 
 def _cmd_screen(args: argparse.Namespace) -> int:
-    """Run the deterministic prefilter and ensemble over an input file, persisting the results."""
+    """Run the deterministic prefilter, then the ensemble, over an input file.
+
+    In `--mode sync` (the default), the ensemble runs synchronously and the
+    votes, decisions, and run record are persisted before this returns. In
+    `--mode batch`, one vendor batch per rater is submitted and its handle
+    persisted; with `--wait`, this then polls every batch to completion and
+    persists the run exactly as sync mode would, otherwise it returns right
+    after submission and a later `batch-fetch` invocation finishes the run.
+    """
     normalized = load_input(args.input)
     config = _load_ensemble_config(Path(args.config))
     store = RunStore(Path(args.run_dir))
@@ -198,33 +281,53 @@ def _cmd_screen(args: argparse.Namespace) -> int:
 
     outcome = _DEFAULT_PREFILTER.run(normalized.records)
 
-    raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
-    ensemble_run = run_ensemble(outcome.kept, raters, config)
-    store.write_votes(ensemble_run.votes)
+    if args.mode == "sync":
+        raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
+        ensemble_run = run_ensemble(outcome.kept, raters, config)
+    else:
+        batch_raters = _build_batch_raters(config, deterministic_seed=args.deterministic_seed)
+        submit_batch(outcome.kept, batch_raters, config, store)
+        if not args.wait:
+            summary = {
+                "ensemble_config_id": ensemble_config_id,
+                "epoch": epoch.id,
+                "prisma": outcome.prisma.to_dict(),
+                "mode": "batch",
+                "submitted": True,
+                "waited": False,
+            }
+            print(json.dumps(summary, indent=2, sort_keys=True))
+            return 0
+        ensemble_run = poll_and_fetch_batch(batch_raters, store)
 
-    decisions = {
-        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau)
-        for vv in ensemble_run.votes
-    }
-    store.write_decisions(ensemble_config_id, decisions)
-
-    run = start_run(type="screening", track=args.track, epoch_id=epoch.id)
-    run.counts.update(
-        {
-            "identified": outcome.prisma.identified,
-            "screened": outcome.prisma.passed,
-            "escalated": sum(1 for d in decisions.values() if d.escalate),
-        }
+    summary = _persist_ensemble_run(
+        store, config, ensemble_config_id, epoch, ensemble_run, outcome, args.track
     )
-    run.finish()
-    store.write_run_record(run)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
 
-    summary = {
-        "ensemble_config_id": ensemble_config_id,
-        "epoch": epoch.id,
-        "prisma": outcome.prisma.to_dict(),
-        "escalated": run.counts["escalated"],
-    }
+
+def _cmd_batch_fetch(args: argparse.Namespace) -> int:
+    """Resume a `screen --mode batch` run: poll persisted handles, fetch, and persist votes."""
+    normalized = load_input(args.input)
+    store = RunStore(Path(args.run_dir))
+    config = store.read_config()
+    ensemble_config_id = compute_ensemble_config_id(config)
+    epoch = store.read_epoch()
+
+    outcome = _DEFAULT_PREFILTER.run(normalized.records)
+
+    batch_raters = _build_batch_raters(config, deterministic_seed=args.deterministic_seed)
+    ensemble_run = poll_and_fetch_batch(
+        batch_raters,
+        store,
+        poll_interval=args.poll_interval,
+        max_poll_interval=args.max_poll_interval,
+    )
+
+    summary = _persist_ensemble_run(
+        store, config, ensemble_config_id, epoch, ensemble_run, outcome, args.track
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
@@ -377,7 +480,50 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Use network-free DeterministicRaters seeded with this value instead of live vendors.",
     )
+    screen.add_argument(
+        "--mode",
+        choices=("sync", "batch"),
+        default="sync",
+        help="Run the ensemble synchronously (default) or submit vendor batch jobs instead.",
+    )
+    screen.add_argument(
+        "--wait",
+        action="store_true",
+        help="In --mode batch, poll every submitted batch to completion before returning "
+        "instead of exiting right after submission.",
+    )
     screen.set_defaults(handler=_cmd_screen)
+
+    batch_fetch = subparsers.add_parser(
+        "batch-fetch",
+        help="Resume a 'screen --mode batch' run: poll handles, fetch, and persist votes.",
+    )
+    batch_fetch.add_argument("--run-dir", required=True, help="Run directory to read/write.")
+    batch_fetch.add_argument(
+        "--input", required=True, help="Original input-contract JSON file, for PRISMA counts."
+    )
+    batch_fetch.add_argument(
+        "--track", default="default", help="Track label recorded on this run's provenance record."
+    )
+    batch_fetch.add_argument(
+        "--deterministic-seed",
+        type=int,
+        default=None,
+        help="Use network-free DeterministicBatchRaters seeded with this value, not live vendors.",
+    )
+    batch_fetch.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Seconds to wait before the first re-poll of a still-pending batch.",
+    )
+    batch_fetch.add_argument(
+        "--max-poll-interval",
+        type=float,
+        default=30.0,
+        help="Upper bound on the backed-off poll interval.",
+    )
+    batch_fetch.set_defaults(handler=_cmd_batch_fetch)
 
     adjudicate = subparsers.add_parser(
         "adjudicate", help="List pending escalated decisions, or resolve one."
