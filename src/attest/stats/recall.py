@@ -1,12 +1,314 @@
-"""Recall estimation from random audit samples: sensitivity with a rule-of-three worst-case floor.
+"""Screening recall estimated from the random recall-audit plane, with a conservative floor.
 
-Screening recall is TP/(TP+FN). Because it can only be estimated from the
-random recall audit plane, sample sizes are typically small; the point
-estimate must always be reported alongside a rule-of-three worst-case floor,
-never alone.
+Recall can only be estimated from the random recall audit plane (see
+`attest.planes.recall_audit`), never from adjudication or ad hoc review,
+because it requires a probability sample of the screen-excluded population.
+Definitions, per audit stratum h:
+
+    n_h    number of screen-excluded records from stratum h drawn into the
+           random recall audit and gold-checked.
+    m_h    number of those n_h records that gold-checking revealed to be
+           truly relevant, i.e. false negatives found in the audit sample.
+    q_h    = m_h / n_h, the sample exclusion error rate.
+    |U_h|  total number of screen-excluded records in stratum h -- the
+           population the audit sample was drawn from.
+    FN_h   = q_h * |U_h|, the estimated number of missed relevant records
+           in stratum h, projecting the sample error rate onto the full
+           population of excludes.
+
+Screening recall is reported as a sensitivity:
+
+    recall = TP / (TP + sum_h FN_h)
+
+This is deliberately NOT the correct-exclusion rate `1 - q`: that answers a
+different question ("how often was an exclusion decision correct?", which
+is dominated by the large, easy majority of clearly-irrelevant excludes)
+rather than "what fraction of everything actually relevant did screening
+find?", which is what recall means and what a systematic review needs.
+
+Because audit samples are typically small, a point estimate alone
+overstates confidence. This module always returns a conservative recall
+floor alongside the point estimate: for each stratum, the floor substitutes
+a conservative upper bound on q_h for the raw q_h, using the rule-of-three
+bound (q_h = 3 / n_h) when zero false negatives were observed (m_h == 0),
+and the Wilson score upper bound otherwise. Zero observed events is exactly
+where the Wilson interval is least trustworthy as an upper bound (it
+degenerates toward the sample rate as m -> 0), so this module does not fall
+back to it there; the rule-of-three bound is the standard, citable
+approximation to a one-sided ~95% upper confidence bound on a zero-event
+binomial rate (Hanley & Lippman-Hand, 1983; Eypasch et al., 1995) and is
+used for that stratum regardless of the requested confidence level -- a
+fixed worst-case convention, not a recomputed interval bound. Callers that
+need a floor calibrated to a non-95% confidence level should treat this as
+a documented approximation, not an exact one.
+
+`scipy` is imported locally within functions so that `contracts`,
+`prefilter`, `ensemble`, and `provenance` remain importable without it
+installed.
 """
 
+from __future__ import annotations
 
-def recall_with_floor(true_positives: int, false_negatives: int) -> tuple[float, float]:
-    """Compute the recall point estimate and its rule-of-three floor (not yet implemented)."""
-    raise NotImplementedError
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+_RULE_OF_THREE_NUMERATOR = 3.0
+
+
+class RecallError(ValueError):
+    """Raised when recall inputs violate the audit design's invariants."""
+
+
+@dataclass(frozen=True)
+class Stratum:
+    """One audit stratum's exclusion-error inputs.
+
+    Attributes:
+        name: Stratum identifier (e.g. a track or dispersion band).
+        n: Number of screen-excluded records from this stratum drawn into
+            the random recall audit and gold-checked (n_h).
+        m: Number of those audited records that gold-checking revealed to
+            be truly relevant, i.e. false negatives found in the audit
+            sample (m_h).
+        population: Total number of screen-excluded records in this
+            stratum (|U_h|), the population the audit sample was drawn from.
+    """
+
+    name: str
+    n: int
+    m: int
+    population: int
+
+    def __post_init__(self) -> None:
+        if self.n <= 0:
+            raise RecallError(f"stratum '{self.name}': n must be positive, got {self.n}")
+        if not (0 <= self.m <= self.n):
+            raise RecallError(
+                f"stratum '{self.name}': m must be between 0 and n ({self.n}), got {self.m}"
+            )
+        if self.population < self.n:
+            raise RecallError(
+                f"stratum '{self.name}': population ({self.population}) must be >= "
+                f"audit sample size n ({self.n})"
+            )
+
+
+@dataclass(frozen=True)
+class RecallEstimate:
+    """Screening recall point estimate and conservative floor for one or more strata.
+
+    Attributes:
+        point: TP / (TP + sum_h FN_h), the sensitivity point estimate.
+        floor: TP / (TP + sum_h FN_h_floor), substituting each stratum's
+            conservative q_h bound. Always <= `point`.
+        ci: Interval on `point`, propagated from the per-stratum binomial
+            uncertainty in q_h under the stratified design. See
+            `stratified_recall` for the propagation method.
+        true_positives: TP used in both `point` and `floor`.
+        estimated_fn: Point estimate of sum_h FN_h.
+        estimated_fn_floor: Conservative estimate of sum_h FN_h underlying `floor`.
+    """
+
+    point: float
+    floor: float
+    ci: tuple[float, float]
+    true_positives: int
+    estimated_fn: float
+    estimated_fn_floor: float
+
+
+def wilson_interval(successes: int, n: int, confidence: float = 0.95) -> tuple[float, float]:
+    """Compute the Wilson score confidence interval for a binomial proportion.
+
+    Uses the Wilson score interval (Wilson, 1927) rather than the normal
+    (Wald) approximation, which is unreliable for small n or proportions
+    near 0 or 1 -- exactly the regime recall audits operate in.
+
+    Args:
+        successes: Number of observed successes (e.g. m_h).
+        n: Number of trials (e.g. n_h).
+        confidence: Two-sided confidence level, in (0, 1). Defaults to 0.95.
+
+    Returns:
+        `(low, high)`, the bounds of the Wilson score interval, clipped to
+        `[0, 1]`. `low <= successes / n <= high` always holds.
+
+    Raises:
+        RecallError: If `n <= 0`, `successes` is outside `[0, n]`, or
+            `confidence` is not strictly between 0 and 1.
+    """
+    if n <= 0:
+        raise RecallError(f"n must be positive, got {n}")
+    if not (0 <= successes <= n):
+        raise RecallError(f"successes must be between 0 and n ({n}), got {successes}")
+    if not (0.0 < confidence < 1.0):
+        raise RecallError(f"confidence must be strictly between 0 and 1, got {confidence}")
+
+    from scipy import stats as scipy_stats
+
+    z = float(scipy_stats.norm.ppf(1 - (1 - confidence) / 2))
+
+    p_hat = successes / n
+    denom = 1 + z**2 / n
+    center = (p_hat + z**2 / (2 * n)) / denom
+    half_width = (z / denom) * math.sqrt(p_hat * (1 - p_hat) / n + z**2 / (4 * n**2))
+    low = max(0.0, center - half_width)
+    high = min(1.0, center + half_width)
+    return (low, high)
+
+
+def exclusion_error_rate(stratum: Stratum) -> float:
+    """Compute q_h = m_h / n_h, the sample exclusion error rate for a stratum."""
+    return stratum.m / stratum.n
+
+
+def exclusion_error_rate_floor(stratum: Stratum, confidence: float = 0.95) -> float:
+    """Compute a conservative upper-bound estimate of q_h for the recall floor.
+
+    Substitutes the rule-of-three bound (3 / n_h) when no false negatives
+    were observed in the audit sample (m_h == 0); otherwise uses the Wilson
+    score upper bound at `confidence`. See the module docstring for why the
+    rule-of-three bound is used, and used as a fixed convention, at m_h == 0.
+
+    Args:
+        stratum: The audit stratum.
+        confidence: Confidence level for the Wilson upper bound, used only
+            when m_h > 0. Ignored when m_h == 0.
+
+    Returns:
+        The conservative (upper-bound) estimate of q_h, always >=
+        `exclusion_error_rate(stratum)`.
+    """
+    if stratum.m == 0:
+        return _RULE_OF_THREE_NUMERATOR / stratum.n
+    _low, high = wilson_interval(stratum.m, stratum.n, confidence=confidence)
+    return high
+
+
+def estimated_missed_fn(
+    stratum: Stratum, *, floor: bool = False, confidence: float = 0.95
+) -> float:
+    """Compute FN_h = q_h * |U_h|, the estimated number of missed relevant records in a stratum.
+
+    Args:
+        stratum: The audit stratum.
+        floor: If True, use the conservative `exclusion_error_rate_floor`
+            instead of the point estimate `exclusion_error_rate`.
+        confidence: Confidence level passed through to
+            `exclusion_error_rate_floor` when `floor` is True.
+
+    Returns:
+        The (point or floor) estimate of FN_h.
+    """
+    q = (
+        exclusion_error_rate_floor(stratum, confidence=confidence)
+        if floor
+        else exclusion_error_rate(stratum)
+    )
+    return q * stratum.population
+
+
+def stratified_recall(
+    strata: Sequence[Stratum],
+    true_positives: int,
+    confidence: float = 0.95,
+) -> RecallEstimate:
+    """Combine per-stratum exclusion-error estimates into an overall screening recall.
+
+    Point estimate: `recall = TP / (TP + sum_h FN_h)`. Floor: the same
+    formula with each stratum's conservative q_h bound (see
+    `exclusion_error_rate_floor`) substituted in.
+
+    The confidence interval on `point` combines each stratum's Wilson
+    interval on q_h into an interval on `sum_h FN_h`, via MOVER (Method Of
+    Variance Estimates Recovery: Zou & Donner, 2008; Newcombe, 1998). Each
+    stratum's Wilson interval `(q_h_low, q_h_high)` scales into an interval
+    on `FN_h` as `(q_h_low * |U_h|, q_h_high * |U_h|)`; MOVER treats half of
+    that interval's width as a standard-error surrogate for `FN_h` and
+    combines strata, which are independent draws, by root-sum-of-squares:
+    `SE(sum_h FN_h) = sqrt(sum_h SE(FN_h)^2)`. This is preferred over a
+    closed-form Wald variance (`|U_h|^2 * q_h(1 - q_h) / n_h`) because the
+    Wald form collapses to zero width whenever `q_h == 0` -- exactly the
+    zero-observed-error stratum this module's floor logic exists to guard
+    against -- while the Wilson interval it draws from remains well-behaved
+    at that boundary. The combined half-width is added to and subtracted
+    from the point estimate `sum_h FN_h` (not from the sum of Wilson
+    centers, so the interval is always centered on the reported point
+    estimate). Because `recall = TP / (TP + FN)` is monotonically
+    decreasing in `FN`, the lower/upper bounds on `FN` map to the
+    upper/lower bounds on recall respectively.
+
+    Args:
+        strata: One or more audit strata. Passing a single stratum reduces
+            exactly to the single-stratum (unstratified) case.
+        true_positives: TP: records included by screening that are truly
+            relevant, from the confusion matrix against gold labels.
+        confidence: Two-sided confidence level for `ci` and for the
+            Wilson-based part of the floor. Defaults to 0.95.
+
+    Returns:
+        A `RecallEstimate` with point, floor, and interval.
+
+    Raises:
+        RecallError: If `strata` is empty or `true_positives` is negative.
+    """
+    if not strata:
+        raise RecallError("stratified_recall requires at least one stratum")
+    if true_positives < 0:
+        raise RecallError(f"true_positives must be non-negative, got {true_positives}")
+
+    fn_point = sum(estimated_missed_fn(s) for s in strata)
+    fn_floor = sum(estimated_missed_fn(s, floor=True, confidence=confidence) for s in strata)
+
+    fn_half_width_sq_sum = 0.0
+    for s in strata:
+        q_low, q_high = wilson_interval(s.m, s.n, confidence=confidence)
+        half_width = (q_high - q_low) * s.population / 2
+        fn_half_width_sq_sum += half_width**2
+    fn_half_width = math.sqrt(fn_half_width_sq_sum)
+    fn_low = max(0.0, fn_point - fn_half_width)
+    fn_high = fn_point + fn_half_width
+
+    point = _recall(true_positives, fn_point)
+    floor = _recall(true_positives, fn_floor)
+    # recall is decreasing in FN, so FN's lower/upper bounds give recall's upper/lower bounds.
+    ci_high = _recall(true_positives, fn_low)
+    ci_low = _recall(true_positives, fn_high)
+
+    return RecallEstimate(
+        point=point,
+        floor=floor,
+        ci=(ci_low, ci_high),
+        true_positives=true_positives,
+        estimated_fn=fn_point,
+        estimated_fn_floor=fn_floor,
+    )
+
+
+def recall_with_floor(
+    stratum: Stratum,
+    true_positives: int,
+    confidence: float = 0.95,
+) -> RecallEstimate:
+    """Compute screening recall point estimate and floor for a single audit stratum.
+
+    Convenience entry point for the common single-stratum case; exactly
+    equivalent to `stratified_recall([stratum], true_positives, confidence)`.
+
+    Args:
+        stratum: The single audit stratum.
+        true_positives: TP: records included by screening that are truly relevant.
+        confidence: Two-sided confidence level for `ci` and the floor.
+
+    Returns:
+        A `RecallEstimate` with point, floor, and interval.
+    """
+    return stratified_recall([stratum], true_positives, confidence=confidence)
+
+
+def _recall(true_positives: int, false_negatives: float) -> float:
+    total = true_positives + false_negatives
+    if total <= 0:
+        return 0.0
+    return true_positives / total

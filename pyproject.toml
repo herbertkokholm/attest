@@ -12,7 +12,7 @@ description = "Screening-and-self-validation kernel for LLM-ensemble evidence sc
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
-dependencies = []
+dependencies = ["krippendorff>=0.6", "scipy>=1.11"]
 
 [project.scripts]
 attest = "attest.cli:main"
@@ -41,6 +41,10 @@ strict = true
 
 [[tool.mypy.overrides]]
 module = ["anthropic.*", "openai.*", "google.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["krippendorff.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
