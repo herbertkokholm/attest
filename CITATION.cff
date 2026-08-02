@@ -1,13 +1,13 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the associated method paper (working paper / manuscript in preparation, not yet published)."
-title: "attest"
+title: "attest: a screening-and-self-validation kernel for multi-vendor LLM ensemble evidence screening"
 authors:
   - family-names: "Kokholm"
     given-names: "Thomas Herbert"
-version: 0.1.0
-date-released: "2026-08-01"
+version: 0.2.0
+date-released: "2026-08-02"
 license: AGPL-3.0-or-later
-repository-code: "TODO: repository URL placeholder"
+repository-code: "https://github.com/herbertkokholm/attest"
 preferred-citation:
   type: unpublished
   title: "A Continuously Self-Validating Multi-Vendor LLM Architecture for Evidence Screening"
