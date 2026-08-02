@@ -294,5 +294,6 @@ def test_import_attest_batch_with_no_extras_installed_still_succeeds() -> None:
         "attest.vendors.providers.anthropic",
         "attest.vendors.providers.openai",
         "attest.vendors.providers.google",
+        "attest.vendors.providers.mistral",
     ):
         importlib.import_module(module_name)

@@ -40,11 +40,18 @@ def _build_openmodel(model: str) -> Rater:
     return OpenModelRater(model=model)
 
 
+def _build_mistral(model: str) -> Rater:
+    from attest.vendors.providers.mistral import MistralRater
+
+    return MistralRater(model=model)
+
+
 _PROVIDER_FACTORIES: dict[str, Callable[[str], Rater]] = {
     "anthropic": _build_anthropic,
     "openai": _build_openai,
     "google": _build_google,
     "openmodel": _build_openmodel,
+    "mistral": _build_mistral,
 }
 
 
@@ -66,10 +73,17 @@ def _build_google_batch(model: str) -> BatchRater:
     return GoogleBatchRater(model=model)
 
 
+def _build_mistral_batch(model: str) -> BatchRater:
+    from attest.vendors.providers.mistral import MistralBatchRater
+
+    return MistralBatchRater(model=model)
+
+
 _BATCH_PROVIDER_FACTORIES: dict[str, Callable[[str], BatchRater]] = {
     "anthropic": _build_anthropic_batch,
     "openai": _build_openai_batch,
     "google": _build_google_batch,
+    "mistral": _build_mistral_batch,
 }
 
 

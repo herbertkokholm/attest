@@ -6,7 +6,7 @@ import importlib
 
 from attest.contracts.input import Record
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
-from attest.vendors.base import DeterministicRater, run_ensemble
+from attest.vendors.base import DeterministicRater, Rater, run_ensemble
 from attest.vendors.registry import build_raters
 
 
@@ -107,5 +107,47 @@ def test_import_attest_with_no_extras_installed_still_succeeds() -> None:
         "attest.vendors.providers.openai",
         "attest.vendors.providers.google",
         "attest.vendors.providers.openmodel",
+        "attest.vendors.providers.mistral",
     ):
         importlib.import_module(module_name)
+
+
+def test_registry_builds_mistral_sync_and_batch_raters_conforming_to_protocols() -> None:
+    from attest.vendors.batch import BatchRater
+    from attest.vendors.registry import build_batch_raters
+
+    config = Config(
+        vendors={
+            "mistral": VendorSpec(
+                model="mistral-small-latest", model_version="v1", prompt_version="p1"
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert isinstance(rater, Rater)
+    assert (rater.vendor, rater.model) == ("mistral", "mistral-small-latest")
+    assert isinstance(batch_rater, BatchRater)
+    assert (batch_rater.vendor, batch_rater.model) == ("mistral", "mistral-small-latest")
+
+
+def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5", model_version="v1", prompt_version="p1"
+            ),
+            "openai": VendorSpec(model="gpt-5", model_version="v1", prompt_version="p1"),
+            "google": VendorSpec(model="gemini-1.5-pro", model_version="v1", prompt_version="p1"),
+            "mistral": VendorSpec(
+                model="mistral-small-latest", model_version="v1", prompt_version="p1"
+            ),
+        },
+        aggregation="majority",
+        tau=0.5,
+    )
+
+    assert config.x == 4
+    assert compute_ensemble_config_id(config) == compute_ensemble_config_id(config)

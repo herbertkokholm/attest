@@ -103,9 +103,12 @@ python tools/check_boundary.py
 `attest` is dependency-light: the kernel itself depends only on
 `krippendorff` and `scipy`/`statsmodels` for statistics (`attest.stats`),
 plus the Python standard library. Vendor SDKs (`anthropic`, `openai`,
-`google-generativeai`) are optional extras, imported lazily and only inside
-`attest.vendors.providers`, so installing `attest` without them still
-imports cleanly.
+`google-generativeai`, `mistralai`) are optional extras, imported lazily and
+only inside `attest.vendors.providers`, so installing `attest` without them
+still imports cleanly. Four vendor families are supported out of the box —
+Anthropic, OpenAI, Google, and Mistral — each a genuinely distinct model
+family, which is the point: it strengthens the inter-vendor independence
+argument behind the ensemble.
 
 ## Architecture at a glance
 
