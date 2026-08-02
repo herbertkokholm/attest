@@ -1,6 +1,396 @@
-"""Ensemble-size (x) sweep: measuring how agreement, recall, and cost scale with ensemble size."""
+"""Controlled ablation of ensemble size x over vendor subsets, on a frozen gold set.
+
+This module answers a single causal question: as ensemble size x grows, how
+do agreement, recall, precision, and escalation cost trade off, and which
+vendors actually drive that trade-off? It runs entirely offline, on
+`VoteVector`s already collected (e.g. via `attest.vendors.base.run_ensemble`
+once, over the full candidate vendor pool) and a frozen, fully gold-labeled
+dataset -- no network call happens here, only re-aggregation of stored votes
+over vendor subsets.
+
+This is deliberately independent of `attest.contracts.validation_record` (the
+longitudinal, per-epoch self-validation record for a live ensemble
+configuration) and of `attest.planes.recall_audit` (the online,
+probability-sample-based recall estimator for a live configuration's
+screen-excluded population). Both of those track a *running* configuration's
+real-world performance over time; this module instead runs a one-off,
+controlled comparison across hypothetical configurations on a dataset where
+every gold label is already known. The two must never be conflated:
+recall and precision here are computed by exact confusion counts against
+gold labels on every record, not estimated from a sample, and under an
+assumption specific to this controlled setting -- that an escalated
+(human-adjudicated) record resolves to its gold label -- which does not
+hold, and is not used, for the production recall estimate.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+import warnings
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, g
+from attest.ensemble.votes import VoteVector
+from attest.stats.agreement import AgreementError, agreement_report
+
+DEFAULT_MAX_SUBSETS_PER_X = 50
+_RELEVANT_LABEL = 1
 
 
-def sweep(sizes: list[int]) -> None:
-    """Run an ensemble-size sweep and report quality/cost tradeoffs (not yet implemented)."""
-    raise NotImplementedError
+class AblationError(ValueError):
+    """Raised when ablation sweep inputs are missing, inconsistent, or infeasible."""
+
+
+@dataclass(frozen=True)
+class LeaveOneOutContribution:
+    """One vendor's marginal contribution to a vendor subset's metrics.
+
+    Computed as `subset_metric - metric(subset without this vendor)`. For
+    alpha, raw_agreement, recall, and precision, a positive delta means the
+    vendor's presence improved that metric. For escalation_rate, a positive
+    delta means the vendor's presence *raised* the escalation rate, i.e.
+    increased the cost of the subset.
+
+    Attributes:
+        removed_vendor: The vendor whose marginal contribution this is.
+        delta_alpha: Change in ordinal Krippendorff's alpha, or None if
+            alpha is undefined for the subset with or without this vendor
+            (fewer than two raters shared a rated record).
+        delta_raw_agreement: Change in raw percent agreement, or None under
+            the same conditions as `delta_alpha`.
+        delta_recall: Change in recall against gold labels.
+        delta_precision: Change in precision against gold labels.
+        delta_escalation_rate: Change in escalation rate.
+    """
+
+    removed_vendor: str
+    delta_alpha: float | None
+    delta_raw_agreement: float | None
+    delta_recall: float
+    delta_precision: float
+    delta_escalation_rate: float
+
+
+@dataclass(frozen=True)
+class SubsetResult:
+    """Metrics for one (ensemble size x, vendor subset) point in the sweep.
+
+    Attributes:
+        x: Ensemble size: the number of vendors in `vendors`.
+        vendors: The vendor subset this result was computed over, as a
+            sorted tuple.
+        alpha: Ordinal Krippendorff's alpha over this subset's votes on the
+            gold set, or None if undefined (fewer than two raters shared a
+            rated record).
+        raw_agreement: Raw percent agreement, always reported alongside
+            alpha rather than alpha alone (see `attest.stats.agreement`).
+            None under the same conditions as `alpha`.
+        recall: Recall against gold labels: TP / (TP + FN). TP/FN are
+            computed from each record's final label -- the aggregation's
+            auto-label where its vote vector doesn't escalate, or the gold
+            label itself where it does (see module docstring).
+        precision: Precision against gold labels: TP / (TP + FP), using the
+            same final-label convention as `recall`.
+        escalation_rate: Fraction of this subset's records whose vote
+            vector escalated rather than auto-labeled.
+        n_records: Number of gold-set records this subset had at least one
+            vote on. Equal to the full gold set size unless some vendor in
+            the pool has missing votes on some records.
+        leave_one_out: Per-vendor marginal contribution of removing that
+            vendor from this subset, keyed by the removed vendor's name.
+    """
+
+    x: int
+    vendors: tuple[str, ...]
+    alpha: float | None
+    raw_agreement: float | None
+    recall: float
+    precision: float
+    escalation_rate: float
+    n_records: int
+    leave_one_out: dict[str, LeaveOneOutContribution]
+
+
+@dataclass(frozen=True)
+class AblationReport:
+    """Full ablation sweep result: one `SubsetResult` per (x, vendor subset) point.
+
+    Attributes:
+        candidate_vendors: The full candidate vendor pool the sweep was run
+            over.
+        results: Every computed subset's metrics, keyed by
+            `(x, vendor_subset)` where `vendor_subset` is a sorted tuple of
+            vendor names. Suitable for plotting quality (alpha, recall,
+            precision) and cost (escalation_rate) against x to find the
+            marginal-return "knee."
+    """
+
+    candidate_vendors: tuple[str, ...]
+    results: dict[tuple[int, tuple[str, ...]], SubsetResult]
+
+
+@dataclass(frozen=True)
+class _Metrics:
+    alpha: float | None
+    raw_agreement: float | None
+    recall: float
+    precision: float
+    escalation_rate: float
+    n_records: int
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _filtered_votes(votes: Sequence[VoteVector], subset: frozenset[str]) -> list[VoteVector]:
+    filtered: list[VoteVector] = []
+    for vv in votes:
+        kept = tuple(vote for vote in vv.votes if vote.vendor in subset)
+        if kept:
+            filtered.append(
+                VoteVector(
+                    record_id=vv.record_id, ensemble_config_id=vv.ensemble_config_id, votes=kept
+                )
+            )
+    return filtered
+
+
+def _compute_metrics(
+    filtered: Sequence[VoteVector],
+    truths: Mapping[str, int],
+    aggregation: str,
+    tau: float,
+) -> _Metrics:
+    if not filtered:
+        raise AblationError("vendor subset has zero overlapping votes with the gold set")
+
+    try:
+        # krippendorff.alpha divides by the expected-disagreement sum, which
+        # is exactly zero (and warns rather than raising) when every rater
+        # in the subset produced only one category; the nan check below
+        # already turns that into the documented "undefined" result, so the
+        # warning is expected noise, not a signal, and is suppressed here.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            report = agreement_report(filtered)
+        alpha: float | None = report.alpha
+        raw_agreement: float | None = report.raw_agreement
+        if alpha is not None and math.isnan(alpha):
+            alpha = None
+    except (AgreementError, ValueError):
+        alpha, raw_agreement = None, None
+
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+    escalations = 0
+    for vv in filtered:
+        if vv.record_id not in truths:
+            raise AblationError(f"record '{vv.record_id}' has no gold label in truths")
+        truth = truths[vv.record_id]
+        decision = g(vv, aggregation=aggregation, tau=tau)
+        final_label: int | None
+        if decision.escalate:
+            escalations += 1
+            # Perfect-adjudication assumption specific to this offline,
+            # fully gold-labeled ablation -- see module docstring.
+            final_label = truth
+        else:
+            final_label = decision.auto_label
+
+        predicted_positive = final_label == _RELEVANT_LABEL
+        actual_positive = truth == _RELEVANT_LABEL
+        if predicted_positive and actual_positive:
+            true_positives += 1
+        elif predicted_positive and not actual_positive:
+            false_positives += 1
+        elif not predicted_positive and actual_positive:
+            false_negatives += 1
+
+    n_records = len(filtered)
+    return _Metrics(
+        alpha=alpha,
+        raw_agreement=raw_agreement,
+        recall=_ratio(true_positives, true_positives + false_negatives),
+        precision=_ratio(true_positives, true_positives + false_positives),
+        escalation_rate=escalations / n_records,
+        n_records=n_records,
+    )
+
+
+def _delta(subset_value: float | None, reduced_value: float | None) -> float | None:
+    if subset_value is None or reduced_value is None:
+        return None
+    return subset_value - reduced_value
+
+
+def _leave_one_out(
+    subset: tuple[str, ...],
+    subset_metrics: _Metrics,
+    votes: Sequence[VoteVector],
+    truths: Mapping[str, int],
+    aggregation: str,
+    tau: float,
+) -> dict[str, LeaveOneOutContribution]:
+    contributions: dict[str, LeaveOneOutContribution] = {}
+    for removed in subset:
+        reduced = tuple(v for v in subset if v != removed)
+        reduced_filtered = _filtered_votes(votes, frozenset(reduced))
+        reduced_metrics = _compute_metrics(reduced_filtered, truths, aggregation, tau)
+        contributions[removed] = LeaveOneOutContribution(
+            removed_vendor=removed,
+            delta_alpha=_delta(subset_metrics.alpha, reduced_metrics.alpha),
+            delta_raw_agreement=_delta(subset_metrics.raw_agreement, reduced_metrics.raw_agreement),
+            delta_recall=subset_metrics.recall - reduced_metrics.recall,
+            delta_precision=subset_metrics.precision - reduced_metrics.precision,
+            delta_escalation_rate=subset_metrics.escalation_rate - reduced_metrics.escalation_rate,
+        )
+    return contributions
+
+
+def _stratified_sample_subsets(
+    vendors: Sequence[str], x: int, max_subsets: int, rng: random.Random
+) -> list[tuple[str, ...]]:
+    """Draw a stratified sample of `max_subsets` distinct size-x vendor subsets.
+
+    "Stratified" here means: each draw weights vendor selection inversely to
+    how often that vendor has already appeared among the subsets chosen so
+    far, so that no vendor is systematically starved of coverage across the
+    sample -- unlike uniform random sampling of combinations, which can by
+    chance under-represent a vendor when the sample is small relative to the
+    total number of combinations.
+    """
+    counts = {vendor: 0 for vendor in vendors}
+    chosen: set[tuple[str, ...]] = set()
+    max_attempts = max_subsets * 50
+    attempts = 0
+    while len(chosen) < max_subsets and attempts < max_attempts:
+        attempts += 1
+        pool = list(vendors)
+        weights = [1.0 / (counts[v] + 1) for v in pool]
+        picked: list[str] = []
+        for _ in range(x):
+            idx = rng.choices(range(len(pool)), weights=weights, k=1)[0]
+            picked.append(pool.pop(idx))
+            weights.pop(idx)
+        subset = tuple(sorted(picked))
+        if subset in chosen:
+            continue
+        chosen.add(subset)
+        for vendor in subset:
+            counts[vendor] += 1
+    return sorted(chosen)
+
+
+def _select_subsets(
+    vendors: Sequence[str], x: int, max_subsets: int, rng: random.Random
+) -> list[tuple[str, ...]]:
+    """Enumerate all size-x vendor subsets, or a documented stratified sample if infeasible."""
+    total = math.comb(len(vendors), x)
+    if total <= max_subsets:
+        return [tuple(c) for c in itertools.combinations(vendors, x)]
+    return _stratified_sample_subsets(vendors, x, max_subsets, rng)
+
+
+def sweep(
+    votes: Sequence[VoteVector],
+    truths: Mapping[str, int],
+    *,
+    vendors: Sequence[str] | None = None,
+    aggregation: str = AGGREGATION_BOUNDARY_DISPERSION,
+    tau: float = 0.0,
+    max_subsets_per_x: int = DEFAULT_MAX_SUBSETS_PER_X,
+    rng: random.Random | None = None,
+) -> AblationReport:
+    """Run a controlled ablation of ensemble size x over vendor subsets on a frozen gold set.
+
+    For every ensemble size `x` from 2 to the size of the candidate vendor
+    pool, enumerates every size-x vendor subset (or, when that is
+    infeasible, draws a documented stratified sample of them -- see
+    `_stratified_sample_subsets`) and computes, for each subset: ordinal
+    Krippendorff's alpha, raw agreement, recall, precision, escalation
+    rate, and each member vendor's leave-one-out marginal contribution.
+
+    Args:
+        votes: Stored vote vectors already collected for the full candidate
+            vendor pool over the frozen gold set (e.g. from one prior call
+            to `attest.vendors.base.run_ensemble`). No new votes are cast;
+            every subset's metrics are computed by re-aggregating this
+            stored data.
+        truths: Mapping of record id to gold ordinal label, covering every
+            record id present in `votes`.
+        vendors: The candidate vendor pool to sweep over. Defaults to the
+            sorted set of all vendor names appearing in `votes`.
+        aggregation: Aggregation rule name passed to `attest.ensemble.aggregate.g`.
+        tau: Dispersion threshold passed to `attest.ensemble.aggregate.g`.
+        max_subsets_per_x: Maximum number of subsets to evaluate per
+            ensemble size `x`. Sizes with more feasible subsets than this
+            fall back to a stratified sample instead of exhaustive
+            enumeration.
+        rng: Source of randomness for stratified sampling; defaults to a
+            fresh `random.Random()`. Pass a seeded `random.Random` for a
+            reproducible sample.
+
+    Returns:
+        An `AblationReport` keyed by `(x, vendor subset)`.
+
+    Raises:
+        AblationError: If `votes` is empty, the candidate vendor pool has
+            fewer than 2 vendors, `vendors` contains duplicates, or `truths`
+            is missing a gold label for a record present in `votes`.
+    """
+    if not votes:
+        raise AblationError("cannot run an ablation sweep over zero vote vectors")
+
+    if vendors is not None:
+        pool = tuple(vendors)
+    else:
+        pool = tuple(sorted({vote.vendor for vv in votes for vote in vv.votes}))
+    if len(set(pool)) != len(pool):
+        raise AblationError(f"candidate vendor pool contains duplicates: {pool}")
+    if len(pool) < 2:
+        raise AblationError(
+            f"ablation sweep requires at least 2 candidate vendors, got {len(pool)}"
+        )
+
+    missing_truths = {vv.record_id for vv in votes} - set(truths)
+    if missing_truths:
+        raise AblationError(f"missing gold labels for record id(s): {sorted(missing_truths)}")
+
+    active_rng = rng if rng is not None else random.Random()
+
+    results: dict[tuple[int, tuple[str, ...]], SubsetResult] = {}
+    for x in range(2, len(pool) + 1):
+        for subset in _select_subsets(pool, x, max_subsets_per_x, active_rng):
+            filtered = _filtered_votes(votes, frozenset(subset))
+            metrics = _compute_metrics(filtered, truths, aggregation, tau)
+            leave_one_out = _leave_one_out(subset, metrics, votes, truths, aggregation, tau)
+            results[(x, subset)] = SubsetResult(
+                x=x,
+                vendors=subset,
+                alpha=metrics.alpha,
+                raw_agreement=metrics.raw_agreement,
+                recall=metrics.recall,
+                precision=metrics.precision,
+                escalation_rate=metrics.escalation_rate,
+                n_records=metrics.n_records,
+                leave_one_out=leave_one_out,
+            )
+
+    return AblationReport(candidate_vendors=pool, results=results)
+
+
+__all__ = [
+    "DEFAULT_MAX_SUBSETS_PER_X",
+    "AblationError",
+    "AblationReport",
+    "LeaveOneOutContribution",
+    "SubsetResult",
+    "sweep",
+]
