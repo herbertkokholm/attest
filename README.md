@@ -176,7 +176,11 @@ argument behind the ensemble.
 - **Provenance** (`attest.provenance`) — immutable, content-hashed
   `ensemble_config_id`, stable epochs, and run records.
 - **Stats** (`attest.stats`) — inter-rater agreement (Krippendorff's alpha),
-  error correlation, and stratified recall with a rule-of-three floor.
+  error correlation, and stratified recall with a rule-of-three floor. See
+  [`docs/sentinel_drift_rule.md`](docs/sentinel_drift_rule.md) for the
+  threshold-rule rationale behind the (not yet implemented) latent-vendor-drift
+  sentinel, reusing this module's alpha; reproducible probe at
+  [`examples/sentinel_drift_probe.py`](examples/sentinel_drift_probe.py).
 - **I/O** (`attest.io.store`) — the only module that touches a filesystem: a
   local, idempotent JSON run directory.
 - **Vendors** (`attest.vendors`) — the `Rater` protocol, a network-free
