@@ -123,6 +123,56 @@ def test_end_to_end_screen_audit_validate(
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
+def test_audit_draw_size_all_draws_full_population(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    adjudicate_rc = main(
+        ["adjudicate", "--run-dir", str(run_dir), "--record-id", "rec-004", "--label", "-1"]
+    )
+    assert adjudicate_rc == 0
+    capsys.readouterr()
+
+    # The screen-excluded population here is exactly {rec-001, rec-004} (see
+    # test_end_to_end_screen_audit_validate above) -- "all" must draw both,
+    # with no --size number needed even though "2" happens to be the answer.
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+            "--seed",
+            "1",
+        ]
+    )
+    assert draw_rc == 0
+    drawn = json.loads(capsys.readouterr().out)["drawn"]
+    assert {row["record_id"] for row in drawn} == {"rec-001", "rec-004"}
+
+
 def test_screen_persists_a_tau_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from attest.ensemble.tau import describe_tau
 

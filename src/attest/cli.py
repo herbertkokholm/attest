@@ -228,6 +228,23 @@ def _screen_excluded_population(
     return population
 
 
+def _audit_draw_size(value: str) -> int | None:
+    """Parse `--size`: an int, or the literal "all" for the full population.
+
+    Returns None for "all", resolved to the actual population size once it
+    is known in `_cmd_audit_draw` (population size isn't known at argparse
+    time).
+    """
+    if value == "all":
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--size must be an integer or 'all', got {value!r}"
+        ) from exc
+
+
 def _population_sizes(population: Sequence[ExcludedRecord]) -> dict[str, int]:
     """Build stratum population sizes covering both stratified and unstratified audit draws.
 
@@ -402,10 +419,9 @@ def _cmd_audit_draw(args: argparse.Namespace) -> int:
     if not population:
         raise CliError("no screen-excluded records are available to audit")
 
+    size = args.size if args.size is not None else len(population)
     rng = Random(args.seed) if args.seed is not None else None
-    rows = draw_audit_sample(
-        population, args.size, stratify_by_track=args.stratify_by_track, rng=rng
-    )
+    rows = draw_audit_sample(population, size, stratify_by_track=args.stratify_by_track, rng=rng)
     store.write_audit_rows(ensemble_config_id, rows)
 
     drawn = [{"record_id": row.record_id, "stratum": row.stratum} for row in rows]
@@ -588,7 +604,13 @@ def _build_parser() -> argparse.ArgumentParser:
     audit_draw.add_argument(
         "--input", required=True, help="Original input-contract JSON file, for track lookup."
     )
-    audit_draw.add_argument("--size", type=int, required=True, help="Number of records to draw.")
+    audit_draw.add_argument(
+        "--size",
+        type=_audit_draw_size,
+        required=True,
+        help="Number of records to draw, or 'all' to draw the entire "
+        "screen-excluded population (for exact, not just floored, recall).",
+    )
     audit_draw.add_argument(
         "--stratify-by-track", action="store_true", help="Stratify the draw by record track."
     )

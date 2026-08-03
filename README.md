@@ -224,6 +224,10 @@ echo '{"<drawn-id-1>": 1, "<drawn-id-2>": -1}' > /tmp/labels.json
 attest audit-apply --run-dir /tmp/attest-demo --labels /tmp/labels.json
 ```
 
+`--size all` draws the entire screen-excluded population instead of a
+sample, for exact (not floored) recall when human-labeling the draw is
+free -- e.g. scoring against an already-published gold set.
+
 Assemble the self-validation record for the epoch:
 
 ```bash
