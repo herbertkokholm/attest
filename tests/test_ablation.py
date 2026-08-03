@@ -16,7 +16,9 @@ from attest.ensemble.votes import build_vote_vector
 from attest.provenance.config import Config, VendorSpec
 from attest.vendors.base import DeterministicRater, run_ensemble
 
-_SPEC = VendorSpec(model="deterministic-v1", model_version="v1", prompt_version="p1")
+_SPEC = VendorSpec(
+    model="deterministic-v1", model_version="v1", prompt_version="p1", temperature=0.0
+)
 
 
 def _record(record_id: str) -> Record:

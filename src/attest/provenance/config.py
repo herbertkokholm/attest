@@ -27,25 +27,32 @@ OUTPUT_CONTRACT_VERSION = "1"
 
 @dataclass(frozen=True)
 class VendorSpec:
-    """One ensemble member's model and prompt versioning.
+    """One ensemble member's model, prompt, and sampling versioning.
 
     Attributes:
         model: Model identifier used by this vendor (e.g. "gpt-4o").
         model_version: Version string of the model.
         prompt_version: Version identifier of the screening prompt used with
             this vendor.
+        temperature: Sampling temperature used with this vendor. Versioned
+            exactly like `model_version` and `prompt_version`: it is
+            hash-sensitive, so changing it yields a different
+            `ensemble_config_id` and opens a new epoch, the same as a model
+            or prompt change would.
     """
 
     model: str
     model_version: str
     prompt_version: str
+    temperature: float
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         """Return this vendor spec as a plain dict."""
         return {
             "model": self.model,
             "model_version": self.model_version,
             "prompt_version": self.prompt_version,
+            "temperature": self.temperature,
         }
 
 

@@ -12,12 +12,20 @@ from attest.provenance.epochs import maybe_open_epoch, open_epoch
 from attest.provenance.runs import RunRecord, start_run
 
 
-def _config(tau: float = 0.5) -> Config:
+def _config(tau: float = 0.5, temperature: float = 0.0) -> Config:
     return Config(
         vendors={
-            "openai": VendorSpec(model="gpt-4o", model_version="2024-08-06", prompt_version="v1"),
+            "openai": VendorSpec(
+                model="gpt-4o",
+                model_version="2024-08-06",
+                prompt_version="v1",
+                temperature=temperature,
+            ),
             "anthropic": VendorSpec(
-                model="claude-sonnet-5", model_version="2026-01", prompt_version="v1"
+                model="claude-sonnet-5",
+                model_version="2026-01",
+                prompt_version="v1",
+                temperature=temperature,
             ),
         },
         aggregation="majority",
@@ -36,9 +44,14 @@ def test_ensemble_config_id_is_independent_of_dict_construction_order() -> None:
     reordered = Config(
         vendors={
             "anthropic": VendorSpec(
-                model="claude-sonnet-5", model_version="2026-01", prompt_version="v1"
+                model="claude-sonnet-5",
+                model_version="2026-01",
+                prompt_version="v1",
+                temperature=0.0,
             ),
-            "openai": VendorSpec(model="gpt-4o", model_version="2024-08-06", prompt_version="v1"),
+            "openai": VendorSpec(
+                model="gpt-4o", model_version="2024-08-06", prompt_version="v1", temperature=0.0
+            ),
         },
         aggregation="majority",
         tau=0.5,
@@ -124,7 +137,12 @@ def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> No
     # always contained the contract; only the hash was previously blind to
     # it. The zero_policy-omission invariant this test is named for is
     # otherwise unchanged.
-    pinned_hash = "0a1673a4c96fed9bdefcce8d4d58c02220250f300943a152264e15991f3bb3a4"
+    #
+    # Retired and recomputed a second time when `VendorSpec.temperature` was
+    # added: every vendor now carries a `temperature`, always included in
+    # `VendorSpec.to_dict()` (unconditionally, like `model_version` and
+    # `prompt_version`), so it is unconditionally hash-sensitive too.
+    pinned_hash = "42b98574e686a64465726f31c3f84f893658fbd4d5085f4bcba354261a84edbc"
 
     assert compute_ensemble_config_id(_config()) == pinned_hash
 
@@ -185,6 +203,22 @@ def test_changed_field_yields_different_id_opens_epoch_and_logs_change() -> None
 
     assert log.history_of(id_after) == [event]
     assert log.previous_config_id(id_after) == id_before
+
+
+def test_temperature_change_yields_different_id_and_opens_epoch() -> None:
+    base = _config(temperature=0.0)
+    changed = _config(temperature=0.7)
+
+    id_before = compute_ensemble_config_id(base)
+    id_after = compute_ensemble_config_id(changed)
+    assert id_before != id_after
+
+    opened_at = datetime(2026, 1, 1, tzinfo=UTC)
+    epoch_before = open_epoch(base, opened_at=opened_at)
+    epoch_after = maybe_open_epoch(epoch_before, changed, opened_at=opened_at)
+
+    assert epoch_after.id != epoch_before.id
+    assert epoch_after.ensemble_config_id == id_after
 
 
 def test_maybe_open_epoch_reuses_current_epoch_when_config_is_unchanged() -> None:

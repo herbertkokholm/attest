@@ -7,7 +7,7 @@ import importlib
 from attest.contracts.input import Record
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
 from attest.vendors.base import DeterministicRater, Rater, run_ensemble
-from attest.vendors.registry import build_raters
+from attest.vendors.registry import build_batch_raters, build_raters
 
 
 def _record(record_id: str) -> Record:
@@ -17,8 +17,12 @@ def _record(record_id: str) -> Record:
 def _config() -> Config:
     return Config(
         vendors={
-            "vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1"),
-            "vendor-b": VendorSpec(model="model-b", model_version="v1", prompt_version="p1"),
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+            "vendor-b": VendorSpec(
+                model="model-b", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
         },
         aggregation="majority",
         tau=0.5,
@@ -64,7 +68,11 @@ def test_deterministic_rater_is_sensitive_to_an_explicit_prompt() -> None:
 
 def test_run_ensemble_resolves_prompt_per_record_track() -> None:
     config = Config(
-        vendors={"vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1")},
+        vendors={
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        },
         aggregation="majority",
         tau=0.5,
         track_prompts={"review-a": "criteria A", "review-b": "criteria B"},
@@ -117,8 +125,12 @@ def test_registry_builds_raters_from_config() -> None:
     raters = build_raters(
         config,
         factories={
-            "vendor-a": lambda model: DeterministicRater(vendor="vendor-a", model=model, seed=1),
-            "vendor-b": lambda model: DeterministicRater(vendor="vendor-b", model=model, seed=2),
+            "vendor-a": lambda spec: DeterministicRater(
+                vendor="vendor-a", model=spec.model, seed=1
+            ),
+            "vendor-b": lambda spec: DeterministicRater(
+                vendor="vendor-b", model=spec.model, seed=2
+            ),
         },
     )
 
@@ -130,7 +142,11 @@ def test_registry_builds_raters_from_config() -> None:
 
 def test_registry_raises_for_unknown_vendor() -> None:
     config = Config(
-        vendors={"mystery": VendorSpec(model="m", model_version="v1", prompt_version="p1")}
+        vendors={
+            "mystery": VendorSpec(
+                model="m", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
     )
 
     try:
@@ -162,7 +178,10 @@ def test_registry_builds_mistral_sync_and_batch_raters_conforming_to_protocols()
     config = Config(
         vendors={
             "mistral": VendorSpec(
-                model="mistral-small-latest", model_version="v1", prompt_version="p1"
+                model="mistral-small-latest",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.3,
             )
         }
     )
@@ -176,16 +195,44 @@ def test_registry_builds_mistral_sync_and_batch_raters_conforming_to_protocols()
     assert (batch_rater.vendor, batch_rater.model) == ("mistral", "mistral-small-latest")
 
 
+def test_registry_passes_the_whole_vendor_spec_to_provider_factories() -> None:
+    # model_version and temperature must actually reach the constructed
+    # rater, not just be hashed into the ensemble_config_id and dropped.
+    config = Config(
+        vendors={
+            "mistral": VendorSpec(
+                model="mistral-small-latest",
+                model_version="2026-01",
+                prompt_version="p1",
+                temperature=0.3,
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert (rater.model_version, rater.temperature) == ("2026-01", 0.3)
+    assert (batch_rater.model_version, batch_rater.temperature) == ("2026-01", 0.3)
+
+
 def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
     config = Config(
         vendors={
             "anthropic": VendorSpec(
-                model="claude-sonnet-5", model_version="v1", prompt_version="p1"
+                model="claude-sonnet-5", model_version="v1", prompt_version="p1", temperature=0.0
             ),
-            "openai": VendorSpec(model="gpt-5", model_version="v1", prompt_version="p1"),
-            "google": VendorSpec(model="gemini-1.5-pro", model_version="v1", prompt_version="p1"),
+            "openai": VendorSpec(
+                model="gpt-5", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+            "google": VendorSpec(
+                model="gemini-1.5-pro", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
             "mistral": VendorSpec(
-                model="mistral-small-latest", model_version="v1", prompt_version="p1"
+                model="mistral-small-latest",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
             ),
         },
         aggregation="majority",

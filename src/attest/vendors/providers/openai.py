@@ -17,6 +17,7 @@ from typing import Any
 from attest.contracts.input import Record
 from attest.vendors.base import (
     VendorResponseError,
+    check_model_version,
     compose_system_prompt,
     parse_ordinal_response,
 )
@@ -29,6 +30,14 @@ class OpenAIRater:
 
     Attributes:
         model: OpenAI model identifier (e.g. "gpt-4o").
+        model_version: Expected resolved model version. The Chat Completions
+            API has no separate version parameter -- `model` is already what
+            is sent -- so this is checked against the version the response
+            itself reports (`response.model`) after every call, catching a
+            floating alias silently resolving to a snapshot other than the
+            one this configuration was hashed under (see
+            `attest.vendors.base.check_model_version`).
+        temperature: Sampling temperature passed to the Chat Completions API.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``OPENAI_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -39,6 +48,8 @@ class OpenAIRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -63,10 +74,15 @@ class OpenAIRater:
 
         Returns:
             The parsed ordinal rating and the raw response payload.
+
+        Raises:
+            ModelVersionDriftError: If the response's `model` differs from
+                `self.model_version`.
         """
         response = self._client().chat.completions.create(
             model=self.model,
             max_completion_tokens=self.max_tokens,
+            temperature=self.temperature,
             messages=[
                 {
                     "role": "system",
@@ -78,9 +94,20 @@ class OpenAIRater:
                 },
             ],
         )
+        reported_version = getattr(response, "model", None)
+        check_model_version(
+            vendor=self.vendor,
+            model=self.model,
+            expected_version=self.model_version,
+            reported_version=reported_version,
+        )
         text = response.choices[0].message.content or ""
         ordinal = parse_ordinal_response(text)
-        raw_response: dict[str, Any] = {"text": text, "id": getattr(response, "id", None)}
+        raw_response: dict[str, Any] = {
+            "text": text,
+            "id": getattr(response, "id", None),
+            "model": reported_version,
+        }
         return ordinal, raw_response
 
 
@@ -94,6 +121,11 @@ class OpenAIBatchRater:
 
     Attributes:
         model: OpenAI model identifier (e.g. "gpt-4o").
+        model_version: Expected resolved model version, checked against each
+            batch result's own `model` field in `fetch` (see
+            `OpenAIRater.model_version` and
+            `attest.vendors.base.check_model_version`).
+        temperature: Sampling temperature passed to the Batch API.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``OPENAI_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -105,6 +137,8 @@ class OpenAIBatchRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -129,6 +163,7 @@ class OpenAIBatchRater:
             "body": {
                 "model": self.model,
                 "max_completion_tokens": self.max_tokens,
+                "temperature": self.temperature,
                 "messages": [
                     {"role": "system", "content": compose_system_prompt(prompt)},
                     {
@@ -195,6 +230,12 @@ class OpenAIBatchRater:
 
         A line whose request errored, or whose text does not parse as an
         ordinal rating, is simply absent from the returned mapping.
+
+        Raises:
+            ModelVersionDriftError: If a succeeded result's `model` field
+                differs from `self.model_version` -- not caught and skipped
+                like a parse failure, since it invalidates every result in
+                the batch, not just this record.
         """
         reverse = {custom_id: record_id for record_id, custom_id in handle.id_map.items()}
         client = self._client()
@@ -210,6 +251,13 @@ class OpenAIBatchRater:
             record_id = reverse.get(entry.get("custom_id"))
             if record_id is None or entry.get("error"):
                 continue
+            reported_version = entry["response"]["body"].get("model")
+            check_model_version(
+                vendor=self.vendor,
+                model=self.model,
+                expected_version=self.model_version,
+                reported_version=reported_version,
+            )
             text = entry["response"]["body"]["choices"][0]["message"]["content"] or ""
             try:
                 ordinal = parse_ordinal_response(text)

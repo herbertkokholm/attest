@@ -25,7 +25,7 @@ _VENDORS = ("v1", "v2", "v3")
 def _config(tau: float = 1.0) -> Config:
     return Config(
         vendors={
-            vendor: VendorSpec(model="m", model_version="1", prompt_version="p")
+            vendor: VendorSpec(model="m", model_version="1", prompt_version="p", temperature=0.0)
             for vendor in _VENDORS
         },
         aggregation="boundary_dispersion",
@@ -152,7 +152,9 @@ def test_config_write_rejects_conflicting_config(tmp_path: Path) -> None:
 
 def test_config_round_trips_with_track_prompts(tmp_path: Path) -> None:
     config = Config(
-        vendors={"v1": VendorSpec(model="m", model_version="1", prompt_version="p")},
+        vendors={
+            "v1": VendorSpec(model="m", model_version="1", prompt_version="p", temperature=0.0)
+        },
         aggregation="boundary_dispersion",
         tau=1.0,
         default_prompt="generic default",
@@ -167,7 +169,9 @@ def test_config_round_trips_with_track_prompts(tmp_path: Path) -> None:
 
 def test_config_round_trips_with_zero_policy(tmp_path: Path) -> None:
     config = Config(
-        vendors={"v1": VendorSpec(model="m", model_version="1", prompt_version="p")},
+        vendors={
+            "v1": VendorSpec(model="m", model_version="1", prompt_version="p", temperature=0.0)
+        },
         aggregation="boundary_dispersion",
         tau=1.0,
         zero_policy="include",

@@ -47,8 +47,12 @@ normalized = validate_and_normalize(payload)  # a dict matching the input contra
 
 config = Config(
     vendors={
-        "v1": VendorSpec(model="deterministic-v1", model_version="1", prompt_version="p1"),
-        "v2": VendorSpec(model="deterministic-v1", model_version="1", prompt_version="p1"),
+        "v1": VendorSpec(
+            model="deterministic-v1", model_version="1", prompt_version="p1", temperature=0.0
+        ),
+        "v2": VendorSpec(
+            model="deterministic-v1", model_version="1", prompt_version="p1", temperature=0.0
+        ),
     },
     aggregation="boundary_dispersion",
     tau=1.0,

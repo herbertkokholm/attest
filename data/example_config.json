@@ -3,12 +3,14 @@
     "anthropic": {
       "model": "claude-sonnet-5",
       "model_version": "2026-01",
-      "prompt_version": "screening-prompt-v1"
+      "prompt_version": "screening-prompt-v1",
+      "temperature": 0.0
     },
     "openai": {
       "model": "gpt-5",
       "model_version": "2026-01",
-      "prompt_version": "screening-prompt-v1"
+      "prompt_version": "screening-prompt-v1",
+      "temperature": 0.0
     }
   },
   "aggregation": "boundary_dispersion",

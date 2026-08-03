@@ -31,8 +31,12 @@ def _records(*ids: str) -> list[Record]:
 def _config() -> Config:
     return Config(
         vendors={
-            "vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1"),
-            "vendor-b": VendorSpec(model="model-b", model_version="v1", prompt_version="p1"),
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+            "vendor-b": VendorSpec(
+                model="model-b", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
         },
         aggregation="boundary_dispersion",
         tau=1.0,
@@ -155,8 +159,12 @@ def test_run_ensemble_batch_matches_run_ensemble_for_same_seed(tmp_path: Path) -
 def test_run_ensemble_batch_matches_run_ensemble_under_per_track_prompts(tmp_path: Path) -> None:
     config = Config(
         vendors={
-            "vendor-a": VendorSpec(model="model-a", model_version="v1", prompt_version="p1"),
-            "vendor-b": VendorSpec(model="model-b", model_version="v1", prompt_version="p1"),
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+            "vendor-b": VendorSpec(
+                model="model-b", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
         },
         aggregation="boundary_dispersion",
         tau=1.0,
@@ -239,8 +247,12 @@ def test_submit_batch_raises_on_ensemble_config_id_conflict(tmp_path: Path) -> N
 
     other_config = Config(
         vendors={
-            "vendor-a": VendorSpec(model="model-a", model_version="v2", prompt_version="p1"),
-            "vendor-b": VendorSpec(model="model-b", model_version="v1", prompt_version="p1"),
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v2", prompt_version="p1", temperature=0.0
+            ),
+            "vendor-b": VendorSpec(
+                model="model-b", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
         },
         aggregation="boundary_dispersion",
         tau=1.0,

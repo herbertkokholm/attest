@@ -80,11 +80,11 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
 
     Args:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
-            an object with "model", "model_version", "prompt_version"),
-            "aggregation", "tau", and optionally "default_prompt" (string),
-            "track_prompts" (mapping of track to prompt text), and/or
-            "zero_policy" (one of "escalate"/"include", default "escalate")
-            fields.
+            an object with "model", "model_version", "prompt_version",
+            "temperature"), "aggregation", "tau", and optionally
+            "default_prompt" (string), "track_prompts" (mapping of track to
+            prompt text), and/or "zero_policy" (one of "escalate"/"include",
+            default "escalate") fields.
 
     Returns:
         The parsed `EnsembleConfig`.
@@ -99,6 +99,7 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
             model=spec["model"],
             model_version=spec["model_version"],
             prompt_version=spec["prompt_version"],
+            temperature=float(spec["temperature"]),
         )
         for name, spec in payload["vendors"].items()
     }

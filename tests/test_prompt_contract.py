@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import warnings
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +27,7 @@ from attest.vendors.base import (
     compose_system_prompt,
     parse_ordinal_response,
 )
+from attest.vendors.batch import BatchHandle
 
 
 def _record(record_id: str = "rec-1") -> Record:
@@ -165,7 +167,7 @@ def test_deterministic_rater_rate_warns_when_prompt_contains_the_contract() -> N
 def _base_config(**overrides: Any) -> Config:
     defaults: dict[str, Any] = {
         "vendors": {
-            "v1": VendorSpec(model="m", model_version="1", prompt_version="p"),
+            "v1": VendorSpec(model="m", model_version="1", prompt_version="p", temperature=0.0),
         },
         "aggregation": "boundary_dispersion",
         "tau": 0.5,
@@ -192,17 +194,26 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
     # recomputed once, deliberately, when output_contract_version became
     # unconditional: a one-time id change for configs supplying no criteria,
     # since their composed prompt has always contained the contract -- only
-    # the hash was previously blind to it.
+    # the hash was previously blind to it. Retired and recomputed a second
+    # time when `VendorSpec.temperature` was added, unconditionally included
+    # in `VendorSpec.to_dict()` alongside `model_version`/`prompt_version`.
     config = _base_config()
     payload = config.to_dict()
     expected_payload = {
-        "vendors": {"v1": {"model": "m", "model_version": "1", "prompt_version": "p"}},
+        "vendors": {
+            "v1": {
+                "model": "m",
+                "model_version": "1",
+                "prompt_version": "p",
+                "temperature": 0.0,
+            }
+        },
         "aggregation": "boundary_dispersion",
         "tau": 0.5,
         "x": 1,
         "output_contract_version": OUTPUT_CONTRACT_VERSION,
     }
-    pinned_hash = "287a188fdd6f39accca0f9c6ee5be416fdfd42d0cf51f6537eaacebb6ce0a15d"
+    pinned_hash = "8ecfaf3773b34232283df03ea60a4cc30cf9fc2fff637e80eded8858a2463602"
 
     assert payload == expected_payload
     assert compute_ensemble_config_id(config) == pinned_hash
@@ -238,12 +249,12 @@ def test_anthropic_rater_composes_system_prompt() -> None:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
             block = SimpleNamespace(type="text", text="1")
-            return SimpleNamespace(content=[block], id="resp-1")
+            return SimpleNamespace(content=[block], id="resp-1", model="v1")
 
     class _FakeClient:
         messages = _FakeMessages()
 
-    rater = AnthropicRater(model="claude-sonnet-5")
+    rater = AnthropicRater(model="claude-sonnet-5", model_version="v1", temperature=0.2)
     rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
 
     rater.rate(_record())
@@ -251,6 +262,47 @@ def test_anthropic_rater_composes_system_prompt() -> None:
 
     rater.rate(_record(), prompt="custom criteria")
     assert captured["system"] == compose_system_prompt("custom criteria")
+
+
+def test_anthropic_rater_passes_temperature_to_the_api_call() -> None:
+    from attest.vendors.providers.anthropic import AnthropicRater
+
+    captured: dict[str, Any] = {}
+
+    class _FakeMessages:
+        def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            block = SimpleNamespace(type="text", text="1")
+            return SimpleNamespace(content=[block], id="resp-1", model="v1")
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    rater = AnthropicRater(model="claude-sonnet-5", model_version="v1", temperature=0.7)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    rater.rate(_record())
+
+    assert captured["temperature"] == 0.7
+
+
+def test_anthropic_rater_raises_on_model_version_drift() -> None:
+    from attest.vendors.base import ModelVersionDriftError
+    from attest.vendors.providers.anthropic import AnthropicRater
+
+    class _FakeMessages:
+        def create(self, **kwargs: Any) -> Any:
+            block = SimpleNamespace(type="text", text="1")
+            return SimpleNamespace(content=[block], id="resp-1", model="v2-snapshot")
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    rater = AnthropicRater(model="claude-sonnet-5", model_version="v1", temperature=0.0)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    with pytest.raises(ModelVersionDriftError, match="v2-snapshot"):
+        rater.rate(_record())
 
 
 def test_openai_rater_composes_system_prompt() -> None:
@@ -262,12 +314,14 @@ def test_openai_rater_composes_system_prompt() -> None:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
             message = SimpleNamespace(content="1")
-            return SimpleNamespace(choices=[SimpleNamespace(message=message)], id="resp-1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
+            )
 
     class _FakeClient:
         chat = SimpleNamespace(completions=_FakeCompletions())
 
-    rater = OpenAIRater(model="gpt-5")
+    rater = OpenAIRater(model="gpt-5", model_version="v1", temperature=0.2)
     rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
 
     rater.rate(_record())
@@ -278,6 +332,51 @@ def test_openai_rater_composes_system_prompt() -> None:
         "role": "system",
         "content": compose_system_prompt("custom criteria"),
     }
+
+
+def test_openai_rater_passes_temperature_to_the_api_call() -> None:
+    from attest.vendors.providers.openai import OpenAIRater
+
+    captured: dict[str, Any] = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            message = SimpleNamespace(content="1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
+            )
+
+    class _FakeClient:
+        chat = SimpleNamespace(completions=_FakeCompletions())
+
+    rater = OpenAIRater(model="gpt-5", model_version="v1", temperature=0.7)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    rater.rate(_record())
+
+    assert captured["temperature"] == 0.7
+
+
+def test_openai_rater_raises_on_model_version_drift() -> None:
+    from attest.vendors.base import ModelVersionDriftError
+    from attest.vendors.providers.openai import OpenAIRater
+
+    class _FakeCompletions:
+        def create(self, **kwargs: Any) -> Any:
+            message = SimpleNamespace(content="1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v2-snapshot"
+            )
+
+    class _FakeClient:
+        chat = SimpleNamespace(completions=_FakeCompletions())
+
+    rater = OpenAIRater(model="gpt-5", model_version="v1", temperature=0.0)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    with pytest.raises(ModelVersionDriftError, match="v2-snapshot"):
+        rater.rate(_record())
 
 
 def test_google_rater_composes_system_prompt() -> None:
@@ -293,13 +392,31 @@ def test_google_rater_composes_system_prompt() -> None:
         captured.append(prompt)
         return _FakeModel()
 
-    rater = GoogleRater(model="gemini-1.5-pro")
+    rater = GoogleRater(model="gemini-1.5-pro", model_version="v1", temperature=0.2)
     rater._client = _fake_client  # type: ignore[method-assign]
 
     rater.rate(_record())
     rater.rate(_record(), prompt="custom criteria")
 
     assert captured == [compose_system_prompt(None), compose_system_prompt("custom criteria")]
+
+
+def test_google_rater_passes_temperature_to_generation_config() -> None:
+    from attest.vendors.providers.google import GoogleRater
+
+    captured: dict[str, Any] = {}
+
+    class _FakeModel:
+        def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(text="1")
+
+    rater = GoogleRater(model="gemini-1.5-pro", model_version="v1", temperature=0.7)
+    rater._client = lambda prompt: _FakeModel()  # type: ignore[method-assign]
+
+    rater.rate(_record())
+
+    assert captured["generation_config"]["temperature"] == 0.7
 
 
 def test_mistral_rater_composes_system_prompt() -> None:
@@ -311,12 +428,14 @@ def test_mistral_rater_composes_system_prompt() -> None:
         def complete(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
             message = SimpleNamespace(content="1")
-            return SimpleNamespace(choices=[SimpleNamespace(message=message)], id="resp-1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
+            )
 
     class _FakeClient:
         chat = _FakeChat()
 
-    rater = MistralRater(model="mistral-small-latest")
+    rater = MistralRater(model="mistral-small-latest", model_version="v1", temperature=0.2)
     rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
 
     rater.rate(_record())
@@ -327,6 +446,51 @@ def test_mistral_rater_composes_system_prompt() -> None:
         "role": "system",
         "content": compose_system_prompt("custom criteria"),
     }
+
+
+def test_mistral_rater_passes_temperature_to_the_api_call() -> None:
+    from attest.vendors.providers.mistral import MistralRater
+
+    captured: dict[str, Any] = {}
+
+    class _FakeChat:
+        def complete(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            message = SimpleNamespace(content="1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
+            )
+
+    class _FakeClient:
+        chat = _FakeChat()
+
+    rater = MistralRater(model="mistral-small-latest", model_version="v1", temperature=0.7)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    rater.rate(_record())
+
+    assert captured["temperature"] == 0.7
+
+
+def test_mistral_rater_raises_on_model_version_drift() -> None:
+    from attest.vendors.base import ModelVersionDriftError
+    from attest.vendors.providers.mistral import MistralRater
+
+    class _FakeChat:
+        def complete(self, **kwargs: Any) -> Any:
+            message = SimpleNamespace(content="1")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], id="resp-1", model="v2-snapshot"
+            )
+
+    class _FakeClient:
+        chat = _FakeChat()
+
+    rater = MistralRater(model="mistral-small-latest", model_version="v1", temperature=0.0)
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+
+    with pytest.raises(ModelVersionDriftError, match="v2-snapshot"):
+        rater.rate(_record())
 
 
 def test_openmodel_rater_composes_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -342,7 +506,9 @@ def test_openmodel_rater_composes_system_prompt(monkeypatch: pytest.MonkeyPatch)
             return None
 
         def read(self) -> bytes:
-            return json.dumps({"choices": [{"message": {"content": "1"}}]}).encode("utf-8")
+            return json.dumps({"model": "v1", "choices": [{"message": {"content": "1"}}]}).encode(
+                "utf-8"
+            )
 
     def _fake_urlopen(request: Any, timeout: float) -> Any:
         captured["body"] = json.loads(request.data.decode("utf-8"))
@@ -350,7 +516,7 @@ def test_openmodel_rater_composes_system_prompt(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(openmodel.urllib.request, "urlopen", _fake_urlopen)
 
-    rater = openmodel.OpenModelRater(model="local-model")
+    rater = openmodel.OpenModelRater(model="local-model", model_version="v1", temperature=0.2)
     rater.rate(_record())
     assert captured["body"]["messages"][0] == {
         "role": "system",
@@ -364,25 +530,119 @@ def test_openmodel_rater_composes_system_prompt(monkeypatch: pytest.MonkeyPatch)
     }
 
 
+def test_openmodel_rater_passes_temperature_in_the_request_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from attest.vendors.providers import openmodel
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __enter__(self) -> _FakeResponse:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"model": "v1", "choices": [{"message": {"content": "1"}}]}).encode(
+                "utf-8"
+            )
+
+    def _fake_urlopen(request: Any, timeout: float) -> Any:
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setattr(openmodel.urllib.request, "urlopen", _fake_urlopen)
+
+    rater = openmodel.OpenModelRater(model="local-model", model_version="v1", temperature=0.7)
+    rater.rate(_record())
+
+    assert captured["body"]["temperature"] == 0.7
+
+
+def test_openmodel_rater_raises_on_model_version_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    from attest.vendors.base import ModelVersionDriftError
+    from attest.vendors.providers import openmodel
+
+    class _FakeResponse:
+        def __enter__(self) -> _FakeResponse:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"model": "v2-snapshot", "choices": [{"message": {"content": "1"}}]}
+            ).encode("utf-8")
+
+    def _fake_urlopen(request: Any, timeout: float) -> Any:
+        return _FakeResponse()
+
+    monkeypatch.setattr(openmodel.urllib.request, "urlopen", _fake_urlopen)
+
+    rater = openmodel.OpenModelRater(model="local-model", model_version="v1", temperature=0.0)
+
+    with pytest.raises(ModelVersionDriftError, match="v2-snapshot"):
+        rater.rate(_record())
+
+
 # --- providers: batch raters' request builders compose the system prompt -------
 
 
 def test_anthropic_batch_request_composes_system_prompt() -> None:
     from attest.vendors.providers.anthropic import AnthropicBatchRater
 
-    rater = AnthropicBatchRater(model="claude-sonnet-5")
+    rater = AnthropicBatchRater(model="claude-sonnet-5", model_version="v1", temperature=0.3)
 
     default_request = rater._request(_record(), "item-0", None)
     custom_request = rater._request(_record(), "item-0", "custom criteria")
 
     assert default_request["params"]["system"] == compose_system_prompt(None)
     assert custom_request["params"]["system"] == compose_system_prompt("custom criteria")
+    assert default_request["params"]["temperature"] == 0.3
+
+
+def test_anthropic_batch_fetch_raises_on_model_version_drift() -> None:
+    from attest.vendors.base import ModelVersionDriftError
+    from attest.vendors.providers.anthropic import AnthropicBatchRater
+
+    rater = AnthropicBatchRater(model="claude-sonnet-5", model_version="v1", temperature=0.0)
+    block = SimpleNamespace(type="text", text="1")
+    message = SimpleNamespace(content=[block], model="v2-snapshot")
+    entry = SimpleNamespace(
+        custom_id="item-0", result=SimpleNamespace(type="succeeded", message=message)
+    )
+
+    class _FakeBatches:
+        def results(self, batch_id: str) -> list[Any]:
+            return [entry]
+
+    class _FakeMessages:
+        batches = _FakeBatches()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
+    handle = BatchHandle(
+        vendor="anthropic",
+        model="claude-sonnet-5",
+        provider_batch_id="batch-1",
+        submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ensemble_config_id="cfg",
+        id_map={"rec-1": "item-0"},
+    )
+
+    with pytest.raises(ModelVersionDriftError, match="v2-snapshot"):
+        rater.fetch(handle)
 
 
 def test_openai_batch_request_line_composes_system_prompt() -> None:
     from attest.vendors.providers.openai import OpenAIBatchRater
 
-    rater = OpenAIBatchRater(model="gpt-5")
+    rater = OpenAIBatchRater(model="gpt-5", model_version="v1", temperature=0.3)
 
     default_line = rater._request_line(_record(), "item-0", None)
     custom_line = rater._request_line(_record(), "item-0", "custom criteria")
@@ -395,12 +655,13 @@ def test_openai_batch_request_line_composes_system_prompt() -> None:
         "role": "system",
         "content": compose_system_prompt("custom criteria"),
     }
+    assert default_line["body"]["temperature"] == 0.3
 
 
 def test_google_batch_request_composes_system_prompt() -> None:
     from attest.vendors.providers.google import GoogleBatchRater
 
-    rater = GoogleBatchRater(model="gemini-1.5-pro")
+    rater = GoogleBatchRater(model="gemini-1.5-pro", model_version="v1", temperature=0.3)
 
     default_request = rater._request(_record(), "item-0", None)
     custom_request = rater._request(_record(), "item-0", "custom criteria")
@@ -411,12 +672,13 @@ def test_google_batch_request_composes_system_prompt() -> None:
     assert custom_request["request"]["system_instruction"]["parts"][0]["text"] == (
         compose_system_prompt("custom criteria")
     )
+    assert default_request["request"]["generation_config"]["temperature"] == 0.3
 
 
 def test_mistral_batch_request_line_composes_system_prompt() -> None:
     from attest.vendors.providers.mistral import MistralBatchRater
 
-    rater = MistralBatchRater(model="mistral-small-latest")
+    rater = MistralBatchRater(model="mistral-small-latest", model_version="v1", temperature=0.3)
 
     default_line = rater._request_line(_record(), "item-0", None)
     custom_line = rater._request_line(_record(), "item-0", "custom criteria")
@@ -429,3 +691,4 @@ def test_mistral_batch_request_line_composes_system_prompt() -> None:
         "role": "system",
         "content": compose_system_prompt("custom criteria"),
     }
+    assert default_line["body"]["temperature"] == 0.3

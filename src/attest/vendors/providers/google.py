@@ -27,6 +27,15 @@ class GoogleRater:
 
     Attributes:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
+        model_version: Expected resolved model version. Retained for the
+            ensemble configuration's hash/audit trail only -- unlike
+            Anthropic/OpenAI/Mistral, `generate_content`'s response does not
+            expose which resolved snapshot served the request, so there is
+            no vendor-reported value to check this against here (see
+            `attest.vendors.base.check_model_version`, which every other
+            provider's `rate` calls but this one cannot).
+        temperature: Sampling temperature passed to `generate_content` via
+            `generation_config`.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``GOOGLE_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -37,6 +46,8 @@ class GoogleRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_output_tokens: int = 8
@@ -67,7 +78,10 @@ class GoogleRater:
         system_prompt = compose_system_prompt(prompt if prompt is not None else self.prompt)
         response = self._client(system_prompt).generate_content(
             f"Title: {record.title}\nAbstract: {record.abstract}",
-            generation_config={"max_output_tokens": self.max_output_tokens},
+            generation_config={
+                "max_output_tokens": self.max_output_tokens,
+                "temperature": self.temperature,
+            },
         )
         text = response.text
         ordinal = parse_ordinal_response(text)
@@ -93,6 +107,12 @@ class GoogleBatchRater:
 
     Attributes:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
+        model_version: Expected resolved model version. Retained for the
+            ensemble configuration's hash/audit trail only -- see
+            `GoogleRater.model_version` for why this batch surface cannot be
+            checked against a vendor-reported value either.
+        temperature: Sampling temperature passed to each request's
+            `generation_config`.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``GOOGLE_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -103,6 +123,8 @@ class GoogleBatchRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_output_tokens: int = 8
@@ -128,7 +150,10 @@ class GoogleBatchRater:
                     {"parts": [{"text": f"Title: {record.title}\nAbstract: {record.abstract}"}]}
                 ],
                 "system_instruction": {"parts": [{"text": compose_system_prompt(prompt)}]},
-                "generation_config": {"max_output_tokens": self.max_output_tokens},
+                "generation_config": {
+                    "max_output_tokens": self.max_output_tokens,
+                    "temperature": self.temperature,
+                },
             },
         }
 

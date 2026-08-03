@@ -50,6 +50,45 @@ class VendorResponseError(ValueError):
     """Raised when a vendor's raw response cannot be parsed into an ordinal rating."""
 
 
+class ModelVersionDriftError(ValueError):
+    """Raised when a vendor's response reports a different model version than configured.
+
+    Distinct from `VendorResponseError`: a parse failure is about one
+    record's reply; a version drift is about the vendor itself no longer
+    matching the `VendorSpec.model_version` this ensemble configuration was
+    pinned to and hashed under (e.g. a floating alias like "claude-sonnet-5"
+    silently resolved to a newer snapshot) -- it invalidates every result in
+    the run, not just one, so it is never caught and skipped the way an
+    unparseable reply is.
+    """
+
+
+def check_model_version(
+    *, vendor: str, model: str, expected_version: str, reported_version: str | None
+) -> None:
+    """Raise if a vendor's response reports a model version other than the one configured.
+
+    Args:
+        vendor: Vendor name, for the error message.
+        model: The model identifier that was requested.
+        expected_version: The `VendorSpec.model_version` this rater was
+            configured with.
+        reported_version: The vendor response's own account of which model
+            version actually served the request, or `None` if this vendor's
+            SDK/response does not expose that information -- in which case
+            no check is possible and this is a silent no-op.
+
+    Raises:
+        ModelVersionDriftError: If `reported_version` is not `None` and
+            differs from `expected_version`.
+    """
+    if reported_version is not None and reported_version != expected_version:
+        raise ModelVersionDriftError(
+            f"vendor '{vendor}' model '{model}' responded with version "
+            f"'{reported_version}', but this configuration expects '{expected_version}'"
+        )
+
+
 def compose_system_prompt(criteria: str | None) -> str:
     """Build the final system message from caller-supplied criteria plus the output contract.
 
@@ -293,8 +332,10 @@ __all__ = [
     "SCREENING_TASK_PREAMBLE",
     "DeterministicRater",
     "EnsembleRun",
+    "ModelVersionDriftError",
     "Rater",
     "VendorResponseError",
+    "check_model_version",
     "compose_system_prompt",
     "parse_ordinal_response",
     "run_ensemble",

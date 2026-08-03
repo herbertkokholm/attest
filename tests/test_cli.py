@@ -22,7 +22,12 @@ _DETERMINISTIC_SEED = 17
 
 
 def _write_config(path: Path) -> None:
-    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p1"}
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
     path.write_text(
         json.dumps(
             {
@@ -233,7 +238,12 @@ def test_screen_rejects_a_nonsensical_tau(
 ) -> None:
     run_dir = tmp_path / "run"
     config_path = tmp_path / "config.json"
-    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p1"}
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
     config_path.write_text(
         json.dumps(
             {
@@ -454,7 +464,12 @@ def test_screen_rejects_an_unrecognized_zero_policy(
 ) -> None:
     run_dir = tmp_path / "run"
     config_path = tmp_path / "config.json"
-    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p1"}
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
     config_path.write_text(
         json.dumps(
             {
@@ -490,7 +505,12 @@ def test_screen_with_zero_policy_include_auto_labels_the_tie(
 ) -> None:
     run_dir = tmp_path / "run"
     config_path = tmp_path / "config.json"
-    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p1"}
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
     config_path.write_text(
         json.dumps(
             {
@@ -528,7 +548,12 @@ def test_screen_with_zero_policy_include_auto_labels_the_tie(
 def test_ablate_over_gold_labeled_votes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     run_dir = tmp_path / "run"
     config_path = tmp_path / "config.json"
-    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p"}
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p",
+        "temperature": 0.0,
+    }
     config_path.write_text(
         json.dumps(
             {

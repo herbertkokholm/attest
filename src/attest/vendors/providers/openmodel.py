@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from attest.contracts.input import Record
-from attest.vendors.base import compose_system_prompt, parse_ordinal_response
+from attest.vendors.base import check_model_version, compose_system_prompt, parse_ordinal_response
 
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
@@ -24,6 +24,12 @@ class OpenModelRater:
 
     Attributes:
         model: Model identifier as known to the serving endpoint.
+        model_version: Expected resolved model version. The OpenAI-compatible
+            schema echoes the serving model back in the response's `model`
+            field, so this is checked against it after every call, the same
+            way `attest.vendors.providers.openai.OpenAIRater` checks a live
+            OpenAI response (see `attest.vendors.base.check_model_version`).
+        temperature: Sampling temperature included in the request payload.
         base_url: Base URL of the OpenAI-compatible server, without the
             trailing `/chat/completions` path.
         api_key: Optional bearer token for the endpoint, if it requires one.
@@ -36,6 +42,8 @@ class OpenModelRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     base_url: str = DEFAULT_BASE_URL
     api_key: str | None = None
     prompt: str | None = None
@@ -52,10 +60,15 @@ class OpenModelRater:
 
         Returns:
             The parsed ordinal rating and the raw decoded JSON response.
+
+        Raises:
+            ModelVersionDriftError: If the response's `model` differs from
+                `self.model_version`.
         """
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
             "messages": [
                 {
                     "role": "system",
@@ -76,6 +89,12 @@ class OpenModelRater:
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             body: dict[str, Any] = json.loads(response.read().decode("utf-8"))
+        check_model_version(
+            vendor=self.vendor,
+            model=self.model,
+            expected_version=self.model_version,
+            reported_version=body.get("model"),
+        )
         text = body["choices"][0]["message"]["content"]
         ordinal = parse_ordinal_response(text)
         return ordinal, body

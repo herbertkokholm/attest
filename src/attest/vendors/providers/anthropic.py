@@ -15,6 +15,7 @@ from typing import Any
 from attest.contracts.input import Record
 from attest.vendors.base import (
     VendorResponseError,
+    check_model_version,
     compose_system_prompt,
     parse_ordinal_response,
 )
@@ -27,6 +28,14 @@ class AnthropicRater:
 
     Attributes:
         model: Anthropic model identifier (e.g. "claude-sonnet-5").
+        model_version: Expected resolved model version. The Messages API has
+            no separate version parameter -- `model` is already what is sent
+            -- so this is checked against the version the response itself
+            reports (`response.model`) after every call, catching a floating
+            alias silently resolving to a snapshot other than the one this
+            configuration was hashed under (see
+            `attest.vendors.base.check_model_version`).
+        temperature: Sampling temperature passed to the Messages API.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -37,6 +46,8 @@ class AnthropicRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -61,10 +72,15 @@ class AnthropicRater:
 
         Returns:
             The parsed ordinal rating and the raw response payload.
+
+        Raises:
+            ModelVersionDriftError: If the response's `model` differs from
+                `self.model_version`.
         """
         response = self._client().messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
+            temperature=self.temperature,
             system=compose_system_prompt(prompt if prompt is not None else self.prompt),
             messages=[
                 {
@@ -73,11 +89,22 @@ class AnthropicRater:
                 }
             ],
         )
+        reported_version = getattr(response, "model", None)
+        check_model_version(
+            vendor=self.vendor,
+            model=self.model,
+            expected_version=self.model_version,
+            reported_version=reported_version,
+        )
         text = "".join(
             block.text for block in response.content if getattr(block, "type", "") == "text"
         )
         ordinal = parse_ordinal_response(text)
-        raw_response: dict[str, Any] = {"text": text, "id": getattr(response, "id", None)}
+        raw_response: dict[str, Any] = {
+            "text": text,
+            "id": getattr(response, "id", None),
+            "model": reported_version,
+        }
         return ordinal, raw_response
 
 
@@ -91,6 +118,11 @@ class AnthropicBatchRater:
 
     Attributes:
         model: Anthropic model identifier (e.g. "claude-sonnet-5").
+        model_version: Expected resolved model version, checked against each
+            batch result's own `message.model` in `fetch` (see
+            `AnthropicRater.model_version` and
+            `attest.vendors.base.check_model_version`).
+        temperature: Sampling temperature passed to the Message Batches API.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -101,6 +133,8 @@ class AnthropicBatchRater:
     """
 
     model: str
+    model_version: str
+    temperature: float
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -122,6 +156,7 @@ class AnthropicBatchRater:
             "params": {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
                 "system": compose_system_prompt(prompt),
                 "messages": [
                     {
@@ -178,6 +213,12 @@ class AnthropicBatchRater:
 
         A record whose result did not succeed, or whose text does not parse
         as an ordinal rating, is simply absent from the returned mapping.
+
+        Raises:
+            ModelVersionDriftError: If a succeeded result's `message.model`
+                differs from `self.model_version` -- not caught and skipped
+                like a parse failure, since it invalidates every result in
+                the batch, not just this record.
         """
         reverse = {custom_id: record_id for record_id, custom_id in handle.id_map.items()}
         results: dict[str, tuple[int, Any]] = {}
@@ -185,6 +226,13 @@ class AnthropicBatchRater:
             record_id = reverse.get(entry.custom_id)
             if record_id is None or entry.result.type != "succeeded":
                 continue
+            reported_version = getattr(entry.result.message, "model", None)
+            check_model_version(
+                vendor=self.vendor,
+                model=self.model,
+                expected_version=self.model_version,
+                reported_version=reported_version,
+            )
             text = "".join(
                 block.text
                 for block in entry.result.message.content
@@ -194,5 +242,8 @@ class AnthropicBatchRater:
                 ordinal = parse_ordinal_response(text)
             except VendorResponseError:
                 continue
-            results[record_id] = (ordinal, {"text": text, "custom_id": entry.custom_id})
+            results[record_id] = (
+                ordinal,
+                {"text": text, "custom_id": entry.custom_id, "model": reported_version},
+            )
         return results
