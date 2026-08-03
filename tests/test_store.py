@@ -10,6 +10,7 @@ import pytest
 
 from attest.contracts.input import ExternalId, Record
 from attest.ensemble.aggregate import g
+from attest.ensemble.tau import describe_tau
 from attest.ensemble.votes import VoteVector, build_vote_vector
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
 from attest.planes.recall_audit import AuditRow
@@ -210,6 +211,33 @@ def test_raw_responses_reject_conflicting_stamp(tmp_path: Path) -> None:
 
     with pytest.raises(StoreError):
         store.write_raw_responses("cfg-b", {"r2": {"v1": {"text": "-1"}}})
+
+
+# --- RunStore: tau report ---------------------------------------------------------
+
+
+def test_tau_report_round_trips(tmp_path: Path) -> None:
+    report = describe_tau(0.3, 4)
+    store = RunStore(tmp_path / "run")
+
+    store.write_tau_report(report)
+
+    assert store.read_tau_report() == report
+
+
+def test_tau_report_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_tau_report() is None
+
+
+def test_tau_report_write_overwrites_previous_report(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    store.write_tau_report(describe_tau(0.3, 4))
+    store.write_tau_report(describe_tau(0.6, 4))
+
+    assert store.read_tau_report() == describe_tau(0.6, 4)
 
 
 # --- RunStore: audit rows and run records ---------------------------------------

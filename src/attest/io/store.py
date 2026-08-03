@@ -34,6 +34,7 @@ from attest.contracts.validation_record import (
 from attest.contracts.validation_record import Config as RecordConfig
 from attest.contracts.validation_record import build as build_validation_record
 from attest.ensemble.aggregate import Decision
+from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
 from attest.planes.adjudication import AdjudicationError, final_label
 from attest.planes.recall_audit import AuditRow, build_strata
@@ -56,6 +57,7 @@ AUDIT_FILENAME = "audit.json"
 RUNS_FILENAME = "runs.json"
 BATCH_HANDLES_FILENAME = "batch_handles.json"
 RAW_RESPONSES_FILENAME = "raw_responses.json"
+TAU_REPORT_FILENAME = "tau_report.json"
 
 
 class StoreError(ValueError):
@@ -402,6 +404,23 @@ class RunStore:
         payload: dict[str, Any] = _read_json(self.root / BATCH_HANDLES_FILENAME) or {}
         return {vendor: dict(handle) for vendor, handle in payload.items()}
 
+    def write_tau_report(self, report: TauReport) -> None:
+        """Persist the tau proof (see `attest.ensemble.tau`) for this run's current config.
+
+        Overwrites any previously stored report -- there is exactly one
+        current tau proof per run directory, not one per epoch, since it
+        describes the currently loaded config's `tau`/`x`, not any
+        particular batch of votes.
+        """
+        _write_json(self.root / TAU_REPORT_FILENAME, report.to_dict())
+
+    def read_tau_report(self) -> TauReport | None:
+        """Read the persisted tau proof, or None if `write_tau_report` was never called."""
+        payload = _read_json(self.root / TAU_REPORT_FILENAME)
+        if payload is None:
+            return None
+        return TauReport.from_dict(payload)
+
 
 def _predictions_by_vendor(
     votes: Sequence[VoteVector], truths: Mapping[str, int]
@@ -578,6 +597,7 @@ __all__ = [
     "EPOCH_FILENAME",
     "RAW_RESPONSES_FILENAME",
     "RUNS_FILENAME",
+    "TAU_REPORT_FILENAME",
     "VOTES_FILENAME",
     "RunStore",
     "StoreError",

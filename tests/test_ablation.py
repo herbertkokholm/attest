@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 
 import pytest
 
 from attest.ablation.xsweep import AblationError, sweep
 from attest.contracts.input import Record
+from attest.ensemble.tau import describe_tau
 from attest.provenance.config import Config, VendorSpec
 from attest.vendors.base import DeterministicRater, run_ensemble
 
@@ -115,6 +117,47 @@ def test_sweep_returns_finite_metrics_for_every_subset() -> None:
             assert not math.isnan(contribution.delta_escalation_rate)
             if contribution.delta_alpha is not None:
                 assert math.isfinite(contribution.delta_alpha)
+
+
+# --- tau_report attachment and the fixed-tau-across-x' caveat ------------------
+
+
+def test_sweep_attaches_the_per_x_tau_report_to_each_subset_result() -> None:
+    record_ids = ["r1", "r2", "r3", "r4", "r5"]
+    raters = [DeterministicRater(vendor=v, seed=i) for i, v in enumerate(["a", "b", "c"])]
+    votes = _run(raters, record_ids)
+    truths = {rid: (1 if i % 2 == 0 else -1) for i, rid in enumerate(record_ids)}
+
+    report = sweep(votes, truths, tau=0.3)
+
+    for (x, _subset), result in report.results.items():
+        assert result.tau_report == describe_tau(0.3, x)
+        assert result.tau_report.x == x
+
+
+def test_sweep_warns_once_when_it_spans_more_than_one_x(recwarn: pytest.WarningsRecorder) -> None:
+    record_ids = ["r1", "r2", "r3", "r4", "r5"]
+    raters = [DeterministicRater(vendor=v, seed=i) for i, v in enumerate(["a", "b", "c"])]
+    votes = _run(raters, record_ids)
+    truths = {rid: (1 if i % 2 == 0 else -1) for i, rid in enumerate(record_ids)}
+
+    sweep(votes, truths)
+
+    tau_warnings = [w for w in recwarn.list if "not comparable across x" in str(w.message)]
+    assert len(tau_warnings) == 1
+
+
+def test_sweep_does_not_warn_when_only_one_x_is_swept() -> None:
+    # A 2-vendor pool only ever sweeps x=2, so there is no cross-x' comparison
+    # to warn about.
+    record_ids = ["r1", "r2", "r3"]
+    raters = [DeterministicRater(vendor=v, seed=i) for i, v in enumerate(["a", "b"])]
+    votes = _run(raters, record_ids)
+    truths = {rid: 1 for rid in record_ids}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sweep(votes, truths)
 
 
 # --- leave-one-out --------------------------------------------------------------

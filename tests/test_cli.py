@@ -106,6 +106,129 @@ def test_end_to_end_screen_audit_validate(
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
+def test_screen_persists_a_tau_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from attest.ensemble.tau import describe_tau
+
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    payload = json.loads((run_dir / "tau_report.json").read_text())
+    expected = describe_tau(1.0, 2)
+    assert payload["tau"] == expected.tau
+    assert payload["x"] == expected.x
+    assert payload["dispersion_inert"] is True
+
+
+def test_screen_warns_for_a_dispersion_inert_tau(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)  # tau=1.0, x=2 -- above the max reachable dispersion.
+
+    with pytest.warns(UserWarning, match="dispersion term"):
+        rc = main(
+            [
+                "screen",
+                "--input",
+                _GOLD_SET,
+                "--config",
+                str(config_path),
+                "--run-dir",
+                str(run_dir),
+                "--deterministic-seed",
+                str(_DETERMINISTIC_SEED),
+            ]
+        )
+    assert rc == 0
+    capsys.readouterr()
+
+
+def test_screen_rejects_a_nonsensical_tau(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {"model": "deterministic-v1", "model_version": "1", "prompt_version": "p1"}
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 0.0,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 1
+    assert "tau must be > 0" in capsys.readouterr().err
+    assert not (run_dir / "votes.json").exists()
+
+
+def test_validate_surfaces_the_tau_report_as_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from attest.ensemble.tau import describe_tau
+
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+
+    assert record["tau_report"] == describe_tau(1.0, 2).to_dict()
+    # The frozen validation-record schema itself is untouched by this addition.
+    assert record["schema_version"] == "1.0"
+
+
 def test_screen_batch_mode_then_batch_fetch_matches_sync(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

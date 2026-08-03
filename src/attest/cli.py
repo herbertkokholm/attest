@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -32,6 +33,7 @@ from typing import Any
 from attest.ablation.xsweep import DEFAULT_MAX_SUBSETS_PER_X, AblationReport, sweep
 from attest.contracts.input import NormalizedInput
 from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, Decision, g
+from attest.ensemble.tau import validate_tau
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
 from attest.planes.adjudication import final_label
 from attest.planes.recall_audit import (
@@ -250,6 +252,7 @@ def _ablation_report_to_dict(report: AblationReport) -> dict[str, Any]:
                     }
                     for vendor, contribution in result.leave_one_out.items()
                 },
+                "tau_report": result.tau_report.to_dict(),
             }
             for result in report.results.values()
         ],
@@ -285,6 +288,11 @@ def _cmd_screen(args: argparse.Namespace) -> int:
         current_epoch = None
     epoch = maybe_open_epoch(current_epoch, config)
     store.write_epoch(epoch)
+
+    tau_report = validate_tau(config.tau, config.x)
+    for message in tau_report.warnings:
+        warnings.warn(message, stacklevel=2)
+    store.write_tau_report(tau_report)
 
     outcome = _DEFAULT_PREFILTER.run(normalized.records)
 
@@ -430,7 +438,16 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         confidence=args.confidence,
     )
 
-    _write_or_print(record.to_json(), args.out)
+    payload = record.to_dict()
+    tau_report = store.read_tau_report()
+    if tau_report is not None:
+        # Provenance, not part of the frozen validation-record schema: the
+        # tau proof (see attest.ensemble.tau) for the config this epoch ran
+        # under, so every validation record self-documents why its tau
+        # behaves the way it does.
+        payload["tau_report"] = tau_report.to_dict()
+
+    _write_or_print(json.dumps(payload, indent=2), args.out)
     return 0
 
 

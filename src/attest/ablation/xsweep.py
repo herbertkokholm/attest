@@ -21,6 +21,22 @@ gold labels on every record, not estimated from a sample, and under an
 assumption specific to this controlled setting -- that an escalated
 (human-adjudicated) record resolves to its gold label -- which does not
 hold, and is not used, for the production recall estimate.
+
+Ablation caveat on `tau`: `sweep` calls `attest.ensemble.aggregate.g` with a
+single, fixed `tau` across every swept ensemble size `x'`. As
+`attest.ensemble.tau` proves, `tau`'s effective meaning -- which regime of
+the escalation step function it falls in -- depends on `x'`, since the set
+of dispersion values attainable by an `x'`-vote vector changes with `x'`.
+A fixed raw `tau` is therefore not a fixed "amount of strictness" across the
+sweep: it may be firmly inside one regime at a small `x'` and effectively
+inert (or on a knife's edge) at a larger one. This module deliberately does
+NOT re-resolve `tau` per `x'` -- doing so would change `g`'s decisions for
+existing callers and fixtures, which is out of scope for a sweep whose whole
+point is to compare fixed-`tau` behavior across `x'`. Instead, each
+`SubsetResult.tau_report` documents what the sweep's fixed `tau` actually
+does at that result's own `x`, and `sweep` emits a single `warnings.warn`
+when it spans more than one `x'` value, so callers reading raw metrics
+across `x'` are not misled into treating `tau` as calibrated between them.
 """
 
 from __future__ import annotations
@@ -33,6 +49,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, g
+from attest.ensemble.tau import TauReport, describe_tau
 from attest.ensemble.votes import VoteVector
 from attest.stats.agreement import AgreementError, agreement_report
 
@@ -101,6 +118,14 @@ class SubsetResult:
             the pool has missing votes on some records.
         leave_one_out: Per-vendor marginal contribution of removing that
             vendor from this subset, keyed by the removed vendor's name.
+        tau_report: What the sweep's single, fixed `tau` (see `sweep`'s
+            `tau` argument) actually does at this subset's own `x` (see
+            `attest.ensemble.tau.describe_tau`) -- not a re-resolved,
+            per-`x` tau. `g` is called with the sweep's fixed `tau` for
+            every subset, unchanged; this field only documents, after the
+            fact, what that fixed value means at this particular `x`, since
+            the same raw `tau` is not comparable in strength across `x`
+            (see the module docstring's ablation caveat).
     """
 
     x: int
@@ -112,6 +137,7 @@ class SubsetResult:
     escalation_rate: float
     n_records: int
     leave_one_out: dict[str, LeaveOneOutContribution]
+    tau_report: TauReport
 
 
 @dataclass(frozen=True)
@@ -365,8 +391,24 @@ def sweep(
 
     active_rng = rng if rng is not None else random.Random()
 
+    if len(pool) > 2:
+        # More than one x' is swept (x ranges 2..len(pool)), so the single,
+        # fixed tau below is not comparable in strength across x' -- see the
+        # module docstring's ablation caveat. Warn once per sweep call,
+        # rather than once per (x, subset), to avoid warning-spamming a
+        # sweep that evaluates many subsets.
+        warnings.warn(
+            f"sweep() spans ensemble sizes x=2..{len(pool)} with a single fixed tau={tau}; "
+            "tau's effective strictness is not comparable across x' (see "
+            "attest.ensemble.tau) -- see each SubsetResult.tau_report for what tau "
+            "actually does at that result's own x.",
+            stacklevel=2,
+        )
+
+    tau_reports_by_x: dict[int, TauReport] = {}
     results: dict[tuple[int, tuple[str, ...]], SubsetResult] = {}
     for x in range(2, len(pool) + 1):
+        tau_report = tau_reports_by_x.setdefault(x, describe_tau(tau, x))
         for subset in _select_subsets(pool, x, max_subsets_per_x, active_rng):
             filtered = _filtered_votes(votes, frozenset(subset))
             metrics = _compute_metrics(filtered, truths, aggregation, tau)
@@ -381,6 +423,7 @@ def sweep(
                 escalation_rate=metrics.escalation_rate,
                 n_records=metrics.n_records,
                 leave_one_out=leave_one_out,
+                tau_report=tau_report,
             )
 
     return AblationReport(candidate_vendors=pool, results=results)
