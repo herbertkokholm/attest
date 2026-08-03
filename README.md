@@ -56,22 +56,49 @@ config = Config(
 raters = [DeterministicRater(vendor=name, seed=42) for name in config.vendors]
 ensemble_run = run_ensemble(normalized.records, raters, config)
 decisions = {
-    vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau) for vv in ensemble_run.votes
+    vv.record_id: g(
+        vv, aggregation=config.aggregation, tau=config.tau, zero_policy=config.zero_policy
+    )
+    for vv in ensemble_run.votes
 }
 ```
 
-By default every rater falls back to its own hardcoded
-`attest.vendors.base.DEFAULT_SCREENING_PROMPT`, which carries no
-review-specific eligibility criteria. To screen against a review's actual
-published criteria, set `Config.default_prompt` (applied to every record)
-and/or `Config.track_prompts` (a mapping of `record.track` to prompt text,
-overriding `default_prompt` for that track) -- `run_ensemble` and
-`submit_batch` resolve the right prompt per record automatically via
+By default every rater falls back to the kernel's own generic
+`attest.vendors.base.SCREENING_TASK_PREAMBLE`, which carries no
+review-specific eligibility criteria; `compose_system_prompt` appends the
+kernel-owned output-format instruction (`OUTPUT_CONTRACT`) to whatever
+criteria text is in force, so callers/config supply criteria only and never
+need to restate the output contract themselves. To screen against a
+review's actual published criteria, set `Config.default_prompt` (applied to
+every record) and/or `Config.track_prompts` (a mapping of `record.track` to
+criteria text, overriding `default_prompt` for that track) -- `run_ensemble`
+and `submit_batch` resolve the right criteria per record automatically via
 `Config.prompt_for_track`, so one ensemble configuration can screen several
 reviews' records in a single run, each against its own criteria, while still
 voting with the same vendors/models/aggregation on all of them. Both fields
 are part of the hashed configuration content, so changing either changes
 `ensemble_config_id`.
+
+`g`'s boundary+dispersion rule never auto-commits the uncertain ordinal (0)
+as a final label -- a vote vector whose mean is exactly 0 either escalates
+to a human (`Config.zero_policy = "escalate"`, the default) or is folded
+into `+1` (`zero_policy = "include"`). There is deliberately no "exclude"
+option: auto-excluding on ensemble uncertainty is the one disposition that
+would silently destroy recall. `zero_policy` is part of the hashed
+configuration content, like `default_prompt`/`track_prompts` above.
+
+`tau` is a threshold on a quantity (sample standard deviation over the
+ordinal domain `{-1, 0, +1}`) that only attains a finite, enumerable set of
+values for a given ensemble size `x` -- so most `tau` values are
+behaviorally identical to a canonical one, and `tau` is not comparable
+across different `x`. `attest.ensemble.tau` proves this and makes it
+self-documenting: `describe_tau`/`validate_tau` produce a `TauReport`
+(reachable dispersion values, the canonical interval `tau` falls in,
+warnings for a suspicious `tau`), and `resolve_tau` computes a safe `tau`
+from a declared policy instead of a hand-picked decimal. `attest screen`
+validates `config.tau` at epoch-open time and persists the report to
+`tau_report.json` in the run directory; `attest validate` surfaces it
+alongside the validation record.
 
 ## The two stable contracts
 
@@ -81,12 +108,12 @@ interfaces: change them only via an explicit version bump, never in place.
 - **`attest.contracts.input`** (`SCHEMA_VERSION = "1.0"`) — the shape of
   records submitted to attest for screening: id, title, abstract, track,
   external ids, and an optional gold label.
-- **`attest.contracts.validation_record`** (`SCHEMA_VERSION = "1.0"`) — one
+- **`attest.contracts.validation_record`** (`SCHEMA_VERSION = "1.1"`) — one
   self-validation record per stable ensemble-configuration epoch: the
-  ensemble config, inter-rater agreement, error correlation, escalation
-  rate, recall (point estimate *and* rule-of-three worst-case floor,
-  reported together, never the point estimate alone), confusion matrix, and
-  PRISMA flow counts.
+  ensemble config (including `zero_policy`), inter-rater agreement, error
+  correlation, escalation rate, recall (point estimate *and* rule-of-three
+  worst-case floor, reported together, never the point estimate alone),
+  confusion matrix, and PRISMA flow counts.
 
 ## The boundary rule
 
@@ -130,7 +157,9 @@ argument behind the ensemble.
   counts.
 - **Ensemble** (`attest.ensemble`) — runs each configured vendor's `Rater`
   over a record and aggregates the vote vector into an auto-label or an
-  escalation (`attest.ensemble.aggregate.g`).
+  escalation (`attest.ensemble.aggregate.g`); `attest.ensemble.tau` proves
+  and exploits `tau`'s step-function structure to validate, describe, and
+  derive it instead of leaving it a hand-picked decimal.
 - **Three statistically separated planes** (`attest.planes`) — form a
   firewall so that recall is never estimated from a biased sample:
   - `adjudication` — resolves escalated (disagreement) records with an
@@ -175,8 +204,9 @@ attest screen \
 ```
 
 This prints a summary (PRISMA counts, escalation count) and persists votes,
-decisions, config, and a run record under `--run-dir`. List and resolve any
-escalated records:
+decisions, config, a `tau_report.json` self-documenting what `config.tau`
+does at this ensemble size (see `attest.ensemble.tau` above), and a run
+record under `--run-dir`. List and resolve any escalated records:
 
 ```bash
 attest adjudicate --run-dir /tmp/attest-demo
@@ -206,6 +236,11 @@ against a frozen gold set:
 ```bash
 attest ablate --run-dir /tmp/attest-demo --input data/example_gold_set.json
 ```
+
+`--tau` and `--zero-policy` are held fixed across every swept ensemble size
+`x'` in this command (they describe the sweep call, not something the sweep
+varies) -- each result's `tau_report` documents what the fixed `tau`
+actually means at that result's own `x`.
 
 Every subcommand except `screen` and `batch-fetch` runs entirely offline
 over files already written to the run directory; `screen` and `batch-fetch`
