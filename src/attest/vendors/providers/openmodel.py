@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from attest.contracts.input import Record
-from attest.vendors.base import DEFAULT_SCREENING_PROMPT, parse_ordinal_response
+from attest.vendors.base import compose_system_prompt, parse_ordinal_response
 
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
@@ -27,7 +27,10 @@ class OpenModelRater:
         base_url: Base URL of the OpenAI-compatible server, without the
             trailing `/chat/completions` path.
         api_key: Optional bearer token for the endpoint, if it requires one.
-        prompt: System prompt instructing the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
         timeout: Request timeout in seconds.
     """
@@ -35,7 +38,7 @@ class OpenModelRater:
     model: str
     base_url: str = DEFAULT_BASE_URL
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_tokens: int = 8
     timeout: float = 30.0
     vendor: str = field(default="openmodel", init=False)
@@ -54,7 +57,10 @@ class OpenModelRater:
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [
-                {"role": "system", "content": prompt if prompt is not None else self.prompt},
+                {
+                    "role": "system",
+                    "content": compose_system_prompt(prompt if prompt is not None else self.prompt),
+                },
                 {
                     "role": "user",
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",

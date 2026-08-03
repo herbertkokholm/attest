@@ -14,8 +14,8 @@ from typing import Any
 
 from attest.contracts.input import Record
 from attest.vendors.base import (
-    DEFAULT_SCREENING_PROMPT,
     VendorResponseError,
+    compose_system_prompt,
     parse_ordinal_response,
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
@@ -29,13 +29,16 @@ class GoogleRater:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``GOOGLE_API_KEY``) when None.
-        prompt: System instruction telling the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_output_tokens: Maximum tokens to request in the reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_output_tokens: int = 8
     vendor: str = field(default="google", init=False)
 
@@ -61,7 +64,8 @@ class GoogleRater:
         Returns:
             The parsed ordinal rating and the raw response payload.
         """
-        response = self._client(prompt if prompt is not None else self.prompt).generate_content(
+        system_prompt = compose_system_prompt(prompt if prompt is not None else self.prompt)
+        response = self._client(system_prompt).generate_content(
             f"Title: {record.title}\nAbstract: {record.abstract}",
             generation_config={"max_output_tokens": self.max_output_tokens},
         )
@@ -91,13 +95,16 @@ class GoogleBatchRater:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``GOOGLE_API_KEY``) when None.
-        prompt: System instruction telling the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_output_tokens: Maximum tokens to request in each reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_output_tokens: int = 8
     vendor: str = field(default="google", init=False)
 
@@ -113,14 +120,14 @@ class GoogleBatchRater:
             genai.configure(api_key=self.api_key)
         return genai
 
-    def _request(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
+    def _request(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
         return {
             "key": custom_id,
             "request": {
                 "contents": [
                     {"parts": [{"text": f"Title: {record.title}\nAbstract: {record.abstract}"}]}
                 ],
-                "system_instruction": {"parts": [{"text": prompt}]},
+                "system_instruction": {"parts": [{"text": compose_system_prompt(prompt)}]},
                 "generation_config": {"max_output_tokens": self.max_output_tokens},
             },
         }

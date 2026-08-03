@@ -16,8 +16,8 @@ from typing import Any
 
 from attest.contracts.input import Record
 from attest.vendors.base import (
-    DEFAULT_SCREENING_PROMPT,
     VendorResponseError,
+    compose_system_prompt,
     parse_ordinal_response,
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
@@ -31,13 +31,16 @@ class MistralRater:
         model: Mistral model identifier (e.g. "mistral-small-latest").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``MISTRAL_API_KEY``) when None.
-        prompt: System prompt instructing the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_tokens: int = 8
     vendor: str = field(default="mistral", init=False)
 
@@ -65,7 +68,10 @@ class MistralRater:
             model=self.model,
             max_tokens=self.max_tokens,
             messages=[
-                {"role": "system", "content": prompt if prompt is not None else self.prompt},
+                {
+                    "role": "system",
+                    "content": compose_system_prompt(prompt if prompt is not None else self.prompt),
+                },
                 {
                     "role": "user",
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
@@ -98,13 +104,16 @@ class MistralBatchRater:
         model: Mistral model identifier (e.g. "mistral-small-latest").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``MISTRAL_API_KEY``) when None.
-        prompt: System prompt instructing the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in each reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_tokens: int = 8
     vendor: str = field(default="mistral", init=False)
 
@@ -118,14 +127,14 @@ class MistralBatchRater:
             ) from exc
         return Mistral(api_key=self.api_key)
 
-    def _request_line(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
+    def _request_line(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
         return {
             "custom_id": custom_id,
             "body": {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
                 "messages": [
-                    {"role": "system", "content": prompt},
+                    {"role": "system", "content": compose_system_prompt(prompt)},
                     {
                         "role": "user",
                         "content": f"Title: {record.title}\nAbstract: {record.abstract}",

@@ -14,8 +14,8 @@ from typing import Any
 
 from attest.contracts.input import Record
 from attest.vendors.base import (
-    DEFAULT_SCREENING_PROMPT,
     VendorResponseError,
+    compose_system_prompt,
     parse_ordinal_response,
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
@@ -29,13 +29,16 @@ class AnthropicRater:
         model: Anthropic model identifier (e.g. "claude-sonnet-5").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
-        prompt: System prompt instructing the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_tokens: int = 8
     vendor: str = field(default="anthropic", init=False)
 
@@ -62,7 +65,7 @@ class AnthropicRater:
         response = self._client().messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=prompt if prompt is not None else self.prompt,
+            system=compose_system_prompt(prompt if prompt is not None else self.prompt),
             messages=[
                 {
                     "role": "user",
@@ -90,13 +93,16 @@ class AnthropicBatchRater:
         model: Anthropic model identifier (e.g. "claude-sonnet-5").
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
-        prompt: System prompt instructing the model how to rate a record.
+        prompt: Screening criteria text, or None to use the kernel's generic
+            fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
+            only -- `compose_system_prompt` appends the output contract, so
+            this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in each reply.
     """
 
     model: str
     api_key: str | None = None
-    prompt: str = DEFAULT_SCREENING_PROMPT
+    prompt: str | None = None
     max_tokens: int = 8
     vendor: str = field(default="anthropic", init=False)
 
@@ -110,13 +116,13 @@ class AnthropicBatchRater:
             ) from exc
         return anthropic.Anthropic(api_key=self.api_key)
 
-    def _request(self, record: Record, custom_id: str, prompt: str) -> dict[str, Any]:
+    def _request(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
         return {
             "custom_id": custom_id,
             "params": {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "system": prompt,
+                "system": compose_system_prompt(prompt),
                 "messages": [
                     {
                         "role": "user",

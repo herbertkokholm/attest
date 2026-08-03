@@ -15,6 +15,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+# Version of the kernel-owned output-format contract appended to every
+# screening prompt (see `attest.vendors.base.OUTPUT_CONTRACT`). Defined here,
+# not in `attest.vendors.base`, because `Config.to_dict` needs it for hashing
+# and `attest.vendors.base` already imports from this module -- importing it
+# back the other way would be circular. `attest.vendors.base` re-exports it.
+OUTPUT_CONTRACT_VERSION = "1"
+
 
 @dataclass(frozen=True)
 class VendorSpec:
@@ -94,7 +101,16 @@ class Config:
         `default_prompt`/`track_prompts` are omitted when unset, so a
         configuration that does not use them serializes -- and hashes into
         `compute_ensemble_config_id` -- identically to one built before
-        these fields existed.
+        these fields existed. `output_contract_version` is included by the
+        same rule: it is omitted unless `default_prompt` or `track_prompts`
+        is set, since only then does the kernel-appended output contract
+        (see `attest.vendors.base.compose_system_prompt`) actually enter the
+        text sent to a vendor on this config's behalf -- a config that never
+        supplies criteria hashes identically to one built before the output
+        contract was made config-hash-sensitive at all. A config that *does*
+        supply criteria picks up `OUTPUT_CONTRACT_VERSION`, so bumping that
+        version (a change to the appended contract text) opens a new epoch
+        for exactly the configs whose composed prompt it actually changes.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
@@ -106,6 +122,8 @@ class Config:
             payload["default_prompt"] = self.default_prompt
         if self.track_prompts:
             payload["track_prompts"] = dict(self.track_prompts)
+        if self.default_prompt is not None or self.track_prompts:
+            payload["output_contract_version"] = OUTPUT_CONTRACT_VERSION
         return payload
 
 

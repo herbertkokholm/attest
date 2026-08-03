@@ -12,19 +12,35 @@ this module itself never makes a network call.
 from __future__ import annotations
 
 import hashlib
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from attest.contracts.input import Record
 from attest.ensemble.votes import VALID_RATINGS, Vote, VoteVector
-from attest.provenance.config import Config, compute_ensemble_config_id
+from attest.provenance.config import (
+    OUTPUT_CONTRACT_VERSION,
+    Config,
+    compute_ensemble_config_id,
+)
 
-DEFAULT_SCREENING_PROMPT = (
+# The generic, criteria-free task instruction used when a caller supplies no
+# criteria of its own (`compose_system_prompt(None)`). Together with
+# `OUTPUT_CONTRACT`, this reproduces the pre-split `DEFAULT_SCREENING_PROMPT`
+# text exactly, so a rater that never receives criteria behaves identically
+# to before the constant was split.
+SCREENING_TASK_PREAMBLE = (
     "You are screening a record for a systematic review. Read the title and "
-    "abstract and decide whether the record should be included. "
-    "Respond with exactly one token: -1 to exclude, 0 if related but "
-    "uncertain, or 1 to include."
+    "abstract and decide whether the record should be included."
+)
+
+# The kernel-owned output-format contract. Composed onto every screening
+# prompt by `compose_system_prompt`, in exactly one place, so it can never be
+# silently dropped by a caller-supplied criteria string the way it could be
+# when it was baked into `DEFAULT_SCREENING_PROMPT`.
+OUTPUT_CONTRACT = (
+    "Respond with exactly one token: -1 to exclude, 0 if related but uncertain, or 1 to include."
 )
 
 _ORDINAL_TOKENS: dict[str, int] = {"-1": -1, "0": 0, "1": 1, "+1": 1}
@@ -34,12 +50,52 @@ class VendorResponseError(ValueError):
     """Raised when a vendor's raw response cannot be parsed into an ordinal rating."""
 
 
+def compose_system_prompt(criteria: str | None) -> str:
+    """Build the final system message from caller-supplied criteria plus the output contract.
+
+    This is the single composition point every rater path (sync providers,
+    batch providers, and `DeterministicRater`) uses to turn criteria text
+    into the message actually sent to a vendor, so `OUTPUT_CONTRACT` is
+    appended in exactly one place and can never be forgotten by a caller
+    that supplies its own criteria.
+
+    Args:
+        criteria: The task-specific screening criteria text, or None to fall
+            back to the generic `SCREENING_TASK_PREAMBLE`.
+
+    Returns:
+        `(criteria or SCREENING_TASK_PREAMBLE) + "\\n\\n" + OUTPUT_CONTRACT`.
+
+    Warns:
+        UserWarning: If `criteria` already contains a copy of
+            `OUTPUT_CONTRACT` -- a leftover from the pre-split convention of
+            bundling the output-format sentence into the prompt by hand,
+            which would otherwise be sent twice.
+    """
+    text = criteria if criteria is not None else SCREENING_TASK_PREAMBLE
+    if OUTPUT_CONTRACT in text:
+        warnings.warn(
+            "criteria already contains the output-contract instruction "
+            f"({OUTPUT_CONTRACT!r}); attest now appends "
+            "attest.vendors.base.OUTPUT_CONTRACT to every composed prompt automatically, "
+            "so remove the duplicated sentence from criteria to avoid sending it twice",
+            stacklevel=2,
+        )
+    return f"{text}\n\n{OUTPUT_CONTRACT}"
+
+
 def parse_ordinal_response(text: str) -> int:
     """Parse a rater's free-text response into an ordinal rating.
 
-    Scans whitespace-separated tokens in `text` (stripped of surrounding
-    punctuation) for the first one that spells an ordinal rating, so replies
-    like ``"1"``, ``"+1."``, or ``"Decision: -1"`` all parse correctly.
+    Tries a strict match first: the whole reply (stripped of surrounding
+    whitespace and punctuation) is a single ordinal token, or its last
+    non-empty line is. Only if neither strict form matches does this fall
+    back to scanning every whitespace-separated token in `text` for ordinal
+    tokens, so replies like ``"1"``, ``"+1."``, or ``"Decision: -1"`` still
+    parse correctly. If that scan finds tokens spelling more than one
+    distinct rating (e.g. a reply that mentions both ``-1`` and ``1``), the
+    response is genuinely ambiguous and this raises rather than silently
+    picking the first one found.
 
     Args:
         text: The rater's raw text response.
@@ -49,13 +105,36 @@ def parse_ordinal_response(text: str) -> int:
 
     Raises:
         VendorResponseError: If no token in `text` spells a recognized
-            ordinal rating.
+            ordinal rating, or if tokens spelling more than one distinct
+            ordinal rating are found.
     """
+    stripped = text.strip()
+    whole = stripped.strip(".,:;()")
+    if whole in _ORDINAL_TOKENS:
+        return _ORDINAL_TOKENS[whole]
+
+    non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if non_empty_lines:
+        last_line = non_empty_lines[-1].strip(".,:;()")
+        if last_line in _ORDINAL_TOKENS:
+            return _ORDINAL_TOKENS[last_line]
+
+    found_ratings: list[int] = []
     for token in text.split():
         cleaned = token.strip().strip(".,:;()")
         if cleaned in _ORDINAL_TOKENS:
-            return _ORDINAL_TOKENS[cleaned]
-    raise VendorResponseError(f"could not parse an ordinal rating (-1/0/1) from response: {text!r}")
+            found_ratings.append(_ORDINAL_TOKENS[cleaned])
+
+    if not found_ratings:
+        raise VendorResponseError(
+            f"could not parse an ordinal rating (-1/0/1) from response: {text!r}"
+        )
+    distinct = sorted(set(found_ratings))
+    if len(distinct) > 1:
+        raise VendorResponseError(
+            f"ambiguous response contains multiple distinct ordinal ratings {distinct}: {text!r}"
+        )
+    return found_ratings[0]
 
 
 @runtime_checkable
@@ -80,11 +159,12 @@ class Rater(Protocol):
 
         Args:
             record: The record to rate.
-            prompt: Screening prompt text to use for this call, overriding
-                this rater's own configured prompt. `None` (the default)
-                means use this rater's own prompt, unchanged -- so existing
-                callers that never pass `prompt` see identical behavior to
-                before this parameter existed.
+            prompt: Screening criteria text to use for this call, overriding
+                this rater's own configured criteria. `None` (the default)
+                means use this rater's own criteria, unchanged. Criteria
+                only -- the output contract is appended once, by the
+                implementation, via `compose_system_prompt`; callers must
+                never bundle it into `prompt` themselves.
 
         Returns:
             A tuple of the ordinal rating (-1, 0, or 1) and the rater's raw,
@@ -117,16 +197,21 @@ class DeterministicRater:
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Deterministically derive an ordinal rating from `record.id`, this rater's
-        seed, and (if given) `prompt`.
+        seed, and (if given) the composed system prompt built from `prompt` criteria.
 
         `prompt` only enters the digest when explicitly passed, so every
         pre-existing caller that never passed one (i.e. always called with
         `prompt=None`) gets the exact same ratings as before this parameter
-        existed -- calibrated seeds in existing tests stay valid.
+        existed -- calibrated seeds in existing tests stay valid. When
+        `prompt` is passed, it is routed through `compose_system_prompt`
+        before entering the digest, exactly as a live provider would route
+        it before sending, so sync and batch execution -- and this rater's
+        sensitivity to `OUTPUT_CONTRACT` changes -- stay in step with the
+        live raters it stands in for.
         """
         digest_input = f"{self.seed}:{self.vendor}:{self.model}:{record.id}"
         if prompt is not None:
-            digest_input = f"{digest_input}:{prompt}"
+            digest_input = f"{digest_input}:{compose_system_prompt(prompt)}"
         digest = hashlib.sha256(digest_input.encode()).digest()
         ordinal = VALID_RATINGS[digest[0] % len(VALID_RATINGS)]
         raw_response = {
@@ -203,11 +288,14 @@ def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Con
 
 
 __all__ = [
-    "DEFAULT_SCREENING_PROMPT",
+    "OUTPUT_CONTRACT",
+    "OUTPUT_CONTRACT_VERSION",
+    "SCREENING_TASK_PREAMBLE",
     "DeterministicRater",
     "EnsembleRun",
     "Rater",
     "VendorResponseError",
+    "compose_system_prompt",
     "parse_ordinal_response",
     "run_ensemble",
 ]
