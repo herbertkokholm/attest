@@ -32,7 +32,13 @@ from typing import Any
 
 from attest.ablation.xsweep import DEFAULT_MAX_SUBSETS_PER_X, AblationReport, sweep
 from attest.contracts.input import NormalizedInput
-from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, Decision, g
+from attest.ensemble.aggregate import (
+    AGGREGATION_BOUNDARY_DISPERSION,
+    KNOWN_ZERO_POLICIES,
+    ZERO_POLICY_ESCALATE,
+    Decision,
+    g,
+)
 from attest.ensemble.tau import validate_tau
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
 from attest.planes.adjudication import final_label
@@ -75,11 +81,17 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
     Args:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
             an object with "model", "model_version", "prompt_version"),
-            "aggregation", "tau", and optionally "default_prompt" (string)
-            and/or "track_prompts" (mapping of track to prompt text) fields.
+            "aggregation", "tau", and optionally "default_prompt" (string),
+            "track_prompts" (mapping of track to prompt text), and/or
+            "zero_policy" (one of "escalate"/"include", default "escalate")
+            fields.
 
     Returns:
         The parsed `EnsembleConfig`.
+
+    Raises:
+        ValueError: If "zero_policy" names an unrecognized policy
+            (propagated from `EnsembleConfig.__post_init__`).
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     vendors = {
@@ -96,6 +108,7 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
         tau=float(payload["tau"]),
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
+        zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
     )
 
 
@@ -163,7 +176,9 @@ def _persist_ensemble_run(
     store.write_raw_responses(ensemble_config_id, ensemble_run.raw_responses)
 
     decisions = {
-        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau)
+        vv.record_id: g(
+            vv, aggregation=config.aggregation, tau=config.tau, zero_policy=config.zero_policy
+        )
         for vv in ensemble_run.votes
     }
     store.write_decisions(ensemble_config_id, decisions)
@@ -471,6 +486,7 @@ def _cmd_ablate(args: argparse.Namespace) -> int:
         truths,
         aggregation=args.aggregation,
         tau=args.tau,
+        zero_policy=args.zero_policy,
         max_subsets_per_x=args.max_subsets_per_x,
         rng=rng,
     )
@@ -614,6 +630,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ablate.add_argument("--input", required=True, help="Frozen gold-set input-contract JSON file.")
     ablate.add_argument("--aggregation", default=AGGREGATION_BOUNDARY_DISPERSION)
     ablate.add_argument("--tau", type=float, default=0.0)
+    ablate.add_argument(
+        "--zero-policy",
+        choices=KNOWN_ZERO_POLICIES,
+        default=ZERO_POLICY_ESCALATE,
+        help="Disposition of a would-be auto_label==0 decision, held fixed across the sweep.",
+    )
     ablate.add_argument("--max-subsets-per-x", type=int, default=DEFAULT_MAX_SUBSETS_PER_X)
     ablate.add_argument("--seed", type=int, default=None, help="Seed for reproducible sampling.")
     ablate.add_argument(

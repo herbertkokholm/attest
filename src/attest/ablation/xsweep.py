@@ -48,7 +48,7 @@ import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, g
+from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, ZERO_POLICY_ESCALATE, g
 from attest.ensemble.tau import TauReport, describe_tau
 from attest.ensemble.votes import VoteVector
 from attest.stats.agreement import AgreementError, agreement_report
@@ -192,6 +192,7 @@ def _compute_metrics(
     truths: Mapping[str, int],
     aggregation: str,
     tau: float,
+    zero_policy: str,
 ) -> _Metrics:
     if not filtered:
         raise AblationError("vendor subset has zero overlapping votes with the gold set")
@@ -220,15 +221,22 @@ def _compute_metrics(
         if vv.record_id not in truths:
             raise AblationError(f"record '{vv.record_id}' has no gold label in truths")
         truth = truths[vv.record_id]
-        decision = g(vv, aggregation=aggregation, tau=tau)
+        decision = g(vv, aggregation=aggregation, tau=tau, zero_policy=zero_policy)
         final_label: int | None
         if decision.escalate:
             escalations += 1
             # Perfect-adjudication assumption specific to this offline,
-            # fully gold-labeled ablation -- see module docstring.
+            # fully gold-labeled ablation -- see module docstring. An
+            # escalated tie (mean exactly 0) follows this same assumption;
+            # it needs no special case.
             final_label = truth
         else:
             final_label = decision.auto_label
+            # g() never auto-commits the uncertain category (ordinal 0) as a
+            # final label -- see attest.ensemble.aggregate's module
+            # docstring -- so there is no third, undefined disposition for
+            # a predicted 0 to silently fall into here.
+            assert final_label != 0, "g() must never auto-commit auto_label == 0"
 
         predicted_positive = final_label == _RELEVANT_LABEL
         actual_positive = truth == _RELEVANT_LABEL
@@ -263,12 +271,13 @@ def _leave_one_out(
     truths: Mapping[str, int],
     aggregation: str,
     tau: float,
+    zero_policy: str,
 ) -> dict[str, LeaveOneOutContribution]:
     contributions: dict[str, LeaveOneOutContribution] = {}
     for removed in subset:
         reduced = tuple(v for v in subset if v != removed)
         reduced_filtered = _filtered_votes(votes, frozenset(reduced))
-        reduced_metrics = _compute_metrics(reduced_filtered, truths, aggregation, tau)
+        reduced_metrics = _compute_metrics(reduced_filtered, truths, aggregation, tau, zero_policy)
         contributions[removed] = LeaveOneOutContribution(
             removed_vendor=removed,
             delta_alpha=_delta(subset_metrics.alpha, reduced_metrics.alpha),
@@ -331,6 +340,7 @@ def sweep(
     vendors: Sequence[str] | None = None,
     aggregation: str = AGGREGATION_BOUNDARY_DISPERSION,
     tau: float = 0.0,
+    zero_policy: str = ZERO_POLICY_ESCALATE,
     max_subsets_per_x: int = DEFAULT_MAX_SUBSETS_PER_X,
     rng: random.Random | None = None,
 ) -> AblationReport:
@@ -355,6 +365,11 @@ def sweep(
             sorted set of all vendor names appearing in `votes`.
         aggregation: Aggregation rule name passed to `attest.ensemble.aggregate.g`.
         tau: Dispersion threshold passed to `attest.ensemble.aggregate.g`.
+        zero_policy: `attest.ensemble.aggregate.g`'s disposition of a
+            would-be `auto_label == 0` decision, held fixed across every
+            subset and every swept `x'` -- this is a property of the sweep
+            call, not something the sweep varies. Defaults to
+            `ZERO_POLICY_ESCALATE`, matching `g`'s own default.
         max_subsets_per_x: Maximum number of subsets to evaluate per
             ensemble size `x`. Sizes with more feasible subsets than this
             fall back to a stratified sample instead of exhaustive
@@ -411,8 +426,10 @@ def sweep(
         tau_report = tau_reports_by_x.setdefault(x, describe_tau(tau, x))
         for subset in _select_subsets(pool, x, max_subsets_per_x, active_rng):
             filtered = _filtered_votes(votes, frozenset(subset))
-            metrics = _compute_metrics(filtered, truths, aggregation, tau)
-            leave_one_out = _leave_one_out(subset, metrics, votes, truths, aggregation, tau)
+            metrics = _compute_metrics(filtered, truths, aggregation, tau, zero_policy)
+            leave_one_out = _leave_one_out(
+                subset, metrics, votes, truths, aggregation, tau, zero_policy
+            )
             results[(x, subset)] = SubsetResult(
                 x=x,
                 vendors=subset,

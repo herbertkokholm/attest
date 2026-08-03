@@ -33,7 +33,7 @@ from attest.contracts.validation_record import (
 )
 from attest.contracts.validation_record import Config as RecordConfig
 from attest.contracts.validation_record import build as build_validation_record
-from attest.ensemble.aggregate import Decision
+from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE, Decision
 from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
 from attest.planes.adjudication import AdjudicationError, final_label
@@ -139,6 +139,7 @@ def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
         tau=payload["tau"],
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
+        zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
     )
 
 
@@ -166,6 +167,7 @@ def _to_record_config(config: EnsembleConfig) -> RecordConfig:
         aggregation=config.aggregation,
         tau=config.tau,
         x=config.x,
+        zero_policy=config.zero_policy,
     )
 
 

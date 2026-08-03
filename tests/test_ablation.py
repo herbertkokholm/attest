@@ -10,7 +10,9 @@ import pytest
 
 from attest.ablation.xsweep import AblationError, sweep
 from attest.contracts.input import Record
+from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE, ZERO_POLICY_INCLUDE
 from attest.ensemble.tau import describe_tau
+from attest.ensemble.votes import build_vote_vector
 from attest.provenance.config import Config, VendorSpec
 from attest.vendors.base import DeterministicRater, run_ensemble
 
@@ -158,6 +160,40 @@ def test_sweep_does_not_warn_when_only_one_x_is_swept() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         sweep(votes, truths)
+
+
+# --- zero_policy is a swept-invariant, not part of the sweep -------------------
+
+
+def test_sweep_zero_policy_changes_a_tied_records_escalation_but_not_recall_here() -> None:
+    # Exact tie: mean 0, not a boundary vector.
+    votes = [build_vote_vector("r1", "cfg", {"a": 0, "b": 0})]
+    truths = {"r1": 1}
+
+    escalate_report = sweep(votes, truths, zero_policy=ZERO_POLICY_ESCALATE)
+    include_report = sweep(votes, truths, zero_policy=ZERO_POLICY_INCLUDE)
+
+    escalate_result = escalate_report.results[(2, ("a", "b"))]
+    include_result = include_report.results[(2, ("a", "b"))]
+
+    # Escalate: routed to adjudication, resolves to gold under the sweep's
+    # perfect-adjudication assumption -- see the module docstring.
+    assert escalate_result.escalation_rate == pytest.approx(1.0)
+    # Include: auto-labeled +1 directly, no escalation at all.
+    assert include_result.escalation_rate == pytest.approx(0.0)
+    # Both happen to score this single record correctly here (truth=1).
+    assert escalate_result.recall == pytest.approx(1.0)
+    assert include_result.recall == pytest.approx(1.0)
+
+
+def test_sweep_zero_policy_defaults_to_escalate() -> None:
+    votes = [build_vote_vector("r1", "cfg", {"a": 0, "b": 0})]
+    truths = {"r1": 1}
+
+    default_report = sweep(votes, truths)
+    explicit_report = sweep(votes, truths, zero_policy=ZERO_POLICY_ESCALATE)
+
+    assert default_report.results == explicit_report.results
 
 
 # --- leave-one-out --------------------------------------------------------------

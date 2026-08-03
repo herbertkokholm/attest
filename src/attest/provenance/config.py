@@ -15,6 +15,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from attest.ensemble.aggregate import KNOWN_ZERO_POLICIES, ZERO_POLICY_ESCALATE
+
 # Version of the kernel-owned output-format contract appended to every
 # screening prompt (see `attest.vendors.base.OUTPUT_CONTRACT`). Defined here,
 # not in `attest.vendors.base`, because `Config.to_dict` needs it for hashing
@@ -69,6 +71,11 @@ class Config:
             each against its own published eligibility criteria, while
             still voting with the same vendors/models/aggregation on all of
             them.
+        zero_policy: Disposition of a would-be `auto_label == 0` decision
+            (see `attest.ensemble.aggregate.g`). `ZERO_POLICY_ESCALATE` (the
+            default) routes it to a human via escalation; `ZERO_POLICY_INCLUDE`
+            folds it into `+1`. Validated at construction; only these two
+            values are accepted -- there is deliberately no "exclude" option.
     """
 
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
@@ -76,6 +83,13 @@ class Config:
     tau: float = 0.0
     default_prompt: str | None = None
     track_prompts: dict[str, str] = field(default_factory=dict)
+    zero_policy: str = ZERO_POLICY_ESCALATE
+
+    def __post_init__(self) -> None:
+        if self.zero_policy not in KNOWN_ZERO_POLICIES:
+            raise ValueError(
+                f"unknown zero_policy '{self.zero_policy}': expected one of {KNOWN_ZERO_POLICIES}"
+            )
 
     @property
     def x(self) -> int:
@@ -111,6 +125,11 @@ class Config:
         supply criteria picks up `OUTPUT_CONTRACT_VERSION`, so bumping that
         version (a change to the appended contract text) opens a new epoch
         for exactly the configs whose composed prompt it actually changes.
+        `zero_policy` follows the same rule: omitted when it is the default
+        `ZERO_POLICY_ESCALATE`, so a config that never sets it hashes
+        identically to one built before the field existed; a config that
+        opts into `ZERO_POLICY_INCLUDE` picks up a different id, correctly
+        opening a new epoch for that real behavior change.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
@@ -124,6 +143,8 @@ class Config:
             payload["track_prompts"] = dict(self.track_prompts)
         if self.default_prompt is not None or self.track_prompts:
             payload["output_contract_version"] = OUTPUT_CONTRACT_VERSION
+        if self.zero_policy != ZERO_POLICY_ESCALATE:
+            payload["zero_policy"] = self.zero_policy
         return payload
 
 

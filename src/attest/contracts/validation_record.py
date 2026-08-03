@@ -1,7 +1,9 @@
-"""Validation-record contract v1.0: one self-validation record per stable ensemble epoch.
+"""Validation-record contract v1.1: one self-validation record per stable ensemble epoch.
 
 This is a stable, versioned interface. Changing the shape produced here
-requires a version bump to ``SCHEMA_VERSION``, not an in-place edit.
+requires a version bump to ``SCHEMA_VERSION``, not an in-place edit. v1.1
+added ``config.zero_policy`` (additive: existing v1.0 consumers ignoring
+unknown fields see no other change).
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -17,9 +19,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 @dataclass
@@ -33,6 +36,10 @@ class Config:
         aggregation: Name of the aggregation strategy across ensemble votes.
         tau: Decision threshold used by the aggregation strategy.
         x: Ensemble size (number of voting members) at this epoch.
+        zero_policy: Disposition of a would-be `auto_label == 0` decision
+            (see `attest.ensemble.aggregate.g`) that produced this record's
+            recall and precision -- the audit trail for a chosen, not
+            defaulted-into, uncertainty policy.
     """
 
     vendors: list[str] = field(default_factory=list)
@@ -41,6 +48,7 @@ class Config:
     aggregation: str = ""
     tau: float = 0.0
     x: int = 0
+    zero_policy: str = ZERO_POLICY_ESCALATE
 
     def to_dict(self) -> dict[str, Any]:
         """Return this configuration as a plain dict."""
@@ -51,6 +59,7 @@ class Config:
             "aggregation": self.aggregation,
             "tau": self.tau,
             "x": self.x,
+            "zero_policy": self.zero_policy,
         }
 
 

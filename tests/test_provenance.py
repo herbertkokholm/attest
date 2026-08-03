@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from attest.provenance.changelog import ChangeLog
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import maybe_open_epoch, open_epoch
@@ -81,6 +83,66 @@ def test_track_prompts_change_the_ensemble_config_id_but_not_when_equal() -> Non
 
     assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_track_prompt)
     assert compute_ensemble_config_id(with_track_prompt) == compute_ensemble_config_id(same_again)
+
+
+def test_zero_policy_defaults_to_escalate() -> None:
+    assert Config().zero_policy == "escalate"
+
+
+def test_zero_policy_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="unknown zero_policy"):
+        Config(zero_policy="exclude")
+
+
+@pytest.mark.parametrize("bogus", ["exclude", "", "ESCALATE", "auto"])
+def test_zero_policy_rejects_every_unrecognized_value(bogus: str) -> None:
+    with pytest.raises(ValueError):
+        Config(zero_policy=bogus)
+
+
+def test_zero_policy_omitted_from_to_dict_when_default() -> None:
+    payload = _config().to_dict()
+
+    assert "zero_policy" not in payload
+
+
+def test_zero_policy_included_in_to_dict_when_include() -> None:
+    payload = Config(zero_policy="include").to_dict()
+
+    assert payload["zero_policy"] == "include"
+
+
+def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> None:
+    # Pinned hash of _config()'s to_dict() shape, predating zero_policy:
+    # a default ("escalate") config with no prompt fields must still hash
+    # to this exact value, since zero_policy is omitted when default.
+    pinned_hash = "25fe28f16fff127d986591104c67f4abf2d862a34ab5dbbb7a864946c8aed9f9"
+
+    assert compute_ensemble_config_id(_config()) == pinned_hash
+
+
+def test_config_hash_stable_for_default_zero_policy() -> None:
+    base = _config()
+    explicit_default = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        zero_policy="escalate",
+    )
+
+    assert compute_ensemble_config_id(base) == compute_ensemble_config_id(explicit_default)
+
+
+def test_zero_policy_include_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_include = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        zero_policy="include",
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_include)
 
 
 def test_prompt_for_track_prefers_track_specific_over_default() -> None:
