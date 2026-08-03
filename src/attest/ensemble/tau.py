@@ -38,12 +38,14 @@ attainable set itself depends on `x` (see `reachable_dispersions` and the
 
 Regimes for a given `x`: the attainable, non-boundary dispersion values
 sorted ascending, `r_0 = 0 < r_1 < ... < r_n`, partition tau into `n + 1`
-regimes: ``(-inf, r_0]``, ``(r_0, r_1]``, ..., ``(r_n, +inf)`` -- read as:
-"strictly above `r_i`, at or below `r_{i+1}`" is one regime (recall `g`'s
-comparison is strict `>`, so `tau == r_i` does *not* escalate a vector whose
-dispersion is exactly `r_i`; see `TauReport.on_reachable_value`). Changing
-which regime `tau` falls in is a real behavior change; moving `tau` within
-a regime is not. A canonical, safe representative for a given regime is the
+regimes: ``(-inf, r_0)``, ``[r_0, r_1)``, ..., ``[r_n, +inf)`` -- read as:
+"at or above `r_i`, strictly below `r_{i+1}`" is one regime (recall `g`'s
+comparison is strict `>`, so `tau == r_i` produces the exact same decisions
+as any tau in `(r_i, r_{i+1})` -- neither escalates a vector whose
+dispersion is exactly `r_i` -- and a *different* partition from any tau
+just below `r_i`; see `TauReport.on_reachable_value`). Changing which
+regime `tau` falls in is a real behavior change; moving `tau` within a
+regime is not. A canonical, safe representative for a given regime is the
 midpoint between its two bounding attainable values (`resolve_tau` always
 returns such a midpoint, never a value exactly on an attainable value).
 

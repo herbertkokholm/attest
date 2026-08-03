@@ -174,16 +174,25 @@ def _base_config(**overrides: Any) -> Config:
     return Config(**defaults)
 
 
-def test_output_contract_version_omitted_when_no_prompt_fields_set() -> None:
+def test_output_contract_version_included_even_when_no_prompt_fields_set() -> None:
+    # The kernel-owned output contract is appended to every composed prompt,
+    # including the no-criteria fallback (see compose_system_prompt), so its
+    # version is always config-hash-sensitive -- not just for configs that
+    # supply criteria.
     payload = _base_config().to_dict()
 
-    assert "output_contract_version" not in payload
+    assert payload["output_contract_version"] == OUTPUT_CONTRACT_VERSION
 
 
 def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() -> None:
-    # Pinned hash of the pre-existing to_dict() shape (no "output_contract_version"
-    # key), computed independently of compute_ensemble_config_id, so this test
-    # actually catches a regression rather than just re-deriving the same formula.
+    # Pinned hash of the current to_dict() shape (including
+    # "output_contract_version", unconditionally), computed independently of
+    # compute_ensemble_config_id, so this test actually catches a regression
+    # rather than just re-deriving the same formula. This pin was retired and
+    # recomputed once, deliberately, when output_contract_version became
+    # unconditional: a one-time id change for configs supplying no criteria,
+    # since their composed prompt has always contained the contract -- only
+    # the hash was previously blind to it.
     config = _base_config()
     payload = config.to_dict()
     expected_payload = {
@@ -191,8 +200,9 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
         "aggregation": "boundary_dispersion",
         "tau": 0.5,
         "x": 1,
+        "output_contract_version": OUTPUT_CONTRACT_VERSION,
     }
-    pinned_hash = "b8ae9c5b0229046ad743855c6d479568a6f1f51a340f9eacb36858e5bfcb3fb8"
+    pinned_hash = "287a188fdd6f39accca0f9c6ee5be416fdfd42d0cf51f6537eaacebb6ce0a15d"
 
     assert payload == expected_payload
     assert compute_ensemble_config_id(config) == pinned_hash
@@ -210,9 +220,9 @@ def test_output_contract_version_included_when_track_prompts_set() -> None:
     assert payload["output_contract_version"] == OUTPUT_CONTRACT_VERSION
 
 
-def test_config_id_unaffected_by_output_contract_version_when_prompts_unset() -> None:
-    # Two configs differing only in a field that to_dict() only surfaces
-    # when prompt fields are set must still collide when neither sets one.
+def test_config_id_deterministic_for_configs_with_prompts_unset() -> None:
+    # output_contract_version is now unconditional in to_dict(), so two
+    # configs that both leave prompt fields unset must still collide.
     assert compute_ensemble_config_id(_base_config()) == compute_ensemble_config_id(_base_config())
 
 

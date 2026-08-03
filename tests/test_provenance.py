@@ -113,10 +113,18 @@ def test_zero_policy_included_in_to_dict_when_include() -> None:
 
 
 def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> None:
-    # Pinned hash of _config()'s to_dict() shape, predating zero_policy:
-    # a default ("escalate") config with no prompt fields must still hash
-    # to this exact value, since zero_policy is omitted when default.
-    pinned_hash = "25fe28f16fff127d986591104c67f4abf2d862a34ab5dbbb7a864946c8aed9f9"
+    # Pinned hash of _config()'s to_dict() shape: a default ("escalate")
+    # config with no prompt fields, still omitting zero_policy since it's the
+    # default. This pin was retired and recomputed once, deliberately, when
+    # output_contract_version became unconditional in to_dict (it used to be
+    # omitted here): the kernel-owned output contract is appended to every
+    # composed prompt, including this config's no-criteria fallback, so its
+    # version must always be config-hash-sensitive. That is a one-time id
+    # change for configs supplying no criteria -- their composed prompt has
+    # always contained the contract; only the hash was previously blind to
+    # it. The zero_policy-omission invariant this test is named for is
+    # otherwise unchanged.
+    pinned_hash = "0a1673a4c96fed9bdefcce8d4d58c02220250f300943a152264e15991f3bb3a4"
 
     assert compute_ensemble_config_id(_config()) == pinned_hash
 
