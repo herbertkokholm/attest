@@ -42,6 +42,24 @@ fixed worst-case convention, not a recomputed interval bound. Callers that
 need a floor calibrated to a non-95% confidence level should treat this as
 a documented approximation, not an exact one.
 
+Both of those bounds assume sampling with replacement from an infinite
+population, which overstates uncertainty once the audit sample covers a
+non-trivial fraction of |U_h|. The floor corrects for this with the
+standard SRSWOR finite-population correction, sqrt((|U_h| - n_h) / (|U_h| -
+1)), which shrinks the bound's excess over the point estimate toward zero
+as n_h approaches |U_h|. At a full-population audit (`audit-draw --size
+all`, n_h == |U_h|) the correction is exactly 0, so the floor collapses to
+the exact point estimate -- a census has no sampling uncertainty left to
+bound, and q_h is then an exact count, not an estimate. At the tiny sampling
+fractions these audits ordinarily draw, the correction is close to 1 and
+this module's prior (uncorrected) behavior is preserved. Note that at m_h
+== 0 the floor uses rule-of-three * FPC as a documented approximation to
+the upper confidence bound, not the exact hypergeometric zero-event bound
+(which would also reach 0 at a census); this approximation is only ever
+anti-conservative below the tiny-fraction regime it was already used in,
+and it agrees with the exact bound at both endpoints (tiny fraction and
+census).
+
 `scipy` is imported locally within functions so that `contracts`,
 `prefilter`, `ensemble`, and `provenance` remain importable without it
 installed.
@@ -163,6 +181,14 @@ def exclusion_error_rate(stratum: Stratum) -> float:
     return stratum.m / stratum.n
 
 
+def _finite_population_correction(n: int, population: int) -> float:
+    """SRSWOR correction sqrt((N - n) / (N - 1)): 1.0 at a tiny sampling
+    fraction, 0.0 at a census (n >= N) or a degenerate population."""
+    if population <= 1 or n >= population:
+        return 0.0
+    return math.sqrt((population - n) / (population - 1))
+
+
 def exclusion_error_rate_floor(stratum: Stratum, confidence: float = 0.95) -> float:
     """Compute a conservative upper-bound estimate of q_h for the recall floor.
 
@@ -170,6 +196,10 @@ def exclusion_error_rate_floor(stratum: Stratum, confidence: float = 0.95) -> fl
     were observed in the audit sample (m_h == 0); otherwise uses the Wilson
     score upper bound at `confidence`. See the module docstring for why the
     rule-of-three bound is used, and used as a fixed convention, at m_h == 0.
+    That infinite-population bound is then scaled toward the point estimate
+    by the SRSWOR finite-population correction, so the floor collapses to
+    the exact rate `exclusion_error_rate(stratum)` for a census (n_h ==
+    |U_h|) and tightens smoothly as the sampled fraction of |U_h| grows.
 
     Args:
         stratum: The audit stratum.
@@ -180,10 +210,13 @@ def exclusion_error_rate_floor(stratum: Stratum, confidence: float = 0.95) -> fl
         The conservative (upper-bound) estimate of q_h, always >=
         `exclusion_error_rate(stratum)`.
     """
+    point = exclusion_error_rate(stratum)
     if stratum.m == 0:
-        return _RULE_OF_THREE_NUMERATOR / stratum.n
-    _low, high = wilson_interval(stratum.m, stratum.n, confidence=confidence)
-    return high
+        infinite_floor = _RULE_OF_THREE_NUMERATOR / stratum.n
+    else:
+        _low, infinite_floor = wilson_interval(stratum.m, stratum.n, confidence=confidence)
+    fpc = _finite_population_correction(stratum.n, stratum.population)
+    return min(1.0, point + (infinite_floor - point) * fpc)
 
 
 def estimated_missed_fn(

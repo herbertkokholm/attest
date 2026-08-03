@@ -31,6 +31,7 @@ from attest.stats.recall import (
     stratified_recall,
     wilson_interval,
 )
+from attest.stats.recall import _finite_population_correction as fpc
 
 # --- agreement.py -----------------------------------------------------------
 #
@@ -249,16 +250,18 @@ def test_wilson_interval_rejects_invalid_inputs() -> None:
 
 
 def test_recall_point_vs_floor_differ_on_zero_cell_stratum() -> None:
-    # m == 0 -> floor uses the rule-of-three bound (3/n), not Wilson.
+    # m == 0 -> floor uses the rule-of-three bound (3/n), not Wilson, scaled
+    # by the finite-population correction (n=20, population=200 is not a
+    # tiny sampling fraction, so the FPC meaningfully shrinks the bound).
     stratum = Stratum(name="zero", n=20, m=0, population=200)
 
     estimate = recall_with_floor(stratum, true_positives=100)
+    expected_q_floor = (3 / 20) * fpc(20, 200)
 
     assert exclusion_error_rate(stratum) == 0.0
-    assert exclusion_error_rate_floor(stratum) == pytest.approx(3 / 20)
+    assert exclusion_error_rate_floor(stratum) == pytest.approx(expected_q_floor)
     assert estimate.point == pytest.approx(1.0)
-    # floor = TP / (TP + q_floor * population) = 100 / (100 + 0.15 * 200)
-    assert estimate.floor == pytest.approx(100 / 130)
+    assert estimate.floor == pytest.approx(100 / (100 + expected_q_floor * 200))
     assert estimate.floor < estimate.point
 
 
@@ -266,10 +269,13 @@ def test_recall_floor_uses_wilson_upper_bound_when_errors_observed() -> None:
     stratum = Stratum(name="nonzero", n=40, m=5, population=400)
 
     floor_rate = exclusion_error_rate_floor(stratum)
+    point = exclusion_error_rate(stratum)
     _low, wilson_high = wilson_interval(5, 40)
+    expected = point + (wilson_high - point) * fpc(40, 400)
 
-    assert floor_rate == pytest.approx(wilson_high)
-    assert floor_rate > exclusion_error_rate(stratum)
+    assert floor_rate == pytest.approx(expected)
+    assert floor_rate > point
+    assert floor_rate < wilson_high
 
 
 def test_stratified_recall_reduces_to_unstratified_for_single_stratum() -> None:
@@ -279,9 +285,10 @@ def test_stratified_recall_reduces_to_unstratified_for_single_stratum() -> None:
     via_convenience = recall_with_floor(stratum, true_positives=100)
 
     assert via_stratified == via_convenience
-    # Hand check: point = TP / (TP + 0) = 1.0; floor = TP / (TP + 3/20*200).
+    # Hand check: point = TP / (TP + 0) = 1.0; floor = TP / (TP + q_floor*200).
+    expected_q_floor = (3 / 20) * fpc(20, 200)
     assert via_stratified.point == pytest.approx(1.0)
-    assert via_stratified.floor == pytest.approx(100 / 130)
+    assert via_stratified.floor == pytest.approx(100 / (100 + expected_q_floor * 200))
 
 
 def test_stratified_recall_combines_multiple_strata() -> None:
@@ -321,3 +328,61 @@ def test_recall_is_never_nan_when_true_positives_and_fn_are_zero() -> None:
 
     assert not math.isnan(estimate.point)
     assert estimate.point == 0.0
+
+
+# --- exclusion_error_rate_floor: finite-population correction -----------------
+
+
+def test_census_zero_cell_floor_collapses_to_exact_recall() -> None:
+    # audit-draw --size all: n == population, no sampling uncertainty left.
+    stratum = Stratum(name="census", n=500, m=0, population=500)
+
+    estimate = recall_with_floor(stratum, true_positives=100)
+
+    assert exclusion_error_rate_floor(stratum) == 0.0
+    assert estimate.floor == pytest.approx(1.0)
+
+
+def test_census_nonzero_cell_floor_equals_point() -> None:
+    stratum = Stratum(name="census", n=500, m=17, population=500)
+
+    assert exclusion_error_rate_floor(stratum) == pytest.approx(exclusion_error_rate(stratum))
+    assert exclusion_error_rate_floor(stratum) == pytest.approx(17 / 500)
+
+
+def test_floor_tightens_monotonically_as_sampling_fraction_grows() -> None:
+    # Same m/n ratio (0.1), increasingly large share of the population sampled.
+    tiny_fraction = Stratum(name="tiny", n=20, m=2, population=200_000)
+    large_fraction = Stratum(name="large", n=20, m=2, population=22)
+
+    assert exclusion_error_rate_floor(large_fraction) < exclusion_error_rate_floor(tiny_fraction)
+
+
+def test_floor_matches_pre_fix_value_at_tiny_sampling_fraction() -> None:
+    # n / population ~ 0.0002 -- negligible enough that the FPC should barely move things.
+    zero_cell = Stratum(name="zero", n=200, m=0, population=1_000_000)
+    nonzero_cell = Stratum(name="nonzero", n=200, m=8, population=1_000_000)
+
+    assert exclusion_error_rate_floor(zero_cell) == pytest.approx(3 / 200, abs=1e-4)
+    _low, wilson_high = wilson_interval(8, 200)
+    assert exclusion_error_rate_floor(nonzero_cell) == pytest.approx(wilson_high, abs=1e-4)
+
+
+def test_finite_population_correction_guards_degenerate_inputs() -> None:
+    assert fpc(10, 1) == 0.0
+    assert fpc(10, 0) == 0.0
+    assert fpc(50, 50) == 0.0
+    assert fpc(60, 50) == 0.0
+
+
+def test_floor_never_drops_below_point_estimate_with_fpc() -> None:
+    strata = [
+        Stratum(name="census-zero", n=500, m=0, population=500),
+        Stratum(name="census-nonzero", n=500, m=17, population=500),
+        Stratum(name="tiny", n=20, m=2, population=200_000),
+        Stratum(name="large", n=20, m=2, population=22),
+        Stratum(name="mid", n=20, m=0, population=200),
+    ]
+
+    for stratum in strata:
+        assert exclusion_error_rate_floor(stratum) >= exclusion_error_rate(stratum)
