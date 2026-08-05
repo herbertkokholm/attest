@@ -258,6 +258,48 @@ def test_tau_report_write_overwrites_previous_report(tmp_path: Path) -> None:
     assert store.read_tau_report() == describe_tau(0.6, 4)
 
 
+def test_config_round_trips_with_confidence_threshold(tmp_path: Path) -> None:
+    config = Config(
+        vendors={
+            "v1": VendorSpec(model="m", model_version="1", prompt_version="p", temperature=0.0)
+        },
+        aggregation="boundary_dispersion",
+        tau=1.0,
+        confidence_threshold=0.7,
+    )
+    store = RunStore(tmp_path / "run")
+
+    ensemble_config_id = store.write_config(config)
+
+    # Round-trips through the store despite never appearing in
+    # Config.to_dict()/the hash -- see _config_to_dict.
+    assert store.read_config() == config
+    assert ensemble_config_id == compute_ensemble_config_id(config)
+
+
+def test_confidence_policy_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    store.write_confidence_policy(low_threshold=0.4, min_supporting_votes=3)
+
+    assert store.read_confidence_policy() == {"low_threshold": 0.4, "min_supporting_votes": 3}
+
+
+def test_confidence_policy_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_confidence_policy() is None
+
+
+def test_confidence_policy_write_overwrites_previous_policy(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    store.write_confidence_policy(low_threshold=0.3, min_supporting_votes=3)
+    store.write_confidence_policy(low_threshold=0.6, min_supporting_votes=3)
+
+    assert store.read_confidence_policy() == {"low_threshold": 0.6, "min_supporting_votes": 3}
+
+
 # --- RunStore: audit rows and run records ---------------------------------------
 
 

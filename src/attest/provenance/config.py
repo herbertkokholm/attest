@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from attest.ensemble.aggregate import KNOWN_ZERO_POLICIES, ZERO_POLICY_ESCALATE
+from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 
 # Version of the kernel-owned output-format contract appended to every
 # screening prompt (see `attest.vendors.base.OUTPUT_CONTRACT`). Defined here,
@@ -83,6 +84,19 @@ class Config:
             default) routes it to a human via escalation; `ZERO_POLICY_INCLUDE`
             folds it into `+1`. Validated at construction; only these two
             values are accepted -- there is deliberately no "exclude" option.
+        confidence_threshold: Default `low_threshold` (see
+            `attest.ensemble.confidence.confidence_tier`) a confidence-
+            stratified `audit-draw` uses when no `--confidence-threshold`
+            override is given on that command's own invocation. Sourced
+            from the same config file as `tau` for the same ergonomic
+            reason -- a runbook setting the caller shouldn't have to retype
+            identically on every invocation -- but, unlike `tau`,
+            deliberately excluded from `to_dict()`/`ensemble_config_id`:
+            see `attest.io.store._config_to_dict` for where it is instead
+            persisted, and `docs/logprob_support.md` for why it must never
+            be hash-versioned (it changes only how an already-fixed
+            excluded population is stratified for audit, never what a
+            vendor samples or the ensemble's own aggregate decision).
     """
 
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
@@ -91,8 +105,13 @@ class Config:
     default_prompt: str | None = None
     track_prompts: dict[str, str] = field(default_factory=dict)
     zero_policy: str = ZERO_POLICY_ESCALATE
+    confidence_threshold: float = DEFAULT_LOW_THRESHOLD
 
     def __post_init__(self) -> None:
+        if not (0.0 <= self.confidence_threshold <= 1.0):
+            raise ValueError(
+                f"confidence_threshold must be in [0, 1], got {self.confidence_threshold}"
+            )
         if self.zero_policy not in KNOWN_ZERO_POLICIES:
             raise ValueError(
                 f"unknown zero_policy '{self.zero_policy}': expected one of {KNOWN_ZERO_POLICIES}"
@@ -134,6 +153,11 @@ class Config:
         identically to one built before the field existed; a config that
         opts into `ZERO_POLICY_INCLUDE` picks up a different id, correctly
         opening a new epoch for that real behavior change.
+        `confidence_threshold` is never included here -- unlike every other
+        field on this class, it is not part of the hashed/versioned
+        contract at all (see its attribute docstring above), so it is
+        persisted separately by `attest.io.store._config_to_dict` instead
+        of through this method.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},

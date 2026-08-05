@@ -228,11 +228,23 @@ class DeterministicRater:
         model: Name to report as this rater's model.
         seed: Seed distinguishing this rater's ratings from another
             `DeterministicRater` with the same vendor and model.
+        request_logprobs: If True, also derive a deterministic, seeded fake
+            logprob from the same digest and attach it under
+            `raw_response["logprobs"]` in the OpenAI-compatible shape
+            `attest.ensemble.confidence._openai_compatible_probability`
+            parses. This does not simulate any real vendor's actual
+            behavior -- it exists solely so `--request-logprobs` (and
+            everything downstream of it: `attest.ensemble.confidence`,
+            confidence-stratified audit draws, confidence-driven
+            active-learning selection) can be exercised network-free in
+            tests, exactly as `request_logprobs=False` (the default)
+            reproduces this rater's pre-logprobs behavior identically.
     """
 
     vendor: str
     model: str = "deterministic-v1"
     seed: int = 0
+    request_logprobs: bool = False
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Deterministically derive an ordinal rating from `record.id`, this rater's
@@ -253,7 +265,7 @@ class DeterministicRater:
             digest_input = f"{digest_input}:{compose_system_prompt(prompt)}"
         digest = hashlib.sha256(digest_input.encode()).digest()
         ordinal = VALID_RATINGS[digest[0] % len(VALID_RATINGS)]
-        raw_response = {
+        raw_response: dict[str, Any] = {
             "vendor": self.vendor,
             "model": self.model,
             "seed": self.seed,
@@ -261,6 +273,11 @@ class DeterministicRater:
             "digest": digest.hex(),
             "prompt": prompt,
         }
+        if self.request_logprobs:
+            fake_logprob = -(digest[1] / 255) * 3.0
+            raw_response["logprobs"] = {
+                "content": [{"token": str(ordinal), "logprob": fake_logprob}]
+            }
         return ordinal, raw_response
 
 

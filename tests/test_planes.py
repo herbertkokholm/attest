@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import random
 
 import pytest
 
 from attest.ensemble.aggregate import g
+from attest.ensemble.confidence import UNSCORED_TIER
 from attest.ensemble.votes import build_vote_vector
 from attest.planes import PLANE_ACTIVE_LEARNING, PLANE_ADJUDICATION, PLANE_RECALL_AUDIT
 from attest.planes.active_learning import (
@@ -174,6 +176,118 @@ def test_selections_are_tagged_active_learning_plane() -> None:
     assert all(s.plane == PLANE_ACTIVE_LEARNING for s in selections)
 
 
+def _confidence_votes(record_id: str, ratings: tuple[int, int, int]):
+    return build_vote_vector(
+        record_id,
+        _CONFIG_ID,
+        {"openai": ratings[0], "mistral": ratings[1], "together": ratings[2]},
+    )
+
+
+def _openai_shaped(logprob: float) -> dict:
+    return {"logprobs": {"content": [{"token": "x", "logprob": logprob}]}}
+
+
+def test_select_for_review_picks_unanimous_low_confidence_record() -> None:
+    # (1, 1, 1): zero dispersion, no boundary -- invisible to the
+    # disagreement signal alone, but every vendor's own confidence in that
+    # "1" is weak (median ~0.4), so the confidence signal should still
+    # surface it.
+    votes = [_confidence_votes("shaky", (1, 1, 1))]
+    raw_responses = {
+        "shaky": {
+            "openai": _openai_shaped(math.log(0.4)),
+            "mistral": _openai_shaped(math.log(0.4)),
+            "together": _openai_shaped(math.log(0.4)),
+        }
+    }
+
+    selections = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert {s.record_id for s in selections} == {"shaky"}
+    assert selections[0].confidence.scored is True
+    assert selections[0].confidence.median_probability == pytest.approx(0.4)
+
+
+def test_select_for_review_does_not_select_unanimous_high_confidence_record() -> None:
+    votes = [_confidence_votes("solid", (1, 1, 1))]
+    raw_responses = {
+        "solid": {
+            "openai": _openai_shaped(math.log(0.8)),
+            "mistral": _openai_shaped(math.log(0.95)),
+            "together": _openai_shaped(math.log(0.85)),
+        }
+    }
+
+    selections = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert selections == []
+
+
+def test_select_for_review_ignores_confidence_below_minimum_coverage() -> None:
+    # Only openai and together carry a raw response -- mistral's entry is
+    # absent, so n_supporting=2 < MIN_SUPPORTING_VOTES=3 and the record must
+    # stay unscored, even though both available votes look low-confidence.
+    votes = [_confidence_votes("undercovered", (1, 1, 1))]
+    raw_responses = {
+        "undercovered": {
+            "openai": _openai_shaped(math.log(0.1)),
+            "together": _openai_shaped(math.log(0.1)),
+        }
+    }
+
+    selections = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert selections == []
+
+
+def test_select_for_review_without_raw_responses_never_triggers_confidence() -> None:
+    # Reproduces this function's pre-confidence behavior exactly.
+    votes = [_confidence_votes("no_raw", (1, 1, 1))]
+
+    selections = select_for_review(votes, dispersion_threshold=0.5)
+
+    assert selections == []
+
+
+def test_select_for_review_attaches_confidence_to_dispersion_driven_selections() -> None:
+    votes = [_votes("boundary", (-1, 1))]
+
+    [selection] = select_for_review(votes, dispersion_threshold=100.0)
+
+    assert selection.confidence.record_id == "boundary"
+    assert selection.confidence.scored is False
+
+
+def test_select_for_review_sorts_by_dispersion_then_confidence_ascending() -> None:
+    votes = [
+        _votes("high_dispersion", (-1, 0, 1)),
+        _confidence_votes("less_shaky", (1, 1, 1)),
+        _confidence_votes("shaky", (1, 1, 1)),
+    ]
+    raw_responses = {
+        "shaky": {
+            "openai": _openai_shaped(math.log(0.1)),
+            "mistral": _openai_shaped(math.log(0.1)),
+            "together": _openai_shaped(math.log(0.1)),
+        },
+        "less_shaky": {
+            "openai": _openai_shaped(math.log(0.45)),
+            "mistral": _openai_shaped(math.log(0.45)),
+            "together": _openai_shaped(math.log(0.45)),
+        },
+    }
+
+    selections = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert [s.record_id for s in selections] == ["high_dispersion", "shaky", "less_shaky"]
+
+
+def test_select_for_review_rejects_confidence_threshold_outside_unit_interval() -> None:
+    with pytest.raises(ActiveLearningError):
+        select_for_review([], confidence_threshold=1.5)
+
+
 # --- recall_audit.py: drawing -------------------------------------------------
 
 
@@ -240,6 +354,61 @@ def test_stratified_draw_never_exceeds_a_strata_population() -> None:
     assert by_stratum["a"] <= 3
     assert by_stratum["b"] <= 97
     assert sum(by_stratum.values()) == 100
+
+
+def _population_by_confidence(low: int, high: int, unscored: int) -> list[ExcludedRecord]:
+    records = [
+        ExcludedRecord(record_id=f"low{i}", track="t", confidence_tier="low") for i in range(low)
+    ]
+    records += [
+        ExcludedRecord(record_id=f"high{i}", track="t", confidence_tier="high") for i in range(high)
+    ]
+    records += [
+        ExcludedRecord(record_id=f"unscored{i}", track="t", confidence_tier=UNSCORED_TIER)
+        for i in range(unscored)
+    ]
+    return records
+
+
+def test_stratified_draw_by_confidence_respects_strata_sizes() -> None:
+    population = _population_by_confidence(low=8, high=2, unscored=0)
+
+    rows = draw_audit_sample(population, 5, stratify_by_confidence=True, rng=random.Random(0))
+
+    by_stratum: dict[str, int] = {}
+    for row in rows:
+        by_stratum[row.stratum] = by_stratum.get(row.stratum, 0) + 1
+
+    assert by_stratum == {"low": 4, "high": 1}
+
+
+def test_stratified_draw_by_confidence_gives_unscored_its_own_stratum() -> None:
+    population = _population_by_confidence(low=5, high=5, unscored=10)
+
+    rows = draw_audit_sample(population, 20, stratify_by_confidence=True, rng=random.Random(0))
+
+    strata = {row.stratum for row in rows}
+    assert strata == {"low", "high", UNSCORED_TIER}
+
+
+def test_draw_audit_sample_rejects_combined_track_and_confidence_stratification() -> None:
+    population = _population_by_confidence(low=5, high=5, unscored=0)
+
+    with pytest.raises(AuditError):
+        draw_audit_sample(
+            population,
+            5,
+            stratify_by_track=True,
+            stratify_by_confidence=True,
+            rng=random.Random(0),
+        )
+
+
+def test_draw_audit_sample_by_confidence_rejects_record_with_no_tier() -> None:
+    population = [ExcludedRecord(record_id="r1", track="t")]  # confidence_tier defaults to None
+
+    with pytest.raises(AuditError):
+        draw_audit_sample(population, 1, stratify_by_confidence=True, rng=random.Random(0))
 
 
 # --- recall_audit.py: ingestion and the firewall ------------------------------

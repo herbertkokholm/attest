@@ -128,6 +128,238 @@ def test_end_to_end_screen_audit_validate(
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
+def _write_confidence_config(path: Path, *, confidence_threshold: float | None = None) -> None:
+    # Real vendor names, not "v1"/"v2": attest.ensemble.confidence dispatches
+    # logprob extraction by vendor name, and three vendors are required to
+    # ever meet MIN_SUPPORTING_VOTES.
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    payload = {
+        "vendors": {
+            "openai": vendor_spec,
+            "mistral": vendor_spec,
+            "together": vendor_spec,
+        },
+        "aggregation": "boundary_dispersion",
+        "tau": 1.0,
+    }
+    if confidence_threshold is not None:
+        payload["confidence_threshold"] = confidence_threshold
+    path.write_text(json.dumps(payload))
+
+
+# Seed chosen (by brute-force search over the three-vendor ensemble) so all
+# four screened records auto-label without escalating, and three of them
+# (all with exactly 3/3 logprob-supporting votes) land in the
+# screen-excluded population -- a confidence-stratified draw with no
+# adjudication step needed first.
+_CONFIDENCE_SEED = 12
+
+
+def test_screen_with_request_logprobs_persists_logprobs_only_when_asked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.json"
+    _write_confidence_config(config_path)
+
+    without_dir = tmp_path / "run_without"
+    without_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(without_dir),
+            "--deterministic-seed",
+            str(_CONFIDENCE_SEED),
+        ]
+    )
+    assert without_rc == 0
+    capsys.readouterr()
+    raw_without = json.loads((without_dir / "raw_responses.json").read_text())["raw_responses"]
+    assert raw_without
+    for by_vendor in raw_without.values():
+        for payload in by_vendor.values():
+            assert "logprobs" not in payload
+
+    with_dir = tmp_path / "run_with"
+    with_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(with_dir),
+            "--deterministic-seed",
+            str(_CONFIDENCE_SEED),
+            "--request-logprobs",
+        ]
+    )
+    assert with_rc == 0
+    capsys.readouterr()
+    raw_with = json.loads((with_dir / "raw_responses.json").read_text())["raw_responses"]
+    assert raw_with
+    for by_vendor in raw_with.values():
+        for payload in by_vendor.values():
+            assert payload["logprobs"]["content"][0]["logprob"] <= 0.0
+
+
+def test_audit_draw_stratify_by_confidence_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_confidence_config(config_path, confidence_threshold=0.5)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_CONFIDENCE_SEED),
+            "--request-logprobs",
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+            "--stratify-by-confidence",
+        ]
+    )
+    assert draw_rc == 0
+    drawn = json.loads(capsys.readouterr().out)["drawn"]
+    assert len(drawn) == 3
+    strata = {row["stratum"] for row in drawn}
+    # Exactly 3/3 vendors support logprobs here, so every drawn record meets
+    # MIN_SUPPORTING_VOTES and none falls back to the "unscored" stratum.
+    assert strata <= {"low", "high"}
+
+    policy = json.loads((run_dir / "confidence_policy.json").read_text())
+    assert policy == {"low_threshold": 0.5, "min_supporting_votes": 3}
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps({row["record_id"]: -1 for row in drawn}))
+    apply_rc = main(["audit-apply", "--run-dir", str(run_dir), "--labels", str(labels_path)])
+    assert apply_rc == 0
+    capsys.readouterr()
+
+    validate_rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert validate_rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["confidence_policy"] == {"low_threshold": 0.5, "min_supporting_votes": 3}
+    assert record["recall"]["point"] is not None
+    assert record["recall"]["audit_n"] == 3
+
+
+def test_audit_draw_confidence_threshold_comes_from_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_confidence_config(config_path, confidence_threshold=0.9)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_CONFIDENCE_SEED),
+            "--request-logprobs",
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    # No CLI flag for the threshold exists (mirroring tau, which has none
+    # either) -- it must come from config.json's "confidence_threshold": 0.9.
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+            "--stratify-by-confidence",
+        ]
+    )
+    assert draw_rc == 0
+    capsys.readouterr()
+
+    policy = json.loads((run_dir / "confidence_policy.json").read_text())
+    assert policy == {"low_threshold": 0.9, "min_supporting_votes": 3}
+
+
+def test_audit_draw_rejects_track_and_confidence_stratification_together(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_confidence_config(config_path)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_CONFIDENCE_SEED),
+            "--request-logprobs",
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+            "--stratify-by-track",
+            "--stratify-by-confidence",
+        ]
+    )
+    assert draw_rc == 1
+    err = capsys.readouterr().err
+    assert "cannot both be set" in err
+
+
 def test_audit_draw_size_all_draws_full_population(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

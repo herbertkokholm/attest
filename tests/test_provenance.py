@@ -125,6 +125,39 @@ def test_zero_policy_included_in_to_dict_when_include() -> None:
     assert payload["zero_policy"] == "include"
 
 
+def test_confidence_threshold_defaults_to_default_low_threshold() -> None:
+    from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
+
+    assert Config().confidence_threshold == DEFAULT_LOW_THRESHOLD
+
+
+@pytest.mark.parametrize("bogus", [-0.01, 1.01])
+def test_confidence_threshold_rejects_value_outside_unit_interval(bogus: float) -> None:
+    with pytest.raises(ValueError, match="confidence_threshold"):
+        Config(confidence_threshold=bogus)
+
+
+def test_confidence_threshold_never_included_in_to_dict() -> None:
+    payload = Config(confidence_threshold=0.9).to_dict()
+
+    assert "confidence_threshold" not in payload
+
+
+def test_confidence_threshold_does_not_change_the_ensemble_config_id() -> None:
+    # Unlike every other Config field tested above (default_prompt,
+    # track_prompts, zero_policy), confidence_threshold must NEVER open a
+    # new epoch: it changes only how an already-fixed excluded population
+    # is stratified for audit, never what a vendor samples or the
+    # ensemble's own aggregate decision (see EnsembleConfig.confidence_threshold
+    # and docs/logprob_support.md).
+    base = _config()
+    different_threshold = Config(
+        vendors=base.vendors, aggregation=base.aggregation, tau=base.tau, confidence_threshold=0.9
+    )
+
+    assert compute_ensemble_config_id(base) == compute_ensemble_config_id(different_threshold)
+
+
 def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> None:
     # Pinned hash of _config()'s to_dict() shape: a default ("escalate")
     # config with no prompt fields, still omitting zero_policy since it's the

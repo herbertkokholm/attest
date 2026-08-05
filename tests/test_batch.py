@@ -182,6 +182,32 @@ def test_run_ensemble_batch_matches_run_ensemble_under_per_track_prompts(tmp_pat
     assert batch_run.votes == sync_run.votes
 
 
+def test_deterministic_batch_rater_forwards_request_logprobs_through_fetch(
+    tmp_path: Path,
+) -> None:
+    rater = DeterministicBatchRater(vendor="openai", model="model-a", seed=1, request_logprobs=True)
+    handle = rater.submit(_records("rec-1"), ensemble_config_id="cfg")
+
+    fetched = rater.fetch(handle)
+
+    ordinal, raw = fetched["rec-1"]
+    assert "logprobs" in raw
+    sync_ordinal, sync_raw = DeterministicRater(
+        vendor="openai", model="model-a", seed=1, request_logprobs=True
+    ).rate(Record(id="rec-1", title="", abstract="", track="batch"))
+    assert ordinal == sync_ordinal
+    assert raw == sync_raw
+
+
+def test_deterministic_batch_rater_omits_logprobs_by_default(tmp_path: Path) -> None:
+    rater = DeterministicBatchRater(vendor="openai", model="model-a", seed=1)
+    handle = rater.submit(_records("rec-1"), ensemble_config_id="cfg")
+
+    _ordinal, raw = rater.fetch(handle)["rec-1"]
+
+    assert "logprobs" not in raw
+
+
 def test_run_ensemble_batch_stamps_the_same_ensemble_config_id(tmp_path: Path) -> None:
     config = _config()
     expected_config_id = compute_ensemble_config_id(config)

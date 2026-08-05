@@ -11,8 +11,21 @@
       "model_version": "2026-01",
       "prompt_version": "screening-prompt-v1",
       "temperature": 0.0
+    },
+    "mistral": {
+      "model": "mistral-large-latest",
+      "model_version": "2026-01",
+      "prompt_version": "screening-prompt-v1",
+      "temperature": 0.0
+    },
+    "together": {
+      "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "model_version": "2026-01",
+      "prompt_version": "screening-prompt-v1",
+      "temperature": 0.0
     }
   },
   "aggregation": "boundary_dispersion",
-  "tau": 1.0
+  "tau": 1.0,
+  "confidence_threshold": 0.5
 }

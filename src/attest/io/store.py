@@ -34,6 +34,7 @@ from attest.contracts.validation_record import (
 from attest.contracts.validation_record import Config as RecordConfig
 from attest.contracts.validation_record import build as build_validation_record
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE, Decision
+from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
 from attest.planes.adjudication import AdjudicationError, final_label
@@ -58,6 +59,7 @@ RUNS_FILENAME = "runs.json"
 BATCH_HANDLES_FILENAME = "batch_handles.json"
 RAW_RESPONSES_FILENAME = "raw_responses.json"
 TAU_REPORT_FILENAME = "tau_report.json"
+CONFIDENCE_POLICY_FILENAME = "confidence_policy.json"
 
 
 class StoreError(ValueError):
@@ -127,6 +129,13 @@ def _decision_from_dict(payload: Mapping[str, Any]) -> Decision:
 def _config_to_dict(config: EnsembleConfig, ensemble_config_id: str) -> dict[str, Any]:
     payload = config.to_dict()
     payload["ensemble_config_id"] = ensemble_config_id
+    # confidence_threshold is deliberately excluded from Config.to_dict()
+    # itself (see that method's docstring) since it must never affect
+    # ensemble_config_id -- added here instead, at the one place a
+    # persisted config.json and a live Config object actually meet, so it
+    # still round-trips through RunStore like every other field a caller
+    # set on Config.
+    payload["confidence_threshold"] = config.confidence_threshold
     return payload
 
 
@@ -140,6 +149,7 @@ def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
+        confidence_threshold=payload.get("confidence_threshold", DEFAULT_LOW_THRESHOLD),
     )
 
 
@@ -422,6 +432,43 @@ class RunStore:
         if payload is None:
             return None
         return TauReport.from_dict(payload)
+
+    def write_confidence_policy(self, *, low_threshold: float, min_supporting_votes: int) -> None:
+        """Persist the confidence-tier policy used for a confidence-stratified audit draw.
+
+        `low_threshold` (see `attest.ensemble.confidence.confidence_tier`) is
+        a deliberate policy choice, not hash-versioned into
+        `attest.provenance.config.Config`/`ensemble_config_id` -- without
+        recording it here, a stored `stratum` of `"low"`/`"high"` on an
+        audit row would carry no trace of which threshold produced it, and
+        a later `validate` call would have no way to reconstruct matching
+        per-tier population sizes. `min_supporting_votes` (see
+        `attest.ensemble.confidence.MIN_SUPPORTING_VOTES`) is recorded
+        alongside it for the same reason: it is currently a fixed constant,
+        but a stored policy should self-document the coverage rule that was
+        actually in force when it was written, not assume today's constant
+        forever.
+
+        Overwrites any previously stored policy -- like `write_tau_report`,
+        there is exactly one current policy per run directory, describing
+        the threshold last actually used, not a history of every value ever
+        tried.
+        """
+        _write_json(
+            self.root / CONFIDENCE_POLICY_FILENAME,
+            {"low_threshold": low_threshold, "min_supporting_votes": min_supporting_votes},
+        )
+
+    def read_confidence_policy(self) -> dict[str, Any] | None:
+        """Read the persisted confidence policy, or None if never written.
+
+        A non-None result also signals that this run's most recent audit
+        draw was confidence-stratified, which `attest.cli._cmd_validate`
+        uses to decide whether to recompute confidence tiers when
+        rebuilding population sizes for `attest.stats.recall`.
+        """
+        payload: dict[str, Any] | None = _read_json(self.root / CONFIDENCE_POLICY_FILENAME)
+        return payload
 
 
 def _predictions_by_vendor(

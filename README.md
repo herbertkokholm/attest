@@ -104,6 +104,44 @@ validates `config.tau` at epoch-open time and persists the report to
 `tau_report.json` in the run directory; `attest validate` surfaces it
 alongside the validation record.
 
+`tau`/dispersion is a *between*-vendor signal: how much the ensemble
+disagreed. `attest.ensemble.confidence` adds an orthogonal *within*-vendor
+one: per-vote logprobs, requested via `screen --request-logprobs`
+(`Config`/`VendorSpec` are untouched by this -- it changes only what
+side-channel metadata comes back with an unchanged sample, never
+`ensemble_config_id`). A record's confidence is the median `P(the token a
+vendor emitted)` across only the vendors that returned one, computed only
+once at least `attest.ensemble.confidence.MIN_SUPPORTING_VOTES` (3) vendors
+did -- below that there is no central-tendency statistic robust to a single
+miscalibrated vendor, so the record is tagged `"unscored"` rather than
+scored on thin evidence. Not every vendor can contribute: Anthropic's
+Messages API has no logprobs equivalent at all (see
+[`docs/logprob_support.md`](docs/logprob_support.md) for the full support
+matrix), so an ensemble that includes Anthropic needs at least four vendors
+total before three can ever support the confidence signal -- `attest`'s own
+bundled `data/example_config.json` is deliberately four vendors
+(anthropic, openai, mistral, together) for exactly this reason, not two.
+This confidence signal feeds two of the three planes:
+`audit-draw --stratify-by-confidence` stratifies the recall audit by tier
+instead of track (see [Confidence-stratified
+auditing](#confidence-stratified-auditing-logprobs) below), and
+`attest.planes.active_learning.select_for_review` additionally selects a
+record whenever it is scored and at or below `confidence_threshold`, which
+catches unanimous-but-shaky vote vectors (e.g. `(1, 1, 1)` where every
+vendor was individually unsure) that dispersion alone can never see, since
+dispersion is zero for any unanimous vote regardless of how confident each
+vendor actually was. `confidence_threshold` (default 0.5) is sourced from
+`Config`/`config.json` exactly like `tau` -- a runbook setting the caller
+shouldn't have to retype identically on every `audit-draw` invocation -- but
+unlike `tau` it is deliberately excluded from `Config.to_dict()` and never
+affects `ensemble_config_id`: it changes only how an already-fixed
+excluded population is stratified for audit, never what a vendor samples or
+the ensemble's own aggregate decision. `attest audit-draw` records whichever
+threshold it actually used to `confidence_policy.json`, the same provenance
+treatment `tau_report.json` gets, and `attest validate` reads it back to
+reconstruct matching population sizes and surfaces it in the validation
+payload as `confidence_policy`.
+
 ## The two stable contracts
 
 `attest` exposes two versioned wire contracts. Treat both as frozen
@@ -170,8 +208,10 @@ inter-vendor independence argument behind the ensemble.
   firewall so that recall is never estimated from a biased sample:
   - `adjudication` — resolves escalated (disagreement) records with an
     authoritative human label.
-  - `active_learning` — routes high-disagreement records to human review to
-    improve the ensemble; never a probability sample.
+  - `active_learning` — routes high-disagreement records, or unanimous
+    records with low within-vendor confidence (see
+    `attest.ensemble.confidence`), to human review to improve the ensemble;
+    never a probability sample.
   - `recall_audit` — the *only* plane recall may be estimated from: a random
     probability sample of the screen-excluded population, gold-checked by a
     human auditor.
@@ -211,9 +251,9 @@ inter-vendor independence argument behind the ensemble.
 ## Running the CLI on the example data
 
 `data/example_gold_set.json` (input contract) and `data/example_config.json`
-(a two-vendor ensemble config) are bundled for a quick, network-free run
-using `--deterministic-seed`, which swaps in seeded `DeterministicRater`s
-instead of live vendor adapters:
+(a four-vendor ensemble config -- anthropic, openai, mistral, together) are
+bundled for a quick, network-free run using `--deterministic-seed`, which
+swaps in seeded `DeterministicRater`s instead of live vendor adapters:
 
 ```bash
 attest screen \
@@ -299,6 +339,55 @@ attest batch-fetch \
 
 This produces byte-for-byte the same `votes.json` and `decisions.json` as
 the synchronous path over the same input, config, and seed.
+
+### Confidence-stratified auditing (logprobs)
+
+`--request-logprobs` asks every vendor that supports it for per-vote
+logprobs -- openai, mistral, together here; Anthropic never does (see
+[`docs/logprob_support.md`](docs/logprob_support.md)) -- and
+`audit-draw --stratify-by-confidence` stratifies the recall audit by the
+resulting tier instead of track:
+
+```bash
+attest screen \
+  --input data/example_gold_set.json \
+  --config data/example_config.json \
+  --run-dir /tmp/attest-logprobs-demo \
+  --deterministic-seed 37 \
+  --request-logprobs
+
+attest audit-draw --run-dir /tmp/attest-logprobs-demo \
+  --input data/example_gold_set.json --size all --stratify-by-confidence
+```
+
+For this seed nothing escalates, and the screen-excluded population is
+exactly two records landing in different tiers: `rec-001` (median
+confidence 0.34, scored from openai/mistral/together -- Anthropic's vote
+still counted toward the `boundary_dispersion` decision above, just not
+toward this figure) draws `"low"`; `rec-002` (median confidence 0.58) draws
+`"high"`. The threshold that produced that split
+(`Config.confidence_threshold`, 0.5 by default) is recorded to
+`confidence_policy.json`:
+
+```json
+{"low_threshold": 0.5, "min_supporting_votes": 3}
+```
+
+Apply gold-check labels and validate exactly as before:
+
+```bash
+echo '{"rec-001": 1, "rec-002": -1}' > /tmp/labels.json
+attest audit-apply --run-dir /tmp/attest-logprobs-demo --labels /tmp/labels.json
+attest validate --run-dir /tmp/attest-logprobs-demo --input data/example_gold_set.json
+```
+
+`rec-001`'s gold label is `1` -- a truly relevant record screening excluded
+anyway -- while `rec-002`'s is `-1`, correctly excluded; the low-confidence
+stratum (`rec-001` alone, stratum population 1) is exactly the one carrying
+the miss, the concrete illustration of what stratifying toward
+low-confidence records is for. `attest validate`'s output now also carries
+a `confidence_policy` key alongside `tau_report`, the same provenance
+treatment `tau` already gets.
 
 ## Running the tests
 

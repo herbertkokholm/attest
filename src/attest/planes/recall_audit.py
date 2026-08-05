@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
+from attest.ensemble.confidence import UNSCORED_TIER
 from attest.ensemble.votes import VALID_RATINGS
 from attest.planes import PLANE_RECALL_AUDIT
 from attest.stats.recall import Stratum
@@ -38,10 +39,17 @@ class ExcludedRecord:
         record_id: Id of the screen-excluded record.
         track: The screening track this record belongs to, used as the
             stratification key when `stratify_by_track` is set.
+        confidence_tier: This record's ensemble-confidence tier (`"low"`,
+            `"high"`, or `attest.ensemble.confidence.UNSCORED_TIER` for
+            coverage-gated records), computed by
+            `attest.ensemble.confidence.confidence_tier` and used as the
+            stratification key when `stratify_by_confidence` is set.
+            `None` if confidence stratification is not in use for this run.
     """
 
     record_id: str
     track: int | str
+    confidence_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,27 +90,57 @@ class AuditPlaneRow(Protocol):
     def plane(self) -> str: ...
 
 
+def _track_key(record: ExcludedRecord) -> str:
+    return str(record.track)
+
+
+def _confidence_key(record: ExcludedRecord) -> str:
+    if record.confidence_tier is None:
+        raise AuditError(
+            f"record '{record.record_id}': stratify_by_confidence=True requires every "
+            "record to carry a confidence_tier (see attest.ensemble.confidence."
+            f"confidence_tier, which returns {UNSCORED_TIER!r} for coverage-gated "
+            "records rather than None) -- got None"
+        )
+    return record.confidence_tier
+
+
 def draw_audit_sample(
     population: Sequence[ExcludedRecord],
     n: int,
     *,
     stratify_by_track: bool = False,
+    stratify_by_confidence: bool = False,
     rng: random.Random | None = None,
 ) -> list[AuditRow]:
     """Draw a random sample of n screen-excluded records for the recall audit.
 
     Without stratification, `n` records are drawn uniformly at random from
     the whole population, all tagged into a single pooled stratum. With
-    `stratify_by_track=True`, `n` is allocated across per-track strata in
-    proportion to each track's population size (largest-remainder /
+    `stratify_by_track=True` (or `stratify_by_confidence=True`), `n` is
+    allocated across per-track (or per-confidence-tier) strata in
+    proportion to each stratum's population size (largest-remainder /
     Hamilton apportionment), then that many records are drawn uniformly at
     random within each stratum -- so no stratum's draw ever exceeds its
     population.
+
+    `stratify_by_confidence` groups by `ExcludedRecord.confidence_tier`
+    (`"low"`/`"high"`/`attest.ensemble.confidence.UNSCORED_TIER`, computed
+    per-record by `attest.ensemble.confidence.confidence_tier`) rather than
+    `track`. This is a proportional draw, not a prioritized one: it does
+    not yet oversample the low-confidence tier the way "stratify toward
+    low-confidence records" implies -- see the "left open" note in
+    `docs/logprob_support.md` for that further, deliberately deferred,
+    Neyman-allocation refinement.
 
     Args:
         population: The screen-excluded records eligible for audit.
         n: Total number of records to draw.
         stratify_by_track: Whether to stratify the draw by `track`.
+        stratify_by_confidence: Whether to stratify the draw by
+            `confidence_tier` instead. Mutually exclusive with
+            `stratify_by_track` -- combined stratification across both
+            keys is an open design question, not yet supported.
         rng: Source of randomness; defaults to a fresh `random.Random()`.
             Pass a seeded `random.Random` for a reproducible draw.
 
@@ -111,29 +149,39 @@ def draw_audit_sample(
         `PLANE_RECALL_AUDIT`.
 
     Raises:
-        AuditError: If `n` is not positive or exceeds the population size.
+        AuditError: If `n` is not positive or exceeds the population size;
+            if both `stratify_by_track` and `stratify_by_confidence` are
+            set; or if `stratify_by_confidence` is set and some record has
+            no `confidence_tier`.
     """
     if n <= 0:
         raise AuditError(f"audit sample size n must be positive, got {n}")
     if n > len(population):
         raise AuditError(f"audit sample size n ({n}) exceeds population size ({len(population)})")
+    if stratify_by_track and stratify_by_confidence:
+        raise AuditError(
+            "stratify_by_track and stratify_by_confidence cannot both be set: combined "
+            "stratification across both keys is an open design question (see "
+            "docs/logprob_support.md's 'left open' note), not yet supported -- choose one"
+        )
 
     active_rng = rng if rng is not None else random.Random()
 
-    if not stratify_by_track:
+    if not stratify_by_track and not stratify_by_confidence:
         sampled = active_rng.sample(list(population), n)
         return [AuditRow(record_id=r.record_id, stratum=_UNSTRATIFIED_NAME) for r in sampled]
 
-    by_track: dict[str, list[ExcludedRecord]] = defaultdict(list)
+    key_fn = _confidence_key if stratify_by_confidence else _track_key
+    by_stratum: dict[str, list[ExcludedRecord]] = defaultdict(list)
     for record in population:
-        by_track[str(record.track)].append(record)
+        by_stratum[key_fn(record)].append(record)
 
-    allocation = _allocate_proportionally(n, {name: len(recs) for name, recs in by_track.items()})
+    allocation = _allocate_proportionally(n, {name: len(recs) for name, recs in by_stratum.items()})
 
     rows: list[AuditRow] = []
-    for track_name, count in allocation.items():
-        sampled = active_rng.sample(by_track[track_name], count)
-        rows.extend(AuditRow(record_id=r.record_id, stratum=track_name) for r in sampled)
+    for stratum_name, count in allocation.items():
+        sampled = active_rng.sample(by_stratum[stratum_name], count)
+        rows.extend(AuditRow(record_id=r.record_id, stratum=stratum_name) for r in sampled)
     return rows
 
 

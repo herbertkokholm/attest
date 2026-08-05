@@ -66,6 +66,37 @@ def test_deterministic_rater_is_sensitive_to_an_explicit_prompt() -> None:
     assert with_prompt_a != with_prompt_b
 
 
+def test_deterministic_rater_omits_logprobs_by_default() -> None:
+    record = _record("rec-1")
+    rater = DeterministicRater(vendor="openai", seed=42)
+
+    _ordinal, raw = rater.rate(record)
+
+    assert "logprobs" not in raw
+
+
+def test_deterministic_rater_request_logprobs_is_deterministic_and_openai_shaped() -> None:
+    from attest.ensemble.confidence import vote_confidence
+
+    record = _record("rec-1")
+    rater_a = DeterministicRater(vendor="openai", seed=42, request_logprobs=True)
+    rater_b = DeterministicRater(vendor="openai", seed=42, request_logprobs=True)
+
+    ordinal, raw_a = rater_a.rate(record)
+    _ordinal_b, raw_b = rater_b.rate(record)
+
+    assert raw_a == raw_b
+    logprob = raw_a["logprobs"]["content"][0]["logprob"]
+    assert -3.0 <= logprob <= 0.0
+    assert raw_a["logprobs"]["content"][0]["token"] == str(ordinal)
+    # Not a real vendor response, but shaped so attest.ensemble.confidence's
+    # shared OpenAI-compatible extractor parses it exactly as a live
+    # openai/mistral/fireworks/together response would.
+    probability = vote_confidence("openai", raw_a)
+    assert probability is not None
+    assert 0.0 < probability <= 1.0
+
+
 def test_run_ensemble_resolves_prompt_per_record_track() -> None:
     config = Config(
         vendors={

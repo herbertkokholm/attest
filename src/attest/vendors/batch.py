@@ -195,12 +195,17 @@ class DeterministicBatchRater:
             `DeterministicBatchRater` with the same vendor and model.
         fail_record_ids: Record ids that `fetch` should omit, simulating a
             per-item failure within this vendor's batch.
+        request_logprobs: Mirrors `DeterministicRater.request_logprobs` --
+            forwarded to the internal `DeterministicRater` `fetch` builds,
+            so a batch submitted/fetched with this set also attaches a
+            deterministic fake `raw_response["logprobs"]`.
     """
 
     vendor: str
     model: str = "deterministic-v1"
     seed: int = 0
     fail_record_ids: frozenset[str] = field(default_factory=frozenset)
+    request_logprobs: bool = False
 
     def submit(
         self,
@@ -231,7 +236,12 @@ class DeterministicBatchRater:
         reproducing exactly what `DeterministicRater.rate` would have returned
         synchronously, so batch/sync parity holds under per-track prompts too.
         """
-        rater = DeterministicRater(vendor=self.vendor, model=self.model, seed=self.seed)
+        rater = DeterministicRater(
+            vendor=self.vendor,
+            model=self.model,
+            seed=self.seed,
+            request_logprobs=self.request_logprobs,
+        )
         results: dict[str, tuple[int, Any]] = {}
         for record_id in handle.id_map:
             if record_id in self.fail_record_ids:

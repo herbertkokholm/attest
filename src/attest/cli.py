@@ -26,6 +26,7 @@ import sys
 import warnings
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from random import Random
 from typing import Any
@@ -38,6 +39,12 @@ from attest.ensemble.aggregate import (
     ZERO_POLICY_ESCALATE,
     Decision,
     g,
+)
+from attest.ensemble.confidence import (
+    DEFAULT_LOW_THRESHOLD,
+    MIN_SUPPORTING_VOTES,
+    confidence_tier,
+    record_confidence,
 )
 from attest.ensemble.tau import validate_tau
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
@@ -83,15 +90,22 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
             an object with "model", "model_version", "prompt_version",
             "temperature"), "aggregation", "tau", and optionally
             "default_prompt" (string), "track_prompts" (mapping of track to
-            prompt text), and/or "zero_policy" (one of "escalate"/"include",
-            default "escalate") fields.
+            prompt text), "zero_policy" (one of "escalate"/"include",
+            default "escalate"), and/or "confidence_threshold" (float in
+            [0, 1], default `attest.ensemble.confidence.DEFAULT_LOW_THRESHOLD`
+            -- the default `--confidence-threshold` a confidence-stratified
+            `audit-draw` uses for this review, sourced from this same file
+            for the same reason `tau` is, though unlike `tau` it never
+            affects `ensemble_config_id`; see `EnsembleConfig.confidence_threshold`)
+            fields.
 
     Returns:
         The parsed `EnsembleConfig`.
 
     Raises:
-        ValueError: If "zero_policy" names an unrecognized policy
-            (propagated from `EnsembleConfig.__post_init__`).
+        ValueError: If "zero_policy" names an unrecognized policy, or
+            "confidence_threshold" is outside `[0, 1]` (both propagated
+            from `EnsembleConfig.__post_init__`).
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     vendors = {
@@ -110,6 +124,7 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
+        confidence_threshold=float(payload.get("confidence_threshold", DEFAULT_LOW_THRESHOLD)),
     )
 
 
@@ -121,7 +136,9 @@ def _load_labels(path: Path) -> dict[str, int]:
     return {str(record_id): int(label) for record_id, label in payload.items()}
 
 
-def _build_raters(config: EnsembleConfig, *, deterministic_seed: int | None) -> list[Rater]:
+def _build_raters(
+    config: EnsembleConfig, *, deterministic_seed: int | None, request_logprobs: bool = False
+) -> list[Rater]:
     """Build one rater per vendor in `config`, live or network-free.
 
     Args:
@@ -129,17 +146,26 @@ def _build_raters(config: EnsembleConfig, *, deterministic_seed: int | None) -> 
         deterministic_seed: If given, build seeded `DeterministicRater`s
             instead of live vendor adapters, so `screen` never touches the
             network. If None, build live raters via `attest.vendors.registry`.
+        request_logprobs: Forwarded to `attest.vendors.registry.build_raters`
+            (live raters) or `DeterministicRater.request_logprobs`
+            (network-free) -- see `attest.ensemble.confidence` for what
+            consumes the resulting `raw_response["logprobs"]`.
     """
     if deterministic_seed is None:
-        return build_raters(config)
+        return build_raters(config, request_logprobs=request_logprobs)
     return [
-        DeterministicRater(vendor=name, model=spec.model, seed=deterministic_seed)
+        DeterministicRater(
+            vendor=name,
+            model=spec.model,
+            seed=deterministic_seed,
+            request_logprobs=request_logprobs,
+        )
         for name, spec in config.vendors.items()
     ]
 
 
 def _build_batch_raters(
-    config: EnsembleConfig, *, deterministic_seed: int | None
+    config: EnsembleConfig, *, deterministic_seed: int | None, request_logprobs: bool = False
 ) -> list[BatchRater]:
     """Build one `BatchRater` per vendor in `config`, live or network-free.
 
@@ -149,11 +175,24 @@ def _build_batch_raters(
             instead of live vendor adapters, so batch mode never touches the
             network. If None, build live batch raters via
             `attest.vendors.registry`.
+        request_logprobs: Forwarded to
+            `attest.vendors.registry.build_batch_raters` (live raters) or
+            `DeterministicBatchRater.request_logprobs` (network-free). Must
+            be passed identically to both the `screen --mode batch` call
+            that submits and the later `batch-fetch` call that fetches --
+            like `deterministic_seed`, it is not itself persisted in
+            `BatchHandle`, so the caller is responsible for consistency
+            across the two invocations.
     """
     if deterministic_seed is None:
-        return build_batch_raters(config)
+        return build_batch_raters(config, request_logprobs=request_logprobs)
     return [
-        DeterministicBatchRater(vendor=name, model=spec.model, seed=deterministic_seed)
+        DeterministicBatchRater(
+            vendor=name,
+            model=spec.model,
+            seed=deterministic_seed,
+            request_logprobs=request_logprobs,
+        )
         for name, spec in config.vendors.items()
     ]
 
@@ -229,6 +268,46 @@ def _screen_excluded_population(
     return population
 
 
+def _attach_confidence_tiers(
+    population: Sequence[ExcludedRecord], store: RunStore, *, low_threshold: float
+) -> list[ExcludedRecord]:
+    """Compute and attach each record's confidence tier from already-stored votes/raw responses.
+
+    Only called for `--stratify-by-confidence`: reads `votes.json`/
+    `raw_responses.json` (already-persisted ensemble output; no new vendor
+    calls) and scores each record via
+    `attest.ensemble.confidence.record_confidence`/`confidence_tier`, the
+    same figure `attest.planes.active_learning.select_for_review` reuses --
+    a single, shared computation, not something recomputed differently per
+    call site.
+
+    Args:
+        population: Screen-excluded records to score (track already set).
+        store: The run's `RunStore`, read from only.
+        low_threshold: The confidence-tier policy in force for this call
+            (see `attest.ensemble.confidence.confidence_tier`).
+
+    Returns:
+        `population`, with each record's `confidence_tier` set.
+
+    Raises:
+        CliError: If a record in `population` has no stored vote vector --
+            confidence cannot be scored without the votes it was derived
+            from.
+    """
+    raw_responses = store.read_raw_responses()
+    votes_by_id = {vote_vector.record_id: vote_vector for vote_vector in store.read_votes()}
+    tiered: list[ExcludedRecord] = []
+    for record in population:
+        vote_vector = votes_by_id.get(record.record_id)
+        if vote_vector is None:
+            raise CliError(f"record '{record.record_id}': no stored votes to score confidence from")
+        confidence = record_confidence(vote_vector, raw_responses.get(record.record_id, {}))
+        tier = confidence_tier(confidence, low_threshold=low_threshold)
+        tiered.append(replace(record, confidence_tier=tier))
+    return tiered
+
+
 def _audit_draw_size(value: str) -> int | None:
     """Parse `--size`: an int, or the literal "all" for the full population.
 
@@ -246,18 +325,32 @@ def _audit_draw_size(value: str) -> int | None:
         ) from exc
 
 
-def _population_sizes(population: Sequence[ExcludedRecord]) -> dict[str, int]:
+def _population_sizes(
+    population: Sequence[ExcludedRecord], *, include_confidence: bool = False
+) -> dict[str, int]:
     """Build stratum population sizes covering both stratified and unstratified audit draws.
 
     Returns a mapping with an "all" entry (the full excluded population
     size, for unstratified draws) alongside one entry per distinct track
-    (for `stratify_by_track=True` draws), so `validate` can look up
-    whichever stratum names the stored audit rows actually used.
+    (for `stratify_by_track=True` draws) and, when `include_confidence` is
+    set and `population`'s records already carry a `confidence_tier` (see
+    `_attach_confidence_tiers`), one entry per distinct tier (for
+    `stratify_by_confidence=True` draws) -- so `validate` can look up
+    whichever stratum names the stored audit rows actually used. Track and
+    confidence-tier names share this same flat namespace, exactly as
+    `attest.planes.recall_audit.AuditRow.stratum`/
+    `attest.stats.recall.Stratum.name` already do; a track literally named
+    `"low"` would collide with the confidence tier of the same name, but
+    the two stratification modes are mutually exclusive per draw (see
+    `attest.planes.recall_audit.draw_audit_sample`), so in practice only
+    one of the two ever populates a given run's audit rows.
     """
     sizes: dict[str, int] = defaultdict(int)
     sizes["all"] = len(population)
     for record in population:
         sizes[str(record.track)] += 1
+        if include_confidence and record.confidence_tier is not None:
+            sizes[record.confidence_tier] += 1
     return dict(sizes)
 
 
@@ -330,10 +423,18 @@ def _cmd_screen(args: argparse.Namespace) -> int:
     outcome = _DEFAULT_PREFILTER.run(normalized.records)
 
     if args.mode == "sync":
-        raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
+        raters = _build_raters(
+            config,
+            deterministic_seed=args.deterministic_seed,
+            request_logprobs=args.request_logprobs,
+        )
         ensemble_run = run_ensemble(outcome.kept, raters, config)
     elif args.mode == "batch":
-        batch_raters = _build_batch_raters(config, deterministic_seed=args.deterministic_seed)
+        batch_raters = _build_batch_raters(
+            config,
+            deterministic_seed=args.deterministic_seed,
+            request_logprobs=args.request_logprobs,
+        )
         submit_batch(outcome.kept, batch_raters, config, store)
         if not args.wait:
             summary = {
@@ -365,7 +466,9 @@ def _cmd_batch_fetch(args: argparse.Namespace) -> int:
 
     outcome = _DEFAULT_PREFILTER.run(normalized.records)
 
-    batch_raters = _build_batch_raters(config, deterministic_seed=args.deterministic_seed)
+    batch_raters = _build_batch_raters(
+        config, deterministic_seed=args.deterministic_seed, request_logprobs=args.request_logprobs
+    )
     ensemble_run = poll_and_fetch_batch(
         batch_raters,
         store,
@@ -414,15 +517,33 @@ def _cmd_audit_draw(args: argparse.Namespace) -> int:
     """Draw a random recall-audit sample from the current screen-excluded population."""
     store = RunStore(Path(args.run_dir))
     normalized = load_input(args.input)
-    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+    config = store.read_config()
+    ensemble_config_id = compute_ensemble_config_id(config)
 
     population = _screen_excluded_population(store, normalized)
     if not population:
         raise CliError("no screen-excluded records are available to audit")
 
+    if args.stratify_by_confidence:
+        # low_threshold comes from config.confidence_threshold only -- the
+        # same config.json this run's tau/vendors came from, and (like tau)
+        # with no CLI override: one source of truth, no drift between what
+        # config.json declares and what a draw actually used.
+        low_threshold = config.confidence_threshold
+        population = _attach_confidence_tiers(population, store, low_threshold=low_threshold)
+        store.write_confidence_policy(
+            low_threshold=low_threshold, min_supporting_votes=MIN_SUPPORTING_VOTES
+        )
+
     size = args.size if args.size is not None else len(population)
     rng = Random(args.seed) if args.seed is not None else None
-    rows = draw_audit_sample(population, size, stratify_by_track=args.stratify_by_track, rng=rng)
+    rows = draw_audit_sample(
+        population,
+        size,
+        stratify_by_track=args.stratify_by_track,
+        stratify_by_confidence=args.stratify_by_confidence,
+        rng=rng,
+    )
     store.write_audit_rows(ensemble_config_id, rows)
 
     drawn = [{"record_id": row.record_id, "stratum": row.stratum} for row in rows]
@@ -460,7 +581,19 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         if record.has_gold and record.gold_label is not None
     }
     population = _screen_excluded_population(store, normalized)
-    population_sizes = _population_sizes(population)
+    # A stored confidence_policy.json is this run's evidence that its most
+    # recent audit draw was confidence-stratified (see
+    # RunStore.write_confidence_policy) -- reused here, not re-asked for on
+    # the command line, so population sizes are rebuilt with the exact
+    # low_threshold that actually produced the stored audit rows' strata.
+    confidence_policy = store.read_confidence_policy()
+    if confidence_policy is not None:
+        population = _attach_confidence_tiers(
+            population, store, low_threshold=confidence_policy["low_threshold"]
+        )
+    population_sizes = _population_sizes(
+        population, include_confidence=confidence_policy is not None
+    )
 
     record = assemble_validation_record(
         store,
@@ -478,6 +611,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         # under, so every validation record self-documents why its tau
         # behaves the way it does.
         payload["tau_report"] = tau_report.to_dict()
+    if confidence_policy is not None:
+        # Same provenance treatment as tau_report: the confidence-tier
+        # policy (attest.ensemble.confidence) this epoch's audit
+        # stratification actually used.
+        payload["confidence_policy"] = confidence_policy
 
     _write_or_print(json.dumps(payload, indent=2), args.out)
     return 0
@@ -549,6 +687,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="In --mode batch, poll every submitted batch to completion before returning "
         "instead of exiting right after submission.",
     )
+    screen.add_argument(
+        "--request-logprobs",
+        action="store_true",
+        help="Ask every vendor that supports it (see docs/logprob_support.md) for per-vote "
+        "logprobs, retained in raw_responses.json. Required for --stratify-by-confidence "
+        "on a later audit-draw, or for confidence-driven active-learning selection.",
+    )
     screen.set_defaults(handler=_cmd_screen)
 
     batch_fetch = subparsers.add_parser(
@@ -579,6 +724,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Upper bound on the backed-off poll interval.",
+    )
+    batch_fetch.add_argument(
+        "--request-logprobs",
+        action="store_true",
+        help="Must match the --request-logprobs value passed to the 'screen --mode batch' "
+        "call that submitted this batch -- not itself persisted in the batch handle.",
     )
     batch_fetch.set_defaults(handler=_cmd_batch_fetch)
 
@@ -614,6 +765,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     audit_draw.add_argument(
         "--stratify-by-track", action="store_true", help="Stratify the draw by record track."
+    )
+    audit_draw.add_argument(
+        "--stratify-by-confidence",
+        action="store_true",
+        help="Stratify the draw by ensemble confidence tier (low/high/unscored) instead of "
+        "track. Mutually exclusive with --stratify-by-track. Requires 'screen "
+        "--request-logprobs' to have been used for this run's votes. The 'low' cutoff comes "
+        "from this run's config.json 'confidence_threshold' (see "
+        "attest.ensemble.confidence.confidence_tier) -- the same runbook setting tau comes "
+        "from, with no separate CLI override -- and is recorded to confidence_policy.json as "
+        "run evidence, reused by 'validate' to reconstruct matching population sizes.",
     )
     audit_draw.add_argument(
         "--seed", type=int, default=None, help="Seed for a reproducible random draw."
