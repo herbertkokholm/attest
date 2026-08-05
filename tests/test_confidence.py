@@ -41,13 +41,45 @@ def test_vote_confidence_single_token_openai_compatible(vendor: str) -> None:
     assert probability == pytest.approx(math.exp(-0.05))
 
 
-def test_vote_confidence_sums_logprobs_across_multiple_tokens() -> None:
-    # "-1" tokenizing into "-" and "1": P(full text) = exp(sum), by the chain rule.
+def test_vote_confidence_geometric_mean_across_multiple_tokens() -> None:
+    # A reply that (still) tokenizes into more than one token is scored by
+    # the geometric mean of its per-token probabilities, not their sum --
+    # see attest.ensemble.confidence._geometric_mean_probability for why a
+    # sum would systematically penalize vendors that split the same
+    # single-letter answer into more tokens.
     raw = _openai_shaped(-0.02, -0.01)
 
     probability = vote_confidence("openai", raw)
 
-    assert probability == pytest.approx(math.exp(-0.03))
+    assert probability == pytest.approx(math.exp((-0.02 + -0.01) / 2))
+
+
+def test_vote_confidence_skips_framing_tokens() -> None:
+    # A leading whitespace token some vendors emit before the answer is
+    # framing, not part of the answer, and must not dilute the mean.
+    raw = {
+        "logprobs": {
+            "content": [
+                {"token": " ", "logprob": -5.0},
+                {"token": "I", "logprob": -0.05},
+            ]
+        }
+    }
+
+    assert vote_confidence("openai", raw) == pytest.approx(math.exp(-0.05))
+
+
+def test_vote_confidence_all_framing_tokens_returns_none() -> None:
+    raw = {
+        "logprobs": {
+            "content": [
+                {"token": " ", "logprob": -1.0},
+                {"token": "\n", "logprob": -2.0},
+            ]
+        }
+    }
+
+    assert vote_confidence("openai", raw) is None
 
 
 def test_vote_confidence_missing_content_returns_none() -> None:
@@ -199,6 +231,39 @@ def test_record_confidence_median_is_robust_to_one_miscalibrated_vendor() -> Non
     mean_probability = (0.95 + 0.90 + 0.01) / 3
     assert confidence.median_probability == pytest.approx(0.90)
     assert confidence.median_probability > mean_probability
+
+
+def test_record_confidence_invariant_to_tokenization_of_the_same_per_token_probability() -> None:
+    # The whole point of moving OUTPUT_CONTRACT to single-token E/U/I
+    # symbols: a vendor whose tokenizer happens to split the reply into
+    # more tokens must land on the same confidence as one that emits it as
+    # a single token, given the same underlying per-token certainty. This
+    # is the regression guard against the tier boundary drifting the way
+    # "-1" splitting into two tokens used to drift it under the old
+    # sum-based extractor.
+    per_token_logprob = math.log(0.8)
+    votes = build_vote_vector(
+        "r-tokenization", _CONFIG_ID, {"openai": 1, "mistral": 1, "together": 1}
+    )
+    single_token_raw = _raw_responses(
+        openai=_openai_shaped(per_token_logprob),
+        mistral=_openai_shaped(per_token_logprob),
+        together=_openai_shaped(per_token_logprob),
+    )
+    two_token_raw = _raw_responses(
+        openai=_openai_shaped(per_token_logprob, per_token_logprob),
+        mistral=_openai_shaped(per_token_logprob, per_token_logprob),
+        together=_openai_shaped(per_token_logprob, per_token_logprob),
+    )
+
+    single_token_confidence = record_confidence(votes, single_token_raw)
+    two_token_confidence = record_confidence(votes, two_token_raw)
+
+    assert single_token_confidence.median_probability == pytest.approx(
+        two_token_confidence.median_probability
+    )
+    assert single_token_confidence.scored is True
+    assert single_token_confidence.n_supporting == two_token_confidence.n_supporting == 3
 
 
 def test_record_confidence_missing_raw_response_entry_treated_as_non_supporting() -> None:

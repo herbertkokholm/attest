@@ -88,7 +88,8 @@ def test_deterministic_rater_request_logprobs_is_deterministic_and_openai_shaped
     assert raw_a == raw_b
     logprob = raw_a["logprobs"]["content"][0]["logprob"]
     assert -3.0 <= logprob <= 0.0
-    assert raw_a["logprobs"]["content"][0]["token"] == str(ordinal)
+    expected_token = {-1: "E", 0: "U", 1: "I"}[ordinal]
+    assert raw_a["logprobs"]["content"][0]["token"] == expected_token
     # Not a real vendor response, but shaped so attest.ensemble.confidence's
     # shared OpenAI-compatible extractor parses it exactly as a live
     # openai/mistral/fireworks/together response would.

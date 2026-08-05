@@ -40,10 +40,20 @@ SCREENING_TASK_PREAMBLE = (
 # silently dropped by a caller-supplied criteria string the way it could be
 # when it was baked into `DEFAULT_SCREENING_PROMPT`.
 OUTPUT_CONTRACT = (
-    "Respond with exactly one token: -1 to exclude, 0 if related but uncertain, or 1 to include."
+    "Respond with exactly one letter and nothing else: E to exclude, U if related but "
+    "uncertain, or I to include."
 )
 
-_ORDINAL_TOKENS: dict[str, int] = {"-1": -1, "0": 0, "1": 1, "+1": 1}
+# Single-token symbols, chosen so the screening decision is always exactly
+# one token regardless of vendor tokenizer: some vendors split a numeral
+# like "-1" into two tokens ("-" and "1") while others keep it as one, which
+# used to make `attest.ensemble.confidence` systematically less confident
+# for two-token vendors on the exact same underlying certainty. A bare
+# letter tokenizes to one token everywhere in practice. Matching is
+# case-insensitive (see `parse_ordinal_response`), so this dict is keyed by
+# the upper-cased letter only.
+_ORDINAL_TOKENS: dict[str, int] = {"E": -1, "U": 0, "I": 1}
+_ORDINAL_TOKEN_TEXT: dict[int, str] = {ordinal: token for token, ordinal in _ORDINAL_TOKENS.items()}
 
 
 class VendorResponseError(ValueError):
@@ -130,11 +140,11 @@ def parse_ordinal_response(text: str) -> int:
     whitespace and punctuation) is a single ordinal token, or its last
     non-empty line is. Only if neither strict form matches does this fall
     back to scanning every whitespace-separated token in `text` for ordinal
-    tokens, so replies like ``"1"``, ``"+1."``, or ``"Decision: -1"`` still
-    parse correctly. If that scan finds tokens spelling more than one
-    distinct rating (e.g. a reply that mentions both ``-1`` and ``1``), the
-    response is genuinely ambiguous and this raises rather than silently
-    picking the first one found.
+    tokens, so replies like ``"I"``, ``"E."``, or ``"Decision: E"`` still
+    parse correctly. Matching is case-insensitive. If that scan finds tokens
+    spelling more than one distinct rating (e.g. a reply that mentions both
+    ``E`` and ``I``), the response is genuinely ambiguous and this raises
+    rather than silently picking the first one found.
 
     Args:
         text: The rater's raw text response.
@@ -148,25 +158,25 @@ def parse_ordinal_response(text: str) -> int:
             ordinal rating are found.
     """
     stripped = text.strip()
-    whole = stripped.strip(".,:;()")
+    whole = stripped.strip(".,:;()").upper()
     if whole in _ORDINAL_TOKENS:
         return _ORDINAL_TOKENS[whole]
 
     non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
     if non_empty_lines:
-        last_line = non_empty_lines[-1].strip(".,:;()")
+        last_line = non_empty_lines[-1].strip(".,:;()").upper()
         if last_line in _ORDINAL_TOKENS:
             return _ORDINAL_TOKENS[last_line]
 
     found_ratings: list[int] = []
     for token in text.split():
-        cleaned = token.strip().strip(".,:;()")
+        cleaned = token.strip().strip(".,:;()").upper()
         if cleaned in _ORDINAL_TOKENS:
             found_ratings.append(_ORDINAL_TOKENS[cleaned])
 
     if not found_ratings:
         raise VendorResponseError(
-            f"could not parse an ordinal rating (-1/0/1) from response: {text!r}"
+            f"could not parse an ordinal rating (E/U/I) from response: {text!r}"
         )
     distinct = sorted(set(found_ratings))
     if len(distinct) > 1:
@@ -276,7 +286,7 @@ class DeterministicRater:
         if self.request_logprobs:
             fake_logprob = -(digest[1] / 255) * 3.0
             raw_response["logprobs"] = {
-                "content": [{"token": str(ordinal), "logprob": fake_logprob}]
+                "content": [{"token": _ORDINAL_TOKEN_TEXT[ordinal], "logprob": fake_logprob}]
             }
         return ordinal, raw_response
 

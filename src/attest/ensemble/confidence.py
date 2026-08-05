@@ -46,38 +46,78 @@ class ConfidenceError(ValueError):
     """Raised when a confidence computation is given a nonsensical input."""
 
 
+def _geometric_mean_probability(entries: Any, *, logprob_keys: tuple[str, ...]) -> float | None:
+    """Shared core of the per-vendor extractors: geometric mean over non-framing tokens.
+
+    By the chain rule, `P(full text) = exp(sum of each token's conditional
+    logprob))`. Summing raw logprobs is *not* comparable across vendors: a
+    vendor whose tokenizer splits the single-letter answer (see
+    `attest.vendors.base.OUTPUT_CONTRACT`) into more pieces than another
+    accumulates more (always <= 0) terms and is systematically pushed
+    toward lower confidence for the exact same underlying certainty --
+    exactly the skew that motivated switching the contract to a single
+    token in the first place. Taking the geometric mean instead --
+    `exp(sum(logprob) / n)` over the non-framing entries -- is invariant to
+    how many tokens the answer happened to split into, so it stays
+    comparable across vendors even if a symbol is ever multi-tokenized.
+    With the single-letter contract this is normally a mean of one term;
+    the normalization is kept as a guard for that case, not the common one.
+
+    Entries whose `token` is pure whitespace (e.g. a leading space some
+    vendors emit before the answer) are framing, not part of the answer,
+    and are excluded from both the sum and `n`.
+
+    Args:
+        entries: The vendor-specific list of per-token logprob entries.
+        logprob_keys: Candidate keys to read the numeric logprob from, in
+            order; the first present, well-typed value is used.
+
+    Returns:
+        `exp(sum(logprob) / n)` over non-framing entries, or `None` if any
+        entry is malformed or every entry turned out to be framing.
+    """
+    total = 0.0
+    n = 0
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            return None
+        logprob = None
+        for key in logprob_keys:
+            if key in entry:
+                logprob = entry.get(key)
+                break
+        if not isinstance(logprob, (int, float)) or not math.isfinite(logprob):
+            return None
+        token = entry.get("token")
+        if isinstance(token, str) and token.strip() == "":
+            continue
+        total += logprob
+        n += 1
+    if n == 0:
+        return None
+    return math.exp(total / n)
+
+
 def _openai_compatible_probability(logprobs: Any) -> float | None:
-    """Extract P(the emitted text) from an OpenAI-compatible `ChoiceLogprobs` payload.
+    """Extract P(the emitted token) from an OpenAI-compatible `ChoiceLogprobs` payload.
 
     Shared by openai, mistral, fireworks (sync), and together: all four
     request logprobs through an OpenAI-shaped Chat Completions endpoint and
     retain the same `{"content": [{"token", "logprob", ...}, ...]}` shape
     (see `attest.vendors.providers.{openai,mistral,fireworks,together}`).
-
-    By the chain rule, `P(full text) = exp(sum of each token's conditional
-    logprob)` -- summing every entry in `content` is robust to however many
-    tokens the ordinal reply happened to tokenize into (e.g. "-1" splitting
-    into "-" and "1"), without needing to guess which token "is" the
-    answer.
+    See `_geometric_mean_probability` for why this is a geometric mean, not
+    a sum.
     """
     if not isinstance(logprobs, Mapping):
         return None
     content = logprobs.get("content")
     if not content:
         return None
-    total = 0.0
-    for entry in content:
-        if not isinstance(entry, Mapping):
-            return None
-        logprob = entry.get("logprob")
-        if not isinstance(logprob, (int, float)) or not math.isfinite(logprob):
-            return None
-        total += logprob
-    return math.exp(total)
+    return _geometric_mean_probability(content, logprob_keys=("logprob",))
 
 
 def _google_probability(logprobs: Any) -> float | None:
-    """Best-effort P(the emitted text) from Gemini's `logprobs_result`.
+    """Best-effort P(the emitted token) from Gemini's `logprobs_result`.
 
     Unconfirmed live, per `docs/logprob_support.md`:
     `attest.vendors.providers.google._serialize_logprobs` falls back to
@@ -88,22 +128,18 @@ def _google_probability(logprobs: Any) -> float | None:
     This tries the shapes Gemini's REST/SDK docs describe and returns
     `None` -- never raises -- on anything else (including the bare-`str()`
     fallback), so an unconfirmed or drifted shape degrades to "no
-    confidence for this vote" rather than corrupting the aggregate.
+    confidence for this vote" rather than corrupting the aggregate. See
+    `_geometric_mean_probability` for why this is a geometric mean, not a
+    sum, over the candidate entries.
     """
     if not isinstance(logprobs, Mapping):
         return None
     candidates = logprobs.get("chosenCandidates", logprobs.get("chosen_candidates"))
     if not candidates:
         return None
-    total = 0.0
-    for entry in candidates:
-        if not isinstance(entry, Mapping):
-            return None
-        logprob = entry.get("logProbability", entry.get("log_probability"))
-        if not isinstance(logprob, (int, float)) or not math.isfinite(logprob):
-            return None
-        total += logprob
-    return math.exp(total)
+    return _geometric_mean_probability(
+        candidates, logprob_keys=("logProbability", "log_probability")
+    )
 
 
 # No entry for "anthropic": AnthropicRater/AnthropicBatchRater never

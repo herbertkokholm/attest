@@ -73,13 +73,15 @@ def test_compose_system_prompt_does_not_warn_for_ordinary_criteria() -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("1", 1),
-        ("-1", -1),
-        ("0", 0),
-        ("+1", 1),
-        (" 1 ", 1),
-        ("1.", 1),
-        ("(-1)", -1),
+        ("I", 1),
+        ("E", -1),
+        ("U", 0),
+        ("i", 1),
+        ("e", -1),
+        ("u", 0),
+        (" I ", 1),
+        ("I.", 1),
+        ("(E)", -1),
     ],
 )
 def test_parse_ordinal_response_strict_whole_reply(text: str, expected: int) -> None:
@@ -87,15 +89,15 @@ def test_parse_ordinal_response_strict_whole_reply(text: str, expected: int) -> 
 
 
 def test_parse_ordinal_response_strict_last_non_empty_line() -> None:
-    text = "Reasoning: this study meets the inclusion criteria.\n\nFinal answer:\n1"
+    text = "Reasoning: this study meets the inclusion criteria.\n\nFinal answer:\nI"
 
     assert parse_ordinal_response(text) == 1
 
 
 def test_parse_ordinal_response_strict_last_line_avoids_false_ambiguity() -> None:
-    # An earlier line mentions "1", but the strict last-line match short-circuits
+    # An earlier line mentions "I", but the strict last-line match short-circuits
     # before the fallback scan ever sees it, so this does not raise as ambiguous.
-    text = "I first considered a score of 1, but on reflection:\n-1"
+    text = "Initial leaning was I, but on further reflection:\nE"
 
     assert parse_ordinal_response(text) == -1
 
@@ -104,12 +106,12 @@ def test_parse_ordinal_response_strict_last_line_avoids_false_ambiguity() -> Non
 
 
 def test_parse_ordinal_response_falls_back_to_first_token_scan_for_prose() -> None:
-    assert parse_ordinal_response("Decision: -1, excluded due to wrong population.") == -1
+    assert parse_ordinal_response("Decision: E, excluded due to wrong population.") == -1
 
 
 def test_parse_ordinal_response_fallback_tolerates_repeated_equal_ratings() -> None:
-    # "1" and "+1" both spell the same rating, so this is not ambiguous.
-    assert parse_ordinal_response("I'd say 1, or maybe +1, either way include it.") == 1
+    # Both mentions spell the same rating, so this is not ambiguous.
+    assert parse_ordinal_response("First pass: I. Second pass: I. Both agree.") == 1
 
 
 # --- parse_ordinal_response: ambiguity and failure ------------------------------
@@ -117,7 +119,7 @@ def test_parse_ordinal_response_fallback_tolerates_repeated_equal_ratings() -> N
 
 def test_parse_ordinal_response_raises_on_genuinely_ambiguous_reply() -> None:
     # Two distinct ratings appear as tokens outside of any strict match.
-    text = "Leaning -1 but could also see an argument for 1 here."
+    text = "Leaning E but could also see an argument for I here."
 
     with pytest.raises(VendorResponseError, match="ambiguous"):
         parse_ordinal_response(text)
@@ -125,13 +127,14 @@ def test_parse_ordinal_response_raises_on_genuinely_ambiguous_reply() -> None:
 
 def test_parse_ordinal_response_raises_when_no_ordinal_token_found() -> None:
     with pytest.raises(VendorResponseError):
-        parse_ordinal_response("I cannot make a determination for this record.")
+        parse_ordinal_response("Unable to reach a determination for this record.")
 
 
 def test_parse_ordinal_response_criteria_echoing_a_number_does_not_misparse() -> None:
-    # A criteria prompt mentioning a number the model echoes back must not be
-    # silently taken as the rating when a real, distinct rating is also present.
-    text = "Per criterion 1 this fails eligibility, so the rating is -1."
+    # A criteria prompt mentioning a roman-numeral-labeled criterion the model
+    # echoes back must not be silently taken as the rating when a real, distinct
+    # rating is also present.
+    text = "Per criterion I this fails eligibility, so the rating is E."
 
     with pytest.raises(VendorResponseError, match="ambiguous"):
         parse_ordinal_response(text)
@@ -248,7 +251,7 @@ def test_anthropic_rater_composes_system_prompt() -> None:
     class _FakeMessages:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            block = SimpleNamespace(type="text", text="1")
+            block = SimpleNamespace(type="text", text="I")
             return SimpleNamespace(content=[block], id="resp-1", model="v1")
 
     class _FakeClient:
@@ -272,7 +275,7 @@ def test_anthropic_rater_passes_temperature_to_the_api_call() -> None:
     class _FakeMessages:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            block = SimpleNamespace(type="text", text="1")
+            block = SimpleNamespace(type="text", text="I")
             return SimpleNamespace(content=[block], id="resp-1", model="v1")
 
     class _FakeClient:
@@ -292,7 +295,7 @@ def test_anthropic_rater_raises_on_model_version_drift() -> None:
 
     class _FakeMessages:
         def create(self, **kwargs: Any) -> Any:
-            block = SimpleNamespace(type="text", text="1")
+            block = SimpleNamespace(type="text", text="I")
             return SimpleNamespace(content=[block], id="resp-1", model="v2-snapshot")
 
     class _FakeClient:
@@ -313,7 +316,7 @@ def test_openai_rater_composes_system_prompt() -> None:
     class _FakeCompletions:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
             )
@@ -342,7 +345,7 @@ def test_openai_rater_passes_temperature_to_the_api_call() -> None:
     class _FakeCompletions:
         def create(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
             )
@@ -364,7 +367,7 @@ def test_openai_rater_raises_on_model_version_drift() -> None:
 
     class _FakeCompletions:
         def create(self, **kwargs: Any) -> Any:
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v2-snapshot"
             )
@@ -386,7 +389,7 @@ def test_google_rater_composes_system_prompt() -> None:
 
     class _FakeModel:
         def generate_content(self, *args: Any, **kwargs: Any) -> Any:
-            return SimpleNamespace(text="1")
+            return SimpleNamespace(text="I")
 
     def _fake_client(prompt: str) -> Any:
         captured.append(prompt)
@@ -409,7 +412,7 @@ def test_google_rater_passes_temperature_to_generation_config() -> None:
     class _FakeModel:
         def generate_content(self, *args: Any, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            return SimpleNamespace(text="1")
+            return SimpleNamespace(text="I")
 
     rater = GoogleRater(model="gemini-1.5-pro", model_version="v1", temperature=0.7)
     rater._client = lambda prompt: _FakeModel()  # type: ignore[method-assign]
@@ -427,7 +430,7 @@ def test_mistral_rater_composes_system_prompt() -> None:
     class _FakeChat:
         def complete(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
             )
@@ -456,7 +459,7 @@ def test_mistral_rater_passes_temperature_to_the_api_call() -> None:
     class _FakeChat:
         def complete(self, **kwargs: Any) -> Any:
             captured.update(kwargs)
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v1"
             )
@@ -478,7 +481,7 @@ def test_mistral_rater_raises_on_model_version_drift() -> None:
 
     class _FakeChat:
         def complete(self, **kwargs: Any) -> Any:
-            message = SimpleNamespace(content="1")
+            message = SimpleNamespace(content="I")
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=message)], id="resp-1", model="v2-snapshot"
             )
@@ -506,7 +509,7 @@ def test_openmodel_rater_composes_system_prompt(monkeypatch: pytest.MonkeyPatch)
             return None
 
         def read(self) -> bytes:
-            return json.dumps({"model": "v1", "choices": [{"message": {"content": "1"}}]}).encode(
+            return json.dumps({"model": "v1", "choices": [{"message": {"content": "I"}}]}).encode(
                 "utf-8"
             )
 
@@ -545,7 +548,7 @@ def test_openmodel_rater_passes_temperature_in_the_request_body(
             return None
 
         def read(self) -> bytes:
-            return json.dumps({"model": "v1", "choices": [{"message": {"content": "1"}}]}).encode(
+            return json.dumps({"model": "v1", "choices": [{"message": {"content": "I"}}]}).encode(
                 "utf-8"
             )
 
@@ -574,7 +577,7 @@ def test_openmodel_rater_raises_on_model_version_drift(monkeypatch: pytest.Monke
 
         def read(self) -> bytes:
             return json.dumps(
-                {"model": "v2-snapshot", "choices": [{"message": {"content": "1"}}]}
+                {"model": "v2-snapshot", "choices": [{"message": {"content": "I"}}]}
             ).encode("utf-8")
 
     def _fake_urlopen(request: Any, timeout: float) -> Any:
@@ -609,7 +612,7 @@ def test_anthropic_batch_fetch_raises_on_model_version_drift() -> None:
     from attest.vendors.providers.anthropic import AnthropicBatchRater
 
     rater = AnthropicBatchRater(model="claude-sonnet-5", model_version="v1", temperature=0.0)
-    block = SimpleNamespace(type="text", text="1")
+    block = SimpleNamespace(type="text", text="I")
     message = SimpleNamespace(content=[block], model="v2-snapshot")
     entry = SimpleNamespace(
         custom_id="item-0", result=SimpleNamespace(type="succeeded", message=message)
