@@ -310,6 +310,136 @@ def test_registry_passes_the_whole_vendor_spec_to_fireworks_and_together_factori
     ) == ("2026-01", 0.4)
 
 
+def test_build_raters_forwards_request_logprobs_to_supporting_vendors() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+            "mistral": VendorSpec(
+                model="mistral-small-latest",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+            ),
+            "google": VendorSpec(
+                model="gemini-1.5-pro", model_version="v1", prompt_version="p1", temperature=0.0
+            ),
+        }
+    )
+
+    raters = build_raters(config, request_logprobs=True)
+    batch_raters = build_batch_raters(config, request_logprobs=True)
+
+    assert all(r.request_logprobs is True for r in raters)  # type: ignore[attr-defined]
+    assert all(r.request_logprobs is True for r in batch_raters)  # type: ignore[attr-defined]
+
+
+def test_build_raters_request_logprobs_defaults_to_false() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.request_logprobs is False  # type: ignore[attr-defined]
+
+
+def test_build_raters_accepts_request_logprobs_for_anthropic_without_adding_a_field() -> None:
+    # Anthropic's factory must tolerate request_logprobs=True (signature
+    # parity with the other factories) without crashing, but the Messages
+    # API has no logprobs equivalent, so AnthropicRater/AnthropicBatchRater
+    # must not gain a field for it -- a field that can never be applied is
+    # exactly the decorative-config-field pattern this codebase avoids.
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config, request_logprobs=True)
+    [batch_rater] = build_batch_raters(config, request_logprobs=True)
+
+    assert not hasattr(rater, "request_logprobs")
+    assert not hasattr(batch_rater, "request_logprobs")
+
+
+def test_build_raters_accepts_request_logprobs_for_fireworks_and_together_without_a_field() -> None:
+    # Same signature-parity-without-a-field expectation as Anthropic, but
+    # because these two don't expose the field *yet* (see
+    # docs/logprob_support.md), not because they never can.
+    config = Config(
+        vendors={
+            "fireworks": VendorSpec(
+                model="accounts/fireworks/models/llama-v3p1-70b-instruct",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+            ),
+            "together": VendorSpec(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+            ),
+        }
+    )
+
+    raters = build_raters(config, request_logprobs=True)
+    batch_raters = build_batch_raters(config, request_logprobs=True)
+
+    assert all(not hasattr(r, "request_logprobs") for r in raters)
+    assert all(not hasattr(r, "request_logprobs") for r in batch_raters)
+
+
+def test_anthropic_rater_constructor_rejects_request_logprobs() -> None:
+    from attest.vendors.providers.anthropic import AnthropicBatchRater, AnthropicRater
+
+    common = {"model": "claude-sonnet-5", "model_version": "v1", "temperature": 0.0}
+    try:
+        AnthropicRater(**common, request_logprobs=True)  # type: ignore[call-arg]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("AnthropicRater unexpectedly accepted request_logprobs")
+
+    try:
+        AnthropicBatchRater(**common, request_logprobs=True)  # type: ignore[call-arg]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("AnthropicBatchRater unexpectedly accepted request_logprobs")
+
+
+def test_build_raters_with_custom_factories_stays_backward_compatible() -> None:
+    # A custom factories override taking only (spec) -- as every factory did
+    # before request_logprobs existed -- must keep working at the default
+    # (request_logprobs left False), since build_raters only forwards the
+    # kwarg when the caller explicitly asks for it.
+    config = Config(
+        vendors={
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(
+        config,
+        factories={
+            "vendor-a": lambda spec: DeterministicRater(vendor="vendor-a", model=spec.model)
+        },
+    )
+
+    assert rater.vendor == "vendor-a"
+
+
 def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
     config = Config(
         vendors={

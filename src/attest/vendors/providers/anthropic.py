@@ -43,6 +43,17 @@ class AnthropicRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
+
+    No `request_logprobs` field: unlike
+    `attest.vendors.providers.openai.OpenAIRater`,
+    `attest.vendors.providers.mistral.MistralRater`, and
+    `attest.vendors.providers.google.GoogleRater`, the Messages API exposes
+    no per-token log-probability equivalent as of this writing, so there is
+    nothing for such a field to apply -- adding one anyway would be a
+    decorative, never-applied config field. If Anthropic's API adds logprobs
+    support, add `request_logprobs`/`top_logprobs` here following the same
+    pattern the other three providers use, and wire it through
+    `attest.vendors.registry._build_anthropic`.
     """
 
     model: str
@@ -130,6 +141,9 @@ class AnthropicBatchRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in each reply.
+
+    No `request_logprobs` field, for the same reason as `AnthropicRater` --
+    see its docstring.
     """
 
     model: str
