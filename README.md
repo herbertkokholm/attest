@@ -195,9 +195,11 @@ inter-vendor independence argument behind the ensemble.
   stamped with the same `ensemble_config_id`, so everything downstream of
   `screen` is unaware of which execution strategy produced them.
   `request_logprobs` optionally requests per-token log probabilities on the
-  ordinal decision from the vendors that support it (not Anthropic; see
+  ordinal decision from the vendors wired for it today (OpenAI, Mistral,
+  Google); Fireworks and Together accept the flag but don't yet act on it,
+  and Anthropic's Messages API has no logprobs equivalent at all -- see
   [`docs/logprob_support.md`](docs/logprob_support.md) for the support
-  matrix and an open design decision on that gap); verify actual
+  matrix and an open design decision on that gap. Verify actual
   vendor/model support with
   [`tools/vendor_logprob_probe.py`](tools/vendor_logprob_probe.py) rather
   than assuming it.

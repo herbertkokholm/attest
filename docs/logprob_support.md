@@ -34,6 +34,21 @@ label agreement.
   would be a decorative config field that can never be applied, so neither
   class has one; `attest.vendors.registry._build_anthropic{,_batch}` accept
   and ignore the flag for factory-signature parity only.
+- **Fireworks AI and Together AI are stubbed, not yet wired.** Both vendors
+  were added to `attest.vendors` after this document was first written.
+  `attest.vendors.registry._build_fireworks{,_batch}`/`_build_together{,_batch}`
+  accept and ignore `request_logprobs` today, the same signature-parity
+  pattern as Anthropic's factories -- but unlike Anthropic, this is a
+  temporary stub, not a permanent API gap: `FireworksRater`/`TogetherRater`
+  (sync) and `TogetherBatchRater` call OpenAI-compatible endpoints and are
+  plausible near-term candidates for the same `logprobs=True,
+  top_logprobs=N` treatment `attest.vendors.providers.openai.OpenAIRater`
+  already has. `FireworksBatchRater` is a separate case: its Batch
+  Inference API has a genuinely different, only partly-confirmed per-row
+  schema (see that module's docstring) -- adding logprobs there means
+  guessing at an already-unconfirmed output shape, so it should wait until
+  that schema itself is verified against a live batch run, not be
+  implemented speculatively alongside the other three.
 
 ## Support matrix
 
@@ -42,12 +57,14 @@ actually configure a `VendorSpec` with -- request-parameter presence in an
 SDK does not guarantee the API honors it for a given model family, and
 sync/batch support are never assumed to match.
 
-| Vendor    | Model | Sync | Batch | Notes |
-|-----------|-------|------|-------|-------|
-| openai    |       |      |       |       |
-| mistral   |       |      |       |       |
-| google    |       |      |       |       |
-| anthropic | (any) | No   | No    | Messages API has no logprobs equivalent |
+| Vendor     | Model | Sync | Batch | Notes |
+|------------|-------|------|-------|-------|
+| openai     |       |      |       |       |
+| mistral    |       |      |       |       |
+| google     |       |      |       |       |
+| fireworks  | --    | Not wired | Not wired | `request_logprobs` accepted but ignored (stub); sync is a plausible near-term add, batch should wait for the row schema itself to be confirmed |
+| together   | --    | Not wired | Not wired | `request_logprobs` accepted but ignored (stub); both sync and batch are plausible near-term adds (OpenAI-compatible shape) |
+| anthropic  | (any) | No   | No    | Messages API has no logprobs equivalent |
 
 ## Open decision: no fallback value for Anthropic (deferred, not resolved here)
 
