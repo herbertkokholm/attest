@@ -262,9 +262,7 @@ class FireworksBatchRater:
         prompts = prompts or {}
         id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
         lines = "\n".join(
-            json.dumps(
-                self._input_row(record, prompts.get(record.id, self.prompt))
-            )
+            json.dumps(self._input_row(record, prompts.get(record.id, self.prompt)))
             for record in records
         )
         client = self._client()
