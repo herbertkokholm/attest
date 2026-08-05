@@ -105,6 +105,17 @@ class FireworksRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
+        request_logprobs: If True, request per-token log probabilities
+            (`logprobs=True, top_logprobs=top_logprobs`) and retain the
+            vendor's own, un-normalized logprob structure in the raw
+            response under `"logprobs"`. Mirrors
+            `attest.vendors.providers.openai.OpenAIRater.request_logprobs`
+            -- see there for why this is not a `VendorSpec` field. Fireworks'
+            Chat Completions endpoint is OpenAI-compatible, so this is a
+            high-confidence but still unverified-in-practice add; check with
+            `tools/vendor_logprob_probe.py` before relying on it.
+        top_logprobs: Number of top alternative tokens to request logprobs
+            for at each position, when `request_logprobs` is True.
     """
 
     model: str
@@ -113,6 +124,8 @@ class FireworksRater:
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
+    request_logprobs: bool = False
+    top_logprobs: int = 5
     vendor: str = field(default="fireworks", init=False)
 
     def _client(self) -> Any:
@@ -139,6 +152,9 @@ class FireworksRater:
             ModelVersionDriftError: If the response's `model` differs from
                 `self.model_version`.
         """
+        logprobs_kwargs: dict[str, Any] = (
+            {"logprobs": True, "top_logprobs": self.top_logprobs} if self.request_logprobs else {}
+        )
         response = self._client().chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
@@ -153,6 +169,7 @@ class FireworksRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 },
             ],
+            **logprobs_kwargs,
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -168,6 +185,10 @@ class FireworksRater:
             "id": getattr(response, "id", None),
             "model": reported_version,
         }
+        response_logprobs = getattr(response.choices[0], "logprobs", None)
+        if self.request_logprobs and response_logprobs is not None:
+            dump = getattr(response_logprobs, "model_dump", None)
+            raw_response["logprobs"] = dump() if callable(dump) else response_logprobs
         return ordinal, raw_response
 
 
@@ -203,6 +224,12 @@ class FireworksBatchRater:
         max_tokens: Maximum tokens to request in each reply.
         timeout: Timeout in seconds for downloading the output dataset's
             signed-URL content in `fetch`.
+
+    No `request_logprobs` field, unlike `FireworksRater`: this batch API's
+    own per-row output schema is itself only inferred, not confirmed (see
+    the module docstring), so a logprobs field here would mean guessing at
+    an already-unconfirmed shape. Add it once the base row schema is
+    verified against a live batch run -- see `docs/logprob_support.md`.
     """
 
     model: str

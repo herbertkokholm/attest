@@ -196,11 +196,12 @@ inter-vendor independence argument behind the ensemble.
   `screen` is unaware of which execution strategy produced them.
   `request_logprobs` optionally requests per-token log probabilities on the
   ordinal decision from the vendors wired for it today (OpenAI, Mistral,
-  Google); Fireworks and Together accept the flag but don't yet act on it,
-  and Anthropic's Messages API has no logprobs equivalent at all -- see
-  [`docs/logprob_support.md`](docs/logprob_support.md) for the support
-  matrix and an open design decision on that gap. Verify actual
-  vendor/model support with
+  Google, Fireworks, Together); `FireworksBatchRater` is the one exception
+  -- its batch row schema is itself unconfirmed, so logprobs there are
+  deliberately deferred -- and Anthropic's Messages API has no logprobs
+  equivalent at all. See [`docs/logprob_support.md`](docs/logprob_support.md)
+  for the support matrix and an open design decision on that gap. Verify
+  actual vendor/model support with
   [`tools/vendor_logprob_probe.py`](tools/vendor_logprob_probe.py) rather
   than assuming it.
 - **CLI** (`attest.cli`) — `screen`, `batch-fetch`, `adjudicate`,
