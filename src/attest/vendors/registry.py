@@ -59,12 +59,30 @@ def _build_mistral(spec: VendorSpec) -> Rater:
     )
 
 
+def _build_fireworks(spec: VendorSpec) -> Rater:
+    from attest.vendors.providers.fireworks import FireworksRater
+
+    return FireworksRater(
+        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+    )
+
+
+def _build_together(spec: VendorSpec) -> Rater:
+    from attest.vendors.providers.together import TogetherRater
+
+    return TogetherRater(
+        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+    )
+
+
 _PROVIDER_FACTORIES: dict[str, Callable[[VendorSpec], Rater]] = {
     "anthropic": _build_anthropic,
     "openai": _build_openai,
     "google": _build_google,
     "openmodel": _build_openmodel,
     "mistral": _build_mistral,
+    "fireworks": _build_fireworks,
+    "together": _build_together,
 }
 
 
@@ -100,11 +118,29 @@ def _build_mistral_batch(spec: VendorSpec) -> BatchRater:
     )
 
 
+def _build_fireworks_batch(spec: VendorSpec) -> BatchRater:
+    from attest.vendors.providers.fireworks import FireworksBatchRater
+
+    return FireworksBatchRater(
+        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+    )
+
+
+def _build_together_batch(spec: VendorSpec) -> BatchRater:
+    from attest.vendors.providers.together import TogetherBatchRater
+
+    return TogetherBatchRater(
+        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+    )
+
+
 _BATCH_PROVIDER_FACTORIES: dict[str, Callable[[VendorSpec], BatchRater]] = {
     "anthropic": _build_anthropic_batch,
     "openai": _build_openai_batch,
     "google": _build_google_batch,
     "mistral": _build_mistral_batch,
+    "fireworks": _build_fireworks_batch,
+    "together": _build_together_batch,
 }
 
 

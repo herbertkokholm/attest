@@ -167,6 +167,8 @@ def test_import_attest_with_no_extras_installed_still_succeeds() -> None:
         "attest.vendors.providers.google",
         "attest.vendors.providers.openmodel",
         "attest.vendors.providers.mistral",
+        "attest.vendors.providers.fireworks",
+        "attest.vendors.providers.together",
     ):
         importlib.import_module(module_name)
 
@@ -214,6 +216,98 @@ def test_registry_passes_the_whole_vendor_spec_to_provider_factories() -> None:
 
     assert (rater.model_version, rater.temperature) == ("2026-01", 0.3)
     assert (batch_rater.model_version, batch_rater.temperature) == ("2026-01", 0.3)
+
+
+def test_registry_builds_fireworks_sync_and_batch_raters_conforming_to_protocols() -> None:
+    from attest.vendors.batch import BatchRater
+    from attest.vendors.registry import build_batch_raters
+
+    config = Config(
+        vendors={
+            "fireworks": VendorSpec(
+                model="accounts/fireworks/models/llama-v3p1-70b-instruct",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.3,
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert isinstance(rater, Rater)
+    assert (rater.vendor, rater.model) == (
+        "fireworks",
+        "accounts/fireworks/models/llama-v3p1-70b-instruct",
+    )
+    assert isinstance(batch_rater, BatchRater)
+    assert (batch_rater.vendor, batch_rater.model) == (
+        "fireworks",
+        "accounts/fireworks/models/llama-v3p1-70b-instruct",
+    )
+
+
+def test_registry_builds_together_sync_and_batch_raters_conforming_to_protocols() -> None:
+    from attest.vendors.batch import BatchRater
+    from attest.vendors.registry import build_batch_raters
+
+    config = Config(
+        vendors={
+            "together": VendorSpec(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.3,
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert isinstance(rater, Rater)
+    assert (rater.vendor, rater.model) == ("together", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
+    assert isinstance(batch_rater, BatchRater)
+    assert (batch_rater.vendor, batch_rater.model) == (
+        "together",
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    )
+
+
+def test_registry_passes_the_whole_vendor_spec_to_fireworks_and_together_factories() -> None:
+    # model_version and temperature must actually reach the constructed
+    # rater, not just be hashed into the ensemble_config_id and dropped.
+    config = Config(
+        vendors={
+            "fireworks": VendorSpec(
+                model="accounts/fireworks/models/llama-v3p1-70b-instruct",
+                model_version="2026-01",
+                prompt_version="p1",
+                temperature=0.3,
+            ),
+            "together": VendorSpec(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model_version="2026-01",
+                prompt_version="p1",
+                temperature=0.4,
+            ),
+        }
+    )
+
+    raters = {r.vendor: r for r in build_raters(config)}
+    batch_raters = {r.vendor: r for r in build_batch_raters(config)}
+
+    assert (raters["fireworks"].model_version, raters["fireworks"].temperature) == ("2026-01", 0.3)
+    assert (raters["together"].model_version, raters["together"].temperature) == ("2026-01", 0.4)
+    assert (
+        batch_raters["fireworks"].model_version,
+        batch_raters["fireworks"].temperature,
+    ) == ("2026-01", 0.3)
+    assert (
+        batch_raters["together"].model_version,
+        batch_raters["together"].temperature,
+    ) == ("2026-01", 0.4)
 
 
 def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
