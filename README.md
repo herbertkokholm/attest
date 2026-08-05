@@ -182,7 +182,7 @@ inter-vendor independence argument behind the ensemble.
   [`docs/sentinel_drift_rule.md`](docs/sentinel_drift_rule.md) for the
   threshold-rule rationale behind the (not yet implemented) latent-vendor-drift
   sentinel, reusing this module's alpha; reproducible probe at
-  [`examples/sentinel_drift_probe.py`](examples/sentinel_drift_probe.py).
+  [`tools/sentinel_drift_probe.py`](tools/sentinel_drift_probe.py).
 - **I/O** (`attest.io.store`) — the only module that touches a filesystem: a
   local, idempotent JSON run directory.
 - **Vendors** (`attest.vendors`) — the `Rater` protocol, a network-free
@@ -194,6 +194,15 @@ inter-vendor independence argument behind the ensemble.
   fetches, and assembles the exact same vote vectors `run_ensemble` would,
   stamped with the same `ensemble_config_id`, so everything downstream of
   `screen` is unaware of which execution strategy produced them.
+  `request_logprobs` optionally requests per-token log probabilities on the
+  ordinal decision from the vendors wired for it today (OpenAI, Mistral,
+  Google); Fireworks and Together accept the flag but don't yet act on it,
+  and Anthropic's Messages API has no logprobs equivalent at all -- see
+  [`docs/logprob_support.md`](docs/logprob_support.md) for the support
+  matrix and an open design decision on that gap. Verify actual
+  vendor/model support with
+  [`tools/vendor_logprob_probe.py`](tools/vendor_logprob_probe.py) rather
+  than assuming it.
 - **CLI** (`attest.cli`) — `screen`, `batch-fetch`, `adjudicate`,
   `audit-draw`, `audit-apply`, `validate`, `ablate`: file-based subcommands
   over a run directory.

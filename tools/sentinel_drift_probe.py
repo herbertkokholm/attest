@@ -14,7 +14,7 @@ produce the numbers cited in the doc. It imports only
 boundary (see `tools/check_boundary.py`), even though this path sits outside
 `src/attest` and is not itself scanned by that guard.
 
-Run directly: `python examples/sentinel_drift_probe.py`
+Run directly: `python tools/sentinel_drift_probe.py`
 """
 
 from __future__ import annotations

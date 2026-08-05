@@ -5,7 +5,7 @@ behavior has drifted from its own baseline on a frozen sentinel set, and
 recommends one. This is the rationale-of-record for the rule; the manuscript
 names it in one sentence and does not repeat this analysis.
 
-Reproducible probe: `examples/sentinel_drift_probe.py`. Imports only
+Reproducible probe: `tools/sentinel_drift_probe.py`. Imports only
 `attest.stats.agreement` and the standard library -- no scheduler, no
 storage, no network, matching the kernel's own boundary
 (`tools/check_boundary.py`) even though this path is not itself scanned by

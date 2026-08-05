@@ -45,6 +45,18 @@ class OpenAIRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
+        request_logprobs: If True, request per-token log probabilities
+            (`logprobs=True, top_logprobs=top_logprobs`) and retain the
+            vendor's own, un-normalized logprob structure in the raw
+            response under `"logprobs"`. This does not change what the
+            model samples -- only what side-channel metadata comes back --
+            so unlike `temperature`/`model_version` it is deliberately not a
+            hash-versioned `VendorSpec` field; toggling it never opens a new
+            ensemble-config epoch. Actual support is unverified without
+            running `tools/vendor_logprob_probe.py` against the configured
+            model.
+        top_logprobs: Number of top alternative tokens to request logprobs
+            for at each position, when `request_logprobs` is True.
     """
 
     model: str
@@ -53,6 +65,8 @@ class OpenAIRater:
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
+    request_logprobs: bool = False
+    top_logprobs: int = 5
     vendor: str = field(default="openai", init=False)
 
     def _client(self) -> Any:
@@ -79,6 +93,9 @@ class OpenAIRater:
             ModelVersionDriftError: If the response's `model` differs from
                 `self.model_version`.
         """
+        logprobs_kwargs: dict[str, Any] = (
+            {"logprobs": True, "top_logprobs": self.top_logprobs} if self.request_logprobs else {}
+        )
         response = self._client().chat.completions.create(
             model=self.model,
             max_completion_tokens=self.max_tokens,
@@ -93,6 +110,7 @@ class OpenAIRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 },
             ],
+            **logprobs_kwargs,
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -108,6 +126,9 @@ class OpenAIRater:
             "id": getattr(response, "id", None),
             "model": reported_version,
         }
+        response_logprobs = getattr(response.choices[0], "logprobs", None)
+        if self.request_logprobs and response_logprobs is not None:
+            raw_response["logprobs"] = response_logprobs.model_dump()
         return ordinal, raw_response
 
 
@@ -134,6 +155,13 @@ class OpenAIBatchRater:
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in each reply.
         completion_window: Vendor-side completion SLA for the batch job.
+        request_logprobs: If True, request per-token log probabilities on
+            every submitted request, mirroring `OpenAIRater.request_logprobs`
+            -- see there for why this is not a `VendorSpec` field. Batch
+            support may lag sync support; verify with
+            `tools/vendor_logprob_probe.py` rather than assuming parity.
+        top_logprobs: Number of top alternative tokens to request logprobs
+            for at each position, when `request_logprobs` is True.
     """
 
     model: str
@@ -143,6 +171,8 @@ class OpenAIBatchRater:
     prompt: str | None = None
     max_tokens: int = 8
     completion_window: str = "24h"
+    request_logprobs: bool = False
+    top_logprobs: int = 5
     vendor: str = field(default="openai", init=False)
 
     def _client(self) -> Any:
@@ -156,22 +186,26 @@ class OpenAIBatchRater:
         return openai.OpenAI(api_key=self.api_key)
 
     def _request_line(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_completion_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": [
+                {"role": "system", "content": compose_system_prompt(prompt)},
+                {
+                    "role": "user",
+                    "content": f"Title: {record.title}\nAbstract: {record.abstract}",
+                },
+            ],
+        }
+        if self.request_logprobs:
+            body["logprobs"] = True
+            body["top_logprobs"] = self.top_logprobs
         return {
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {
-                "model": self.model,
-                "max_completion_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "messages": [
-                    {"role": "system", "content": compose_system_prompt(prompt)},
-                    {
-                        "role": "user",
-                        "content": f"Title: {record.title}\nAbstract: {record.abstract}",
-                    },
-                ],
-            },
+            "body": body,
         }
 
     def submit(
@@ -258,10 +292,13 @@ class OpenAIBatchRater:
                 expected_version=self.model_version,
                 reported_version=reported_version,
             )
-            text = entry["response"]["body"]["choices"][0]["message"]["content"] or ""
+            choice = entry["response"]["body"]["choices"][0]
+            text = choice["message"]["content"] or ""
             try:
                 ordinal = parse_ordinal_response(text)
             except VendorResponseError:
                 continue
+            if self.request_logprobs and choice.get("logprobs") is not None:
+                entry = {**entry, "logprobs": choice["logprobs"]}
             results[record_id] = (ordinal, entry)
         return results
