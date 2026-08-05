@@ -57,12 +57,26 @@ _SYNC_RATER_CLASSES = {
     "openai": ("attest.vendors.providers.openai", "OpenAIRater"),
     "mistral": ("attest.vendors.providers.mistral", "MistralRater"),
     "google": ("attest.vendors.providers.google", "GoogleRater"),
+    "fireworks": ("attest.vendors.providers.fireworks", "FireworksRater"),
+    "together": ("attest.vendors.providers.together", "TogetherRater"),
 }
 
 _BATCH_RATER_CLASSES = {
     "openai": ("attest.vendors.providers.openai", "OpenAIBatchRater"),
     "mistral": ("attest.vendors.providers.mistral", "MistralBatchRater"),
     "google": ("attest.vendors.providers.google", "GoogleBatchRater"),
+    "together": ("attest.vendors.providers.together", "TogetherBatchRater"),
+}
+
+# Vendors valid as --vendor but with no logprobs-capable batch rater
+# (permanently, or -- like fireworks -- for now): reported explicitly by
+# cmd_batch_submit/cmd_batch_fetch rather than raising a raw KeyError.
+_BATCH_UNSUPPORTED_REASONS = {
+    "anthropic": "Messages API has no logprobs equivalent",
+    "fireworks": (
+        "FireworksBatchRater has no request_logprobs field yet -- its own row "
+        "schema is unconfirmed, see docs/logprob_support.md"
+    ),
 }
 
 
@@ -105,8 +119,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_batch_submit(args: argparse.Namespace) -> int:
-    if args.vendor == "anthropic":
-        print(f"[{args.vendor}/batch] not supported: Messages API has no logprobs equivalent")
+    if args.vendor in _BATCH_UNSUPPORTED_REASONS:
+        print(f"[{args.vendor}/batch] not supported: {_BATCH_UNSUPPORTED_REASONS[args.vendor]}")
         return 0
 
     rater_cls = _load_class(*_BATCH_RATER_CLASSES[args.vendor])
@@ -128,8 +142,8 @@ def cmd_batch_submit(args: argparse.Namespace) -> int:
 
 
 def cmd_batch_fetch(args: argparse.Namespace) -> int:
-    if args.vendor == "anthropic":
-        print(f"[{args.vendor}/batch] not supported: Messages API has no logprobs equivalent")
+    if args.vendor in _BATCH_UNSUPPORTED_REASONS:
+        print(f"[{args.vendor}/batch] not supported: {_BATCH_UNSUPPORTED_REASONS[args.vendor]}")
         return 0
 
     handle = BatchHandle.from_dict(json.loads(Path(args.handle_file).read_text()))

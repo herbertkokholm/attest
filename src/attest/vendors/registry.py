@@ -96,23 +96,22 @@ def _build_mistral(spec: VendorSpec, *, request_logprobs: bool = False) -> Rater
 def _build_fireworks(spec: VendorSpec, *, request_logprobs: bool = False) -> Rater:
     from attest.vendors.providers.fireworks import FireworksRater
 
-    # request_logprobs is accepted for signature parity but not yet
-    # forwarded: FireworksRater does not expose the field yet. Its Chat
-    # Completions endpoint is OpenAI-compatible and plausibly supports
-    # logprobs/top_logprobs, but that is unverified -- see
-    # docs/logprob_support.md for the open follow-up.
     return FireworksRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        request_logprobs=request_logprobs,
     )
 
 
 def _build_together(spec: VendorSpec, *, request_logprobs: bool = False) -> Rater:
     from attest.vendors.providers.together import TogetherRater
 
-    # See _build_fireworks: request_logprobs accepted for signature parity,
-    # not yet forwarded -- TogetherRater does not expose the field yet.
     return TogetherRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        request_logprobs=request_logprobs,
     )
 
 
@@ -189,11 +188,11 @@ def _build_fireworks_batch(spec: VendorSpec, *, request_logprobs: bool = False) 
 def _build_together_batch(spec: VendorSpec, *, request_logprobs: bool = False) -> BatchRater:
     from attest.vendors.providers.together import TogetherBatchRater
 
-    # See _build_fireworks_batch: request_logprobs accepted for signature
-    # parity, not yet forwarded -- TogetherBatchRater does not expose the
-    # field yet.
     return TogetherBatchRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        request_logprobs=request_logprobs,
     )
 
 

@@ -370,10 +370,10 @@ def test_build_raters_accepts_request_logprobs_for_anthropic_without_adding_a_fi
     assert not hasattr(batch_rater, "request_logprobs")
 
 
-def test_build_raters_accepts_request_logprobs_for_fireworks_and_together_without_a_field() -> None:
-    # Same signature-parity-without-a-field expectation as Anthropic, but
-    # because these two don't expose the field *yet* (see
-    # docs/logprob_support.md), not because they never can.
+def test_build_raters_forwards_request_logprobs_to_fireworks_and_together() -> None:
+    # Both are OpenAI-compatible on the sync path, and Together's batch API
+    # mirrors OpenAI's, so both get the same request_logprobs treatment as
+    # openai/mistral/google -- see docs/logprob_support.md.
     config = Config(
         vendors={
             "fireworks": VendorSpec(
@@ -392,10 +392,37 @@ def test_build_raters_accepts_request_logprobs_for_fireworks_and_together_withou
     )
 
     raters = build_raters(config, request_logprobs=True)
-    batch_raters = build_batch_raters(config, request_logprobs=True)
 
-    assert all(not hasattr(r, "request_logprobs") for r in raters)
-    assert all(not hasattr(r, "request_logprobs") for r in batch_raters)
+    assert all(r.request_logprobs is True for r in raters)  # type: ignore[attr-defined]
+
+
+def test_build_batch_raters_forwards_request_logprobs_to_together_not_fireworks() -> None:
+    # TogetherBatchRater mirrors OpenAI's batch shape and gets the field.
+    # FireworksBatchRater's own row schema is still unconfirmed (see its
+    # module docstring), so it deliberately has no request_logprobs field
+    # yet -- request_logprobs=True must not crash building it, just be a
+    # no-op, the same signature-parity pattern Anthropic's factories use.
+    config = Config(
+        vendors={
+            "fireworks": VendorSpec(
+                model="accounts/fireworks/models/llama-v3p1-70b-instruct",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+            ),
+            "together": VendorSpec(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+            ),
+        }
+    )
+
+    batch_raters = {r.vendor: r for r in build_batch_raters(config, request_logprobs=True)}
+
+    assert batch_raters["together"].request_logprobs is True  # type: ignore[attr-defined]
+    assert not hasattr(batch_raters["fireworks"], "request_logprobs")
 
 
 def test_anthropic_rater_constructor_rejects_request_logprobs() -> None:
@@ -415,6 +442,25 @@ def test_anthropic_rater_constructor_rejects_request_logprobs() -> None:
         pass
     else:
         raise AssertionError("AnthropicBatchRater unexpectedly accepted request_logprobs")
+
+
+def test_fireworks_batch_rater_constructor_rejects_request_logprobs() -> None:
+    # Locks in that FireworksBatchRater truly has no request_logprobs field
+    # -- not just that the registry happens not to pass one -- since its
+    # batch row schema is itself unconfirmed (see its module docstring).
+    from attest.vendors.providers.fireworks import FireworksBatchRater
+
+    try:
+        FireworksBatchRater(
+            model="accounts/fireworks/models/llama-v3p1-70b-instruct",
+            model_version="v1",
+            temperature=0.0,
+            request_logprobs=True,  # type: ignore[call-arg]
+        )
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("FireworksBatchRater unexpectedly accepted request_logprobs")
 
 
 def test_build_raters_with_custom_factories_stays_backward_compatible() -> None:
