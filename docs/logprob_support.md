@@ -52,19 +52,27 @@ label agreement.
 
 ## Support matrix
 
-Fill in by running `tools/vendor_logprob_probe.py` against each model you
-actually configure a `VendorSpec` with -- request-parameter presence in an
-SDK does not guarantee the API honors it for a given model family, and
-sync/batch support are never assumed to match.
+Two separate questions, only one of which needs a live call:
 
-| Vendor     | Model | Sync | Batch | Notes |
-|------------|-------|------|-------|-------|
-| openai     |       |      |       |       |
-| mistral    |       |      |       |       |
-| google     |       |      |       |       |
-| fireworks  |       |      | Not wired | Batch (`FireworksBatchRater`) deliberately has no field until its row schema is confirmed against a live run |
-| together   |       |      |       |       |
-| anthropic  | (any) | No   | No    | Messages API has no logprobs equivalent |
+- **Does `attest` request it?** Known now, from the code -- the two columns
+  below reflect the current state of `attest.vendors.providers.*` directly,
+  no API key required.
+- **Does the vendor's API actually honor the request for a given model?**
+  An empirical question, per model family (and not assumed to match between
+  sync and batch even for the same vendor) -- unfilled below, since it
+  needs live credentials and a real, billed call via
+  `tools/vendor_logprob_probe.py sync`/`batch-submit`/`batch-fetch`. Add the
+  model and outcome to a row once you've run it against a model you
+  actually configure a `VendorSpec` with.
+
+| Vendor    | Requests logprobs (sync) | Requests logprobs (batch) | Confirmed live (model, outcome) | Notes |
+|-----------|---------------------------|----------------------------|----------------------------------|-------|
+| openai    | Yes | Yes | not yet run | |
+| mistral   | Yes | Yes | not yet run | |
+| google    | Yes | Yes | not yet run | Gemini logprobs support is model-family-dependent |
+| fireworks | Yes | No (`FireworksBatchRater` has no field) | not yet run (sync only) | batch row schema itself unconfirmed, see that module's docstring |
+| together  | Yes | Yes | not yet run | |
+| anthropic | No (no field) | No (no field) | N/A | Messages API has no logprobs equivalent |
 
 ## Open decision: no fallback value for Anthropic (deferred, not resolved here)
 
