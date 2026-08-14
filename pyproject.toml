@@ -20,14 +20,14 @@ attest = "attest.cli:main"
 [project.optional-dependencies]
 dev = ["ruff", "mypy", "pytest", "pytest-cov"]
 anthropic = ["anthropic>=0.120.2"]
-openai = ["openai>=2.51.0"]
+openai = ["openai>=2.53.0"]
 google = ["google-generativeai>=0.8.6"]
 mistral = ["mistralai>=1.0"]
 fireworks = ["fireworks-ai>=1.2.6"]
 together = ["together>=2.28.0"]
 all = [
     "anthropic>=0.120.2",
-    "openai>=2.51.0",
+    "openai>=2.53.0",
     "google-generativeai>=0.8.6",
     "mistralai>=1.0",
     "fireworks-ai>=1.2.6",
