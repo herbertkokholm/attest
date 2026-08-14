@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -46,7 +47,11 @@ class AgreementReport:
     Attributes:
         alpha: Chance-corrected ordinal agreement coefficient. 1.0 is
             perfect agreement, 0.0 is agreement at chance level; it can be
-            negative when observed agreement is worse than chance.
+            negative when observed agreement is worse than chance. `None`
+            if alpha is undefined for this batch (see `krippendorff_alpha`)
+            -- this can happen even when `raw_agreement` is well-defined,
+            e.g. when every rater agreed on every unit (both observed and
+            expected chance-corrected disagreement are exactly zero).
         raw_agreement: Proportion of rater-pairs, among pairs of raters that
             both rated the same unit, whose ratings are identical. Not
             chance-corrected, so it is easily inflated by class imbalance --
@@ -55,7 +60,7 @@ class AgreementReport:
         n_raters: Number of distinct raters (vendors) in the reliability matrix.
     """
 
-    alpha: float
+    alpha: float | None
     raw_agreement: float
     n_units: int
     n_raters: int
@@ -152,6 +157,15 @@ def krippendorff_alpha(
         Krippendorff's alpha under the ordinal difference function.
 
     Raises:
+        AgreementError: If alpha is mathematically undefined because both
+            the observed and expected (chance-corrected) disagreement sums
+            are exactly zero -- most commonly because every rater in the
+            matrix assigned only one category. The `krippendorff` package
+            computes this as `1 - observed/expected`, so a zero expected
+            sum is a 0/0 division; the package emits a `RuntimeWarning` and
+            returns `nan` rather than raising, which this function turns
+            into a typed, catchable error instead of letting `nan` escape
+            to a caller.
         ValueError: Propagated from `krippendorff.alpha` if fewer than two
             raters rated any single unit (alpha is undefined with zero
             observed pairs) or if the matrix contains values outside
@@ -159,13 +173,23 @@ def krippendorff_alpha(
     """
     from krippendorff import alpha as _kd_alpha
 
-    return float(
-        _kd_alpha(
-            reliability_data=[list(row) for row in reliability_matrix],
-            level_of_measurement="ordinal",
-            value_domain=list(value_domain),
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = float(
+            _kd_alpha(
+                reliability_data=[list(row) for row in reliability_matrix],
+                level_of_measurement="ordinal",
+                value_domain=list(value_domain),
+            )
         )
-    )
+
+    if math.isnan(result):
+        raise AgreementError(
+            "alpha is undefined (0/0): every rater in this reliability matrix "
+            "assigned only one category, so both observed and expected "
+            "(chance-corrected) disagreement are exactly zero"
+        )
+    return result
 
 
 def agreement_report(
@@ -180,10 +204,17 @@ def agreement_report(
 
     Returns:
         An `AgreementReport` with alpha and raw agreement side by side.
+        `alpha` is `None` if undefined for this batch (see
+        `krippendorff_alpha`) -- `raw_agreement` is still reported in that
+        case, since it stays well-defined even when alpha does not.
     """
     vendors, matrix = build_reliability_matrix(vote_vectors)
+    try:
+        alpha: float | None = krippendorff_alpha(matrix, value_domain=value_domain)
+    except AgreementError:
+        alpha = None
     return AgreementReport(
-        alpha=krippendorff_alpha(matrix, value_domain=value_domain),
+        alpha=alpha,
         raw_agreement=raw_agreement(matrix),
         n_units=len(vote_vectors),
         n_raters=len(vendors),
@@ -204,8 +235,11 @@ def pairwise_alpha(
         A mapping of `"vendorA|vendorB"` (vendors in sorted order) to that
         pair's alpha, matching the key format of
         `attest.contracts.validation_record.Agreement.pairwise`. A pair is
-        omitted if it shares no unit rated by both vendors, since alpha is
-        undefined for a pair with zero observed joint ratings.
+        omitted if it shares no unit rated by both vendors, or if the pair
+        agreed on every shared unit (alpha undefined, 0/0) -- in both cases
+        `krippendorff_alpha` raises a `ValueError` subclass here, which
+        this catches and treats as "no defined alpha for this pair" rather
+        than surfacing a `nan` entry.
     """
     vendors, matrix = build_reliability_matrix(vote_vectors)
     result: dict[str, float] = {}

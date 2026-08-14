@@ -198,18 +198,13 @@ def _compute_metrics(
         raise AblationError("vendor subset has zero overlapping votes with the gold set")
 
     try:
-        # krippendorff.alpha divides by the expected-disagreement sum, which
-        # is exactly zero (and warns rather than raising) when every rater
-        # in the subset produced only one category; the nan check below
-        # already turns that into the documented "undefined" result, so the
-        # warning is expected noise, not a signal, and is suppressed here.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            report = agreement_report(filtered)
+        # agreement_report already turns an undefined alpha (every rater in
+        # the subset produced only one category: 0/0 in krippendorff's own
+        # division) into alpha=None -- see attest.stats.agreement -- so no
+        # warning suppression or nan check is needed here.
+        report = agreement_report(filtered)
         alpha: float | None = report.alpha
         raw_agreement: float | None = report.raw_agreement
-        if alpha is not None and math.isnan(alpha):
-            alpha = None
     except (AgreementError, ValueError):
         alpha, raw_agreement = None, None
 
