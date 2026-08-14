@@ -12,7 +12,7 @@ description = "Screening-and-self-validation kernel for LLM-ensemble evidence sc
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
-dependencies = ["krippendorff>=0.8.2", "scipy>=1.11"]
+dependencies = ["krippendorff>=0.8.2", "scipy>=1.17.1"]
 
 [project.scripts]
 attest = "attest.cli:main"
