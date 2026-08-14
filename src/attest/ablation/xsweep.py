@@ -52,9 +52,9 @@ from attest.ensemble.aggregate import AGGREGATION_BOUNDARY_DISPERSION, ZERO_POLI
 from attest.ensemble.tau import TauReport, describe_tau
 from attest.ensemble.votes import VoteVector
 from attest.stats.agreement import AgreementError, agreement_report
+from attest.stats.confusion import confusion_matrix
 
 DEFAULT_MAX_SUBSETS_PER_X = 50
-_RELEVANT_LABEL = 1
 
 
 class AblationError(ValueError):
@@ -213,46 +213,46 @@ def _compute_metrics(
     except (AgreementError, ValueError):
         alpha, raw_agreement = None, None
 
-    true_positives = 0
-    false_positives = 0
-    false_negatives = 0
+    final_labels: dict[str, int] = {}
     escalations = 0
     for vv in filtered:
         if vv.record_id not in truths:
             raise AblationError(f"record '{vv.record_id}' has no gold label in truths")
         truth = truths[vv.record_id]
         decision = g(vv, aggregation=aggregation, tau=tau, zero_policy=zero_policy)
-        final_label: int | None
         if decision.escalate:
             escalations += 1
             # Perfect-adjudication assumption specific to this offline,
             # fully gold-labeled ablation -- see module docstring. An
             # escalated tie (mean exactly 0) follows this same assumption;
             # it needs no special case.
-            final_label = truth
+            final_labels[vv.record_id] = truth
         else:
-            final_label = decision.auto_label
-            # g() never auto-commits the uncertain category (ordinal 0) as a
-            # final label -- see attest.ensemble.aggregate's module
-            # docstring -- so there is no third, undefined disposition for
-            # a predicted 0 to silently fall into here.
-            assert final_label != 0, "g() must never auto-commit auto_label == 0"
+            # A non-escalated decision must carry a non-None, non-zero
+            # auto_label: g() never auto-commits the uncertain category
+            # (ordinal 0) as a final label -- see attest.ensemble.aggregate's
+            # module docstring -- so there is no third, undefined
+            # disposition for a predicted 0 (or a missing label) to
+            # silently fall into here. Checked explicitly (rather than via
+            # `assert`) so a future regression in `g()` is caught even when
+            # Python runs with optimizations enabled, instead of silently
+            # miscounting this record as excluded.
+            auto_label = decision.auto_label
+            if auto_label is None or auto_label == 0:
+                raise AblationError(
+                    f"record '{vv.record_id}': g() returned auto_label={auto_label!r} for "
+                    "a non-escalated decision, which must never happen (see "
+                    "attest.ensemble.aggregate)"
+                )
+            final_labels[vv.record_id] = auto_label
 
-        predicted_positive = final_label == _RELEVANT_LABEL
-        actual_positive = truth == _RELEVANT_LABEL
-        if predicted_positive and actual_positive:
-            true_positives += 1
-        elif predicted_positive and not actual_positive:
-            false_positives += 1
-        elif not predicted_positive and actual_positive:
-            false_negatives += 1
-
+    matrix = confusion_matrix(final_labels, truths)
     n_records = len(filtered)
     return _Metrics(
         alpha=alpha,
         raw_agreement=raw_agreement,
-        recall=_ratio(true_positives, true_positives + false_negatives),
-        precision=_ratio(true_positives, true_positives + false_positives),
+        recall=_ratio(matrix.tp, matrix.tp + matrix.fn),
+        precision=_ratio(matrix.tp, matrix.tp + matrix.fp),
         escalation_rate=escalations / n_records,
         n_records=n_records,
     )

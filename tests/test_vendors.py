@@ -543,3 +543,70 @@ def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
 
     assert config.x == 4
     assert compute_ensemble_config_id(config) == compute_ensemble_config_id(config)
+
+
+# --- google provider: _serialize_logprobs's best-effort shape handling ---------
+#
+# The `google-generativeai` SDK's response objects are protobuf-backed, not
+# uniformly pydantic, so `_serialize_logprobs` (attest.vendors.providers.google)
+# probes for `to_dict`/`model_dump` and falls back to `str()`. It is a pure,
+# duck-typed function, exercisable offline with plain stub objects, without
+# either the `google` extra or a live API call -- unlike the rest of the
+# provider's `rate`/`fetch` methods, which do require the SDK and are covered
+# only by `tools/vendor_logprob_probe.py`'s manual, live verification (see
+# `docs/logprob_support.md`).
+
+
+def test_serialize_logprobs_uses_to_dict_when_available() -> None:
+    from attest.vendors.providers.google import _serialize_logprobs
+
+    class _WithToDict:
+        def to_dict(self) -> dict[str, str]:
+            return {"shape": "to_dict"}
+
+    assert _serialize_logprobs(_WithToDict()) == {"shape": "to_dict"}
+
+
+def test_serialize_logprobs_uses_model_dump_when_to_dict_is_absent() -> None:
+    from attest.vendors.providers.google import _serialize_logprobs
+
+    class _WithModelDump:
+        def model_dump(self) -> dict[str, str]:
+            return {"shape": "model_dump"}
+
+    assert _serialize_logprobs(_WithModelDump()) == {"shape": "model_dump"}
+
+
+def test_serialize_logprobs_prefers_to_dict_over_model_dump() -> None:
+    from attest.vendors.providers.google import _serialize_logprobs
+
+    class _WithBoth:
+        def to_dict(self) -> dict[str, str]:
+            return {"shape": "to_dict"}
+
+        def model_dump(self) -> dict[str, str]:
+            return {"shape": "model_dump"}
+
+    assert _serialize_logprobs(_WithBoth()) == {"shape": "to_dict"}
+
+
+def test_serialize_logprobs_falls_back_to_str_when_neither_method_exists() -> None:
+    from attest.vendors.providers.google import _serialize_logprobs
+
+    class _Bare:
+        def __str__(self) -> str:
+            return "protobuf-repr"
+
+    assert _serialize_logprobs(_Bare()) == "protobuf-repr"
+
+
+def test_serialize_logprobs_ignores_a_non_callable_to_dict_attribute() -> None:
+    from attest.vendors.providers.google import _serialize_logprobs
+
+    class _NonCallableAttr:
+        to_dict = "not a method"
+
+        def __str__(self) -> str:
+            return "fallback"
+
+    assert _serialize_logprobs(_NonCallableAttr()) == "fallback"

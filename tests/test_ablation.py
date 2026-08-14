@@ -225,3 +225,32 @@ def test_leave_one_out_identifies_the_removed_vendor() -> None:
 
     most_impactful = max(full.leave_one_out.values(), key=lambda c: c.delta_recall)
     assert most_impactful.removed_vendor == "good"
+
+
+# --- g()'s never-auto-commit-zero invariant is enforced explicitly, not via assert --
+
+
+@pytest.mark.parametrize("bad_auto_label", [0, None])
+def test_compute_metrics_raises_if_g_ever_returns_an_invalid_non_escalated_label(
+    monkeypatch: pytest.MonkeyPatch, bad_auto_label: int | None
+) -> None:
+    """g() must never return a non-escalated Decision with auto_label 0 or None
+    (see attest.ensemble.aggregate's module docstring); this is checked with an
+    explicit raise rather than `assert` specifically so a future regression is
+    still caught under `python -O`, instead of silently miscounting the record
+    as excluded. Forces the violation via monkeypatch since `g()` itself never
+    produces it under normal operation."""
+    from attest.ensemble.aggregate import Decision
+
+    record_ids = ["r1"]
+    raters = [DeterministicRater(vendor=v, seed=i) for i, v in enumerate(["a", "b"])]
+    votes = _run(raters, record_ids)
+    truths = {"r1": 1}
+
+    def _bad_g(*args: object, **kwargs: object) -> Decision:
+        return Decision(auto_label=bad_auto_label, escalate=False, dispersion=0.0, boundary=False)
+
+    monkeypatch.setattr("attest.ablation.xsweep.g", _bad_g)
+
+    with pytest.raises(AblationError, match="must never happen"):
+        sweep(votes, truths)

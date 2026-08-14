@@ -18,7 +18,7 @@ dependencies = ["krippendorff>=0.8.2", "scipy>=1.11"]
 attest = "attest.cli:main"
 
 [project.optional-dependencies]
-dev = ["ruff", "mypy", "pytest"]
+dev = ["ruff", "mypy", "pytest", "pytest-cov"]
 anthropic = ["anthropic>=0.120.2"]
 openai = ["openai>=2.51.0"]
 google = ["google-generativeai>=0.8.6"]
@@ -60,3 +60,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tools"]
+
+[tool.coverage.run]
+source = ["attest"]
+
+[tool.coverage.report]
+skip_covered = false
+show_missing = true

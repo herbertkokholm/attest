@@ -78,6 +78,16 @@ _DEFAULT_DOMAIN = (-1, 0, 1)
 _ISCLOSE_REL_TOL = 1e-9
 _ISCLOSE_ABS_TOL = 1e-12
 
+# Guards reachable_dispersions's enumeration, which is comb(x + d - 1, x)
+# multisets (d = len(distinct_domain)) each costing an exact-Fraction
+# variance computation over x ratings. At the ordinal domain's usual size
+# (d=3), this is quadratic in x and stays well under a second for any
+# realistic ensemble size (comb(202, 2) = 20,301 combos at x=200); this cap
+# exists only to fail fast and legibly if `x` is ever passed a value from
+# the wrong scale (e.g. a record count instead of a vendor count) rather
+# than silently hanging or exhausting memory.
+_MAX_REACHABLE_COMBINATIONS = 2_000_000
+
 
 def _isclose(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=_ISCLOSE_REL_TOL, abs_tol=_ISCLOSE_ABS_TOL)
@@ -121,13 +131,26 @@ def reachable_dispersions(
         times, is a non-boundary multiset with zero dispersion).
 
     Raises:
-        ValueError: If `x < 1` or `domain` is empty.
+        ValueError: If `x < 1` or `domain` is empty, or if `x` and `domain`
+            would require enumerating more than `_MAX_REACHABLE_COMBINATIONS`
+            multisets (see that constant's comment) -- a guard against a
+            silent hang or unbounded memory use from an `x` passed in the
+            wrong scale, not a realistic ensemble-size limit.
     """
     if x < 1:
         raise ValueError(f"x must be >= 1, got {x}")
     distinct_domain = sorted(set(domain))
     if not distinct_domain:
         raise ValueError("domain must not be empty")
+
+    combination_count = math.comb(x + len(distinct_domain) - 1, x)
+    if combination_count > _MAX_REACHABLE_COMBINATIONS:
+        raise ValueError(
+            f"x={x} over a domain of size {len(distinct_domain)} would require "
+            f"enumerating {combination_count:,} multisets, exceeding the "
+            f"{_MAX_REACHABLE_COMBINATIONS:,}-combination guard; this is almost always a "
+            "sign that x is not an ensemble size (e.g. a record count passed by mistake)"
+        )
 
     variances: set[Fraction] = set()
     for combo in itertools.combinations_with_replacement(distinct_domain, x):

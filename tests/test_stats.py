@@ -15,8 +15,10 @@ from attest.stats.agreement import (
     pairwise_alpha,
     raw_agreement,
 )
+from attest.stats.confusion import RELEVANT_LABEL, ConfusionMatrix, confusion_matrix
 from attest.stats.correlation import (
     CorrelationError,
+    build_predictions_by_vendor,
     conditional_fn_correlation,
     error_correlation,
     error_indicators,
@@ -222,6 +224,33 @@ def test_pairwise_fn_correlation_covers_all_vendor_pairs() -> None:
     assert result["gemini|openai"].correlation is None
 
 
+def test_build_predictions_by_vendor_aligns_and_restricts_to_fully_covered_gold_ids() -> None:
+    # "r2" is missing "b"'s vote, so it must be dropped even though it has a
+    # gold label -- pairwise_fn_correlation requires every vendor to have an
+    # aligned entry for every included record.
+    votes = [
+        _vv("r1", {"a": 1, "b": -1}),
+        _vv("r2", {"a": -1}),
+        _vv("r3", {"a": 1, "b": 1}),
+    ]
+    truths = {"r1": 1, "r2": -1, "r3": 1}
+
+    predictions, ordered_truths = build_predictions_by_vendor(votes, truths)
+
+    assert predictions == {"a": [1, 1], "b": [-1, 1]}
+    assert ordered_truths == [1, 1]
+
+
+def test_build_predictions_by_vendor_ignores_records_with_no_gold_label() -> None:
+    votes = [_vv("r1", {"a": 1}), _vv("ungoverned", {"a": -1})]
+    truths = {"r1": 1}
+
+    predictions, ordered_truths = build_predictions_by_vendor(votes, truths)
+
+    assert predictions == {"a": [1]}
+    assert ordered_truths == [1]
+
+
 # --- recall.py ----------------------------------------------------------------
 
 
@@ -386,3 +415,43 @@ def test_floor_never_drops_below_point_estimate_with_fpc() -> None:
 
     for stratum in strata:
         assert exclusion_error_rate_floor(stratum) >= exclusion_error_rate(stratum)
+
+
+# --- confusion.py -------------------------------------------------------------
+
+
+def test_confusion_matrix_counts_tp_fp_fn_tn() -> None:
+    predictions = {"a": 1, "b": 1, "c": -1, "d": -1}
+    truths = {"a": 1, "b": -1, "c": 1, "d": -1}
+
+    matrix = confusion_matrix(predictions, truths)
+
+    assert matrix == ConfusionMatrix(tp=1, fp=1, fn=1, tn=1)
+
+
+def test_confusion_matrix_skips_ids_missing_from_either_side() -> None:
+    predictions = {"a": 1, "only_in_predictions": 1}
+    truths = {"a": 1, "only_in_truths": 1}
+
+    matrix = confusion_matrix(predictions, truths)
+
+    assert matrix == ConfusionMatrix(tp=1, fp=0, fn=0, tn=0)
+
+
+def test_confusion_matrix_empty_inputs_give_all_zero_counts() -> None:
+    assert confusion_matrix({}, {}) == ConfusionMatrix(tp=0, fp=0, fn=0, tn=0)
+
+
+def test_confusion_matrix_relevant_label_is_configurable() -> None:
+    predictions = {"a": 0, "b": 1, "c": 0}
+    truths = {"a": 0, "b": 0, "c": 1}
+
+    default = confusion_matrix(predictions, truths)
+    assert default == ConfusionMatrix(tp=0, fp=1, fn=1, tn=1)
+
+    zero_as_relevant = confusion_matrix(predictions, truths, relevant_label=0)
+    assert zero_as_relevant == ConfusionMatrix(tp=1, fp=1, fn=1, tn=0)
+
+
+def test_relevant_label_constant_is_include() -> None:
+    assert RELEVANT_LABEL == 1

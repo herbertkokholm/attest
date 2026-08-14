@@ -45,10 +45,10 @@ from attest.provenance.config import VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import Epoch
 from attest.provenance.runs import RunRecord
 from attest.stats.agreement import agreement_report, pairwise_alpha
-from attest.stats.correlation import pairwise_fn_correlation
+from attest.stats.confusion import RELEVANT_LABEL
+from attest.stats.confusion import confusion_matrix as _confusion_matrix
+from attest.stats.correlation import build_predictions_by_vendor, pairwise_fn_correlation
 from attest.stats.recall import stratified_recall
-
-_RELEVANT_LABEL = 1
 
 CONFIG_FILENAME = "config.json"
 EPOCH_FILENAME = "epoch.json"
@@ -471,31 +471,6 @@ class RunStore:
         return payload
 
 
-def _predictions_by_vendor(
-    votes: Sequence[VoteVector], truths: Mapping[str, int]
-) -> tuple[dict[str, list[int]], list[int]]:
-    """Build per-vendor prediction lists and the matching truths list.
-
-    Restricted to gold-labeled records that every vendor present in `votes`
-    cast a vote on, since `pairwise_fn_correlation` requires equal-length,
-    aligned sequences per vendor.
-    """
-    by_record: dict[str, dict[str, int]] = {
-        vv.record_id: {vote.vendor: vote.rating for vote in vv.votes} for vv in votes
-    }
-    vendors = sorted({vendor for ratings in by_record.values() for vendor in ratings})
-    gold_ids = sorted(
-        record_id
-        for record_id in truths
-        if record_id in by_record and all(vendor in by_record[record_id] for vendor in vendors)
-    )
-    predictions = {
-        vendor: [by_record[record_id][vendor] for record_id in gold_ids] for vendor in vendors
-    }
-    ordered_truths = [truths[record_id] for record_id in gold_ids]
-    return predictions, ordered_truths
-
-
 def _final_labels(
     decisions: Mapping[str, Decision], human_labels: Mapping[str, int]
 ) -> dict[str, int]:
@@ -506,24 +481,6 @@ def _final_labels(
         except AdjudicationError:
             continue
     return resolved
-
-
-def _confusion_matrix(final_labels: Mapping[str, int], truths: Mapping[str, int]) -> dict[str, int]:
-    tp = fp = fn = tn = 0
-    for record_id, label in final_labels.items():
-        if record_id not in truths:
-            continue
-        predicted_positive = label == _RELEVANT_LABEL
-        actual_positive = truths[record_id] == _RELEVANT_LABEL
-        if predicted_positive and actual_positive:
-            tp += 1
-        elif predicted_positive and not actual_positive:
-            fp += 1
-        elif not predicted_positive and actual_positive:
-            fn += 1
-        else:
-            tn += 1
-    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
 def assemble_validation_record(
@@ -598,7 +555,7 @@ def assemble_validation_record(
     overall = agreement_report(votes)
     record.agreement = Agreement(krippendorff_alpha=overall.alpha, pairwise=pairwise_alpha(votes))
 
-    predictions_by_vendor, ordered_truths = _predictions_by_vendor(votes, truths)
+    predictions_by_vendor, ordered_truths = build_predictions_by_vendor(votes, truths)
     correlations = pairwise_fn_correlation(predictions_by_vendor, ordered_truths)
     record.error_correlation = ErrorCorrelation(
         pairwise_fn_on_relevant={
@@ -613,12 +570,13 @@ def assemble_validation_record(
 
     resolved_labels = _final_labels(decisions, human_labels or {})
     record.prisma.screen_excluded = sum(
-        1 for label in resolved_labels.values() if label != _RELEVANT_LABEL
+        1 for label in resolved_labels.values() if label != RELEVANT_LABEL
     )
     record.prisma.included = sum(
-        1 for label in resolved_labels.values() if label == _RELEVANT_LABEL
+        1 for label in resolved_labels.values() if label == RELEVANT_LABEL
     )
-    record.confusion = _confusion_matrix(resolved_labels, truths)
+    matrix = _confusion_matrix(resolved_labels, truths)
+    record.confusion = {"tp": matrix.tp, "fp": matrix.fp, "fn": matrix.fn, "tn": matrix.tn}
 
     labeled_audit_rows = [row for row in audit_rows if row.human_label is not None]
     if labeled_audit_rows:

@@ -71,6 +71,15 @@ def test_reachable_dispersions_x_one_is_only_zero() -> None:
     assert reachable_dispersions(1) == (0.0,)
 
 
+def test_reachable_dispersions_raises_for_x_far_outside_realistic_ensemble_scale() -> None:
+    # x in the thousands is never a real ensemble size (a vendor count); it's
+    # almost always the wrong quantity passed by mistake (e.g. a record
+    # count). This must fail fast and legibly rather than hang or exhaust
+    # memory enumerating comb(x + 2, 2) multisets.
+    with pytest.raises(ValueError, match="exceeding the"):
+        reachable_dispersions(10_000)
+
+
 # --- describe_tau: structure -----------------------------------------------------
 
 

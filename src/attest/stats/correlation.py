@@ -27,6 +27,8 @@ import itertools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from attest.ensemble.votes import VoteVector
+
 
 class CorrelationError(ValueError):
     """Raised when inputs to a correlation computation are inconsistent."""
@@ -151,6 +153,40 @@ def conditional_fn_correlation(
     errors_a = [p != t for p, t, keep in zip(predictions_a, truths, mask, strict=True) if keep]
     errors_b = [p != t for p, t, keep in zip(predictions_b, truths, mask, strict=True) if keep]
     return error_correlation(errors_a, errors_b)
+
+
+def build_predictions_by_vendor(
+    votes: Sequence[VoteVector], truths: Mapping[str, int]
+) -> tuple[dict[str, list[int]], list[int]]:
+    """Reshape vote vectors into per-vendor prediction lists aligned for `pairwise_fn_correlation`.
+
+    Restricted to gold-labeled records that every vendor present in `votes`
+    cast a vote on, since `pairwise_fn_correlation` requires equal-length,
+    aligned sequences per vendor.
+
+    Args:
+        votes: One vote vector per record.
+        truths: Mapping of record id to gold ordinal label.
+
+    Returns:
+        `(predictions_by_vendor, ordered_truths)`: a mapping of vendor name
+        to that vendor's predicted labels, and the gold labels in the same
+        record order, both restricted to the fully-covered gold record ids.
+    """
+    by_record: dict[str, dict[str, int]] = {
+        vv.record_id: {vote.vendor: vote.rating for vote in vv.votes} for vv in votes
+    }
+    vendors = sorted({vendor for ratings in by_record.values() for vendor in ratings})
+    gold_ids = sorted(
+        record_id
+        for record_id in truths
+        if record_id in by_record and all(vendor in by_record[record_id] for vendor in vendors)
+    )
+    predictions = {
+        vendor: [by_record[record_id][vendor] for record_id in gold_ids] for vendor in vendors
+    }
+    ordered_truths = [truths[record_id] for record_id in gold_ids]
+    return predictions, ordered_truths
 
 
 def pairwise_fn_correlation(
