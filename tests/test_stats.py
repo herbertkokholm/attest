@@ -144,6 +144,50 @@ def test_build_reliability_matrix_rejects_empty_input() -> None:
         build_reliability_matrix([])
 
 
+def test_krippendorff_alpha_raises_when_every_rater_used_only_one_category() -> None:
+    # Zero variance in the data: both observed and expected (chance-corrected)
+    # disagreement are exactly zero, so alpha is 0/0 -- undefined, not 1.0.
+    votes = [
+        _vv("u1", {"r1": 1, "r2": 1}),
+        _vv("u2", {"r1": 1, "r2": 1}),
+        _vv("u3", {"r1": 1, "r2": 1}),
+    ]
+    _vendors, matrix = build_reliability_matrix(votes)
+
+    with pytest.raises(AgreementError, match="undefined"):
+        krippendorff_alpha(matrix)
+
+
+def test_agreement_report_alpha_is_none_when_undefined_but_raw_agreement_survives() -> None:
+    votes = [
+        _vv("u1", {"r1": 1, "r2": 1}),
+        _vv("u2", {"r1": 1, "r2": 1}),
+        _vv("u3", {"r1": 1, "r2": 1}),
+    ]
+
+    report = agreement_report(votes)
+
+    assert report.alpha is None
+    assert report.raw_agreement == pytest.approx(1.0)
+    assert report.n_units == 3
+    assert report.n_raters == 2
+
+
+def test_pairwise_alpha_omits_a_pair_that_agreed_on_everything() -> None:
+    # r1/r2 agree on every unit (alpha undefined, 0/0) and must be omitted,
+    # exactly like a pair sharing zero units -- never surfaced as NaN.
+    votes = [
+        _vv("u1", {"r1": 1, "r2": 1, "r3": -1}),
+        _vv("u2", {"r1": 1, "r2": 1, "r3": 1}),
+    ]
+
+    pairwise = pairwise_alpha(votes)
+
+    assert "r1|r2" not in pairwise
+    assert "r1|r3" in pairwise
+    assert "r2|r3" in pairwise
+
+
 # --- correlation.py ----------------------------------------------------------
 #
 # Hand-computed reference for the 5 truly-relevant records (truth == 1):
