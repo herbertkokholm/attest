@@ -572,9 +572,7 @@ def assemble_validation_record(
     record.prisma.screen_excluded = sum(
         1 for label in resolved_labels.values() if label != RELEVANT_LABEL
     )
-    record.prisma.included = sum(
-        1 for label in resolved_labels.values() if label == RELEVANT_LABEL
-    )
+    record.prisma.included = sum(1 for label in resolved_labels.values() if label == RELEVANT_LABEL)
     matrix = _confusion_matrix(resolved_labels, truths)
     record.confusion = {"tp": matrix.tp, "fp": matrix.fp, "fn": matrix.fn, "tn": matrix.tn}
 
