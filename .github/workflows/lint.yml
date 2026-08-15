@@ -11,6 +11,14 @@ jobs:
   ci:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml's floor (requires-python >=3.11) through the
+        # newest stable CPython release. 3.15 stays out until it's GA
+        # (still beta as of writing; see PEP 790).
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -18,7 +26,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
       - name: Install dependencies
