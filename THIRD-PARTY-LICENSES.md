@@ -63,7 +63,7 @@ license terms.
 | mdurl                              | 0.1.2           | MIT License                                        | https://github.com/executablebooks/mdurl                                                            |
 | mistralai                          | 2.9.3           | UNKNOWN                                            | https://github.com/mistralai/client-python.git                                                      |
 | multidict                          | 6.7.1           | UNKNOWN                                            | https://github.com/aio-libs/multidict                                                               |
-| numpy                              | 2.5.2           | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | https://numpy.org                                                                                   |
+| numpy                              | 2.4.6           | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | https://numpy.org                                                                                   |
 | openai                             | 3.1.0           | Apache Software License                            | https://github.com/openai/openai-python                                                             |
 | opentelemetry-api                  | 1.44.0          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api                  |
 | opentelemetry-semantic-conventions | 0.65b0          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-semantic-conventions |
@@ -80,7 +80,7 @@ license terms.
 | requests                           | 2.34.2          | Apache Software License                            | https://github.com/psf/requests                                                                     |
 | rich                               | 15.0.0          | MIT License                                        | https://github.com/Textualize/rich                                                                  |
 | rich-rst                           | 2.1.0           | MIT                                                | https://wasi-master.github.io/rich-rst                                                              |
-| scipy                              | 1.18.0          | BSD License                                        | https://scipy.org/                                                                                  |
+| scipy                              | 1.17.1          | BSD License                                        | https://scipy.org/                                                                                  |
 | six                                | 1.17.0          | MIT License                                        | https://github.com/benjaminp/six                                                                    |
 | sniffio                            | 1.3.1           | Apache Software License; MIT License               | https://github.com/python-trio/sniffio                                                              |
 | together                           | 2.31.0          | Apache Software License                            | https://github.com/togethercomputer/together-py                                                     |
