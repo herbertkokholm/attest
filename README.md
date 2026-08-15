@@ -404,6 +404,8 @@ python tools/check_boundary.py
 attest is licensed under the GNU Affero General Public License v3.0 or later
 (AGPL-3.0-or-later). See LICENSE.
 
+Third-party dependency licenses: see [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+
 Copyright (C) 2026 Thomas Herbert Kokholm.
 
 A commercial license is available on request for use that the AGPL's terms do
