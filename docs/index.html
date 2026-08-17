@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>attest</title>
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <meta name="description"
+    content="A standalone, dependency-light Python kernel for LLM-ensemble title/abstract screening in systematic reviews — three statistically separated planes, versioned self-validation records, and a mechanically enforced boundary between the kernel and any product shell.">
+  <style>
+    :root,
+    :root[data-theme="dark"] {
+      --bg: #0f1420;
+      --panel: #171e2e;
+      --card: #1c2740;
+      --card2: #18223a;
+      --ink: #e8edf6;
+      --muted: #93a1c0;
+      --line: #2b3958;
+      --accent: #5b8cff;
+      --header-g1: #141b2b;
+      --header-g2: #101623;
+      --input-bg: #0d1420;
+      --hover-line: #3d5680;
+      --pill-safe-bg: #123a24;
+      --pill-safe-fg: #7fe3a0;
+      --pill-safe-border: #1d5c39;
+      --pill-danger-bg: #3a1620;
+      --pill-danger-fg: #ff9db0;
+      --pill-danger-border: #5c1d2e;
+      --pill-read-bg: #16233d;
+      --pill-read-fg: #9db8ff;
+      --pill-read-border: #253a63;
+      --date-fg: #6f7fa2;
+      --tb-fg: #0c1018;
+      --footer-fg: #5f6f90;
+      --footer-link: #8fa8d8;
+      --code-bg: #0d1420;
+      --code-fg: #cfe0ff;
+    }
+
+    :root[data-theme="light"] {
+      --bg: #f4f6fb;
+      --panel: #ffffff;
+      --card: #ffffff;
+      --card2: #eef1f8;
+      --ink: #1a2233;
+      --muted: #5a6a8a;
+      --line: #dbe1ee;
+      --accent: #3a63d8;
+      --header-g1: #ffffff;
+      --header-g2: #eef1f8;
+      --input-bg: #ffffff;
+      --hover-line: #b7c3de;
+      --pill-safe-bg: #e2f7ea;
+      --pill-safe-fg: #1f8a4c;
+      --pill-safe-border: #b6e6c7;
+      --pill-danger-bg: #fbe6ea;
+      --pill-danger-fg: #b23b53;
+      --pill-danger-border: #f0c3cd;
+      --pill-read-bg: #e8eefc;
+      --pill-read-fg: #3a5aa8;
+      --pill-read-border: #cddaf5;
+      --date-fg: #6b7aa0;
+      --tb-fg: #0c1018;
+      --footer-fg: #7583a3;
+      --footer-link: #3a5aa8;
+      --code-bg: #eef1f8;
+      --code-fg: #1a3f99;
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      transition: background .15s, color .15s
+    }
+
+    a {
+      color: var(--footer-link)
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: linear-gradient(180deg, var(--header-g1), var(--header-g2));
+      border-bottom: 1px solid var(--line);
+      padding: 14px 24px
+    }
+
+    .htop {
+      max-width: 980px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px
+    }
+
+    .htop h1 {
+      font-size: 16px;
+      margin: 0;
+      font-weight: 650;
+      letter-spacing: .2px;
+      flex: 1;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    .htop nav {
+      display: flex;
+      gap: 18px;
+      font-size: 13.5px
+    }
+
+    .htop nav a {
+      color: var(--muted);
+      text-decoration: none
+    }
+
+    .htop nav a:hover {
+      color: var(--ink)
+    }
+
+    #themetog {
+      background: var(--input-bg);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      padding: 7px 11px;
+      border-radius: 9px;
+      font-size: 12.5px;
+      cursor: pointer
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 0 24px
+    }
+
+    .hero {
+      padding: 64px 0 48px;
+      text-align: center
+    }
+
+    .hero h2 {
+      font-size: clamp(28px, 4.5vw, 42px);
+      margin: 0 0 14px;
+      font-weight: 700;
+      letter-spacing: -.3px;
+      line-height: 1.15
+    }
+
+    .hero p {
+      color: var(--muted);
+      font-size: 17px;
+      max-width: 680px;
+      margin: 0 auto 30px;
+      line-height: 1.55
+    }
+
+    .cta {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 11px 22px;
+      border-radius: 10px;
+      font-size: 14.5px;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid transparent
+    }
+
+    .btn.primary {
+      background: var(--accent);
+      color: #fff
+    }
+
+    .btn.ghost {
+      background: var(--input-bg);
+      color: var(--ink);
+      border-color: var(--line)
+    }
+
+    .btn.ghost:hover {
+      border-color: var(--hover-line)
+    }
+
+    section {
+      padding: 44px 0;
+      border-top: 1px solid var(--line)
+    }
+
+    section h3 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      color: var(--muted);
+      margin: 0 0 8px;
+      font-weight: 700
+    }
+
+    section h4 {
+      font-size: 24px;
+      margin: 0 0 14px;
+      font-weight: 700;
+      letter-spacing: -.2px
+    }
+
+    section p.lead {
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+      max-width: 680px
+    }
+
+    .flow {
+      display: flex;
+      gap: 0;
+      align-items: stretch;
+      flex-wrap: wrap;
+      margin-top: 28px
+    }
+
+    .flow .step {
+      flex: 1;
+      min-width: 190px;
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      padding: 16px 18px;
+      margin: 6px
+    }
+
+    .flow .step b {
+      display: block;
+      font-size: 13.5px;
+      margin-bottom: 5px
+    }
+
+    .flow .step span {
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.5
+    }
+
+    .flow .arrow {
+      align-self: center;
+      color: var(--muted);
+      font-size: 20px;
+      padding: 0 4px
+    }
+
+    .mock {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 13px;
+      margin-top: 24px
+    }
+
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      padding: 14px 15px 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      position: relative
+    }
+
+    .card .stripe {
+      position: absolute;
+      left: 0;
+      top: 13px;
+      bottom: 13px;
+      width: 4px;
+      border-radius: 4px
+    }
+
+    .card .tt {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.34;
+      padding-left: 8px;
+      font-family: "SF Mono", Menlo, Consolas, monospace
+    }
+
+    .card .auth {
+      font-size: 11.5px;
+      color: var(--muted);
+      padding-left: 8px;
+      line-height: 1.5
+    }
+
+    .card .meta {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      padding-left: 8px
+    }
+
+    .pill {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 11px;
+      font-weight: 600;
+      letter-spacing: .3px;
+      text-transform: uppercase
+    }
+
+    .pill.read {
+      background: var(--pill-read-bg);
+      color: var(--pill-read-fg);
+      border: 1px solid var(--pill-read-border)
+    }
+
+    .pill.safe {
+      background: var(--pill-safe-bg);
+      color: var(--pill-safe-fg);
+      border: 1px solid var(--pill-safe-border)
+    }
+
+    .pill.danger {
+      background: var(--pill-danger-bg);
+      color: var(--pill-danger-fg);
+      border: 1px solid var(--pill-danger-border)
+    }
+
+    .feat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 24px
+    }
+
+    .feat {
+      padding: 0
+    }
+
+    .feat b {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 6px
+    }
+
+    .feat span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55
+    }
+
+    .mcp-panel {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px 24px;
+      margin-top: 24px
+    }
+
+    .mcp-panel h5 {
+      font-size: 14px;
+      margin: 0 0 10px
+    }
+
+    .mcp-panel ol {
+      margin: 0 0 4px;
+      padding-left: 20px;
+      color: var(--muted);
+      font-size: 13.5px;
+      line-height: 1.7
+    }
+
+    code,
+    pre {
+      font-family: "SF Mono", Menlo, Consolas, monospace
+    }
+
+    pre {
+      background: var(--code-bg);
+      color: var(--code-fg);
+      padding: 12px 14px;
+      border-radius: 9px;
+      font-size: 12.5px;
+      overflow-x: auto;
+      margin: 10px 0 18px
+    }
+
+    .mcp-tools {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      gap: 10px;
+      margin-top: 6px
+    }
+
+    .mcp-tools div {
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 10px 12px
+    }
+
+    .mcp-tools code {
+      font-size: 12px;
+      color: var(--accent)
+    }
+
+    .mcp-tools span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.4
+    }
+
+    .pgrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 14px;
+      margin-top: 24px
+    }
+
+    .pcard {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      padding: 16px 18px
+    }
+
+    .pcard b {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 7px
+    }
+
+    .pcard span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55
+    }
+
+    footer {
+      color: var(--footer-fg);
+      font-size: 12px;
+      text-align: center;
+      padding: 36px 24px 44px;
+      border-top: 1px solid var(--line);
+      margin-top: 20px
+    }
+
+    footer a {
+      color: var(--footer-link)
+    }
+
+    footer .links {
+      display: flex;
+      gap: 18px;
+      justify-content: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap
+    }
+  </style>
+  <script>
+    (function () {
+      var saved = localStorage.getItem('attest-theme');
+      var theme = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+</head>
+
+<body>
+
+  <header>
+    <div class="htop">
+      <img src="icons/icon.svg" alt="" width="24" height="24" style="border-radius: 6px; flex-shrink: 0;">
+      <h1>attest</h1>
+      <nav>
+        <a href="#how">How it works</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#integrity">Integrity</a>
+        <a href="https://github.com/herbertkokholm/attest" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <button id="themetog" type="button">Light</button>
+    </div>
+  </header>
+
+  <div class="hero wrap">
+    <h2>An LLM ensemble screens your review —<br>and the run has to prove its own recall.</h2>
+    <p>A standalone, dependency-light Python kernel for the screening-and-
+      self-validation step of systematic-review title/abstract screening. An
+      ensemble of LLMs from different vendors rates each record; disagreement
+      escalates to a human; three statistically separated planes make sure
+      recall is estimated only from a random, gold-checked sample of what got
+      excluded — never from adjudication or active-learning data. Every run
+      produces a versioned self-validation record: inter-rater agreement,
+      error correlation, escalation rate, and recall with its worst-case
+      floor.</p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">Quickstart</a>
+      <a class="btn ghost" href="#integrity">The boundary rule</a>
+      <a class="btn ghost" href="https://github.com/herbertkokholm/attest" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+    <p style="color: var(--muted); font-size: 0.85em; margin-top: 1.5em;">
+      Kernel only — a separate product shell is expected to import
+      <code>attest</code>, fetch candidate records, schedule work, persist
+      results, and serve a UI. AGPL-3.0-or-later; a commercial license is
+      available on request for use the AGPL doesn't permit.
+    </p>
+  </div>
+
+  <div class="wrap">
+
+    <section id="how">
+      <h3>How it works</h3>
+      <h4>Vote, aggregate, and never auto-exclude on uncertainty</h4>
+      <p class="lead">Records that survive a caller-supplied prefilter go to
+        an ensemble of vendor <code>Rater</code>s; the boundary+dispersion
+        rule (<code>attest.ensemble.aggregate.g</code>) aggregates each vote
+        vector into an auto-label or an escalation. There is deliberately no
+        "exclude" option in that rule — auto-excluding on ensemble
+        uncertainty is the one disposition that would silently destroy
+        recall.</p>
+      <div class="flow">
+        <div class="step"><b>1. Prefilter</b><span>Deterministic, source-agnostic dedup and exclusion rules the
+            caller injects — owns the upstream PRISMA counts.</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><b>2. Ensemble vote</b><span>Each vendor rates the record on an ordinal scale
+            (exclude / uncertain / include); votes aggregate via the boundary+dispersion rule.</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><b>3. Decide or escalate</b><span>A mean of exactly zero escalates to a human by default —
+            it never auto-commits to a final label.</span></div>
+      </div>
+
+      <p class="lead" style="margin-top: 28px;">Escalated and low-confidence
+        records are routed by two of three <em>statistically separated</em>
+        planes; the third is the only one recall may ever be estimated from.</p>
+      <div class="mock">
+        <div class="card">
+          <div class="stripe" style="background:#7fe3a0"></div>
+          <div class="meta"><span class="pill safe">Human resolution</span></div>
+          <div class="tt">attest.planes.adjudication</div>
+          <div class="auth">Resolves an escalated (disagreement) record with an authoritative human
+            label.</div>
+        </div>
+        <div class="card">
+          <div class="stripe" style="background:#9db8ff"></div>
+          <div class="meta"><span class="pill read">Never a probability sample</span></div>
+          <div class="tt">attest.planes.active_learning</div>
+          <div class="auth">Routes high-disagreement records, or unanimous records with low
+            within-vendor confidence, to human review — to improve the ensemble, not to measure it.</div>
+        </div>
+        <div class="card">
+          <div class="stripe" style="background:#ff9db0"></div>
+          <div class="meta"><span class="pill danger">Only source of recall</span></div>
+          <div class="tt">attest.planes.recall_audit</div>
+          <div class="auth">Refuses any row not tagged <code>PLANE_RECALL_AUDIT</code> — the one
+            random, gold-checked sample recall may ever be estimated from.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <h3>Quickstart</h3>
+      <h4>Install, check, and run the bundled example</h4>
+      <p class="lead">No PyPI release yet — install from a checkout. The
+        bundled four-vendor example config and gold set run entirely offline
+        via <code>--deterministic-seed</code>, no vendor API keys required.</p>
+
+      <div class="mcp-panel">
+        <h5>Install</h5>
+        <pre>python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"</pre>
+
+        <h5>Run the checks</h5>
+        <pre>ruff check .
+ruff format --check .
+mypy src
+pytest -q
+python tools/check_boundary.py</pre>
+
+        <h5>Screen the bundled example data</h5>
+        <pre>attest screen \
+  --input data/example_gold_set.json \
+  --config data/example_config.json \
+  --run-dir /tmp/attest-demo \
+  --deterministic-seed 42</pre>
+
+        <h5>Subcommands <span style="font-weight:400">— file-based, over a run directory</span></h5>
+        <div class="mcp-tools">
+          <div><code>screen / batch-fetch</code><span>The only two subcommands that may reach the network —
+              synchronously, or via each vendor's cheaper batch API</span></div>
+          <div><code>adjudicate</code><span>List and resolve escalated (disagreement) records with an
+              authoritative human label</span></div>
+          <div><code>audit-draw / audit-apply</code><span>Draw a random sample from the screen-excluded population
+              and apply gold-check labels</span></div>
+          <div><code>active-learning-select / active-learning-review</code><span>Route high-disagreement or
+              low-confidence records to review, with reviewer/selection provenance</span></div>
+          <div><code>validate</code><span>Assemble the versioned self-validation record for the epoch</span></div>
+          <div><code>ablate</code><span>Controlled ablation sweep over ensemble size on stored votes against a
+              frozen gold set</span></div>
+          <div><code>protocol / manifest / verify</code><span>Freeze the validation-protocol descriptor and run
+              manifest, then offline-verify a SHA-256 per persisted artifact</span></div>
+          <div><code>sentinel-init / sentinel-check</code><span>Latent-vendor-drift detector — a hard trigger opens
+              a new epoch; an advisory alpha bound never does alone</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h3>Architecture</h3>
+      <h4>Dependency-light, and each module does one thing</h4>
+      <div class="feat-grid">
+        <div class="feat"><b>Prefilter</b><span>Deterministic, source-agnostic dedup and exclusion rules, injected by
+            the caller; owns the upstream PRISMA counts.</span></div>
+        <div class="feat"><b>Ensemble</b><span>Runs each vendor's <code>Rater</code> and aggregates the vote vector
+            via the boundary+dispersion rule — never auto-commits an uncertain mean to a final label.</span></div>
+        <div class="feat"><b>Three separated planes</b><span><code>adjudication</code>, <code>active_learning</code>,
+            <code>recall_audit</code> form a firewall so recall is never estimated from a biased sample.</span>
+        </div>
+        <div class="feat"><b>Provenance</b><span>Five separately versioned descriptors and the machinery around them:
+            <code>config</code>, <code>epochs</code>, <code>changelog</code>, <code>protocol</code>,
+            <code>manifest</code>, <code>sentinel</code>, <code>runs</code>.</span></div>
+        <div class="feat"><b>Stats</b><span>Krippendorff's alpha, error correlation, and stratified recall with a
+            rule-of-three worst-case floor.</span></div>
+        <div class="feat"><b>I/O</b><span>The only module that touches a filesystem: a local, idempotent JSON run
+            directory.</span></div>
+        <div class="feat"><b>Vendors</b><span>The <code>Rater</code> protocol, a network-free
+            <code>DeterministicRater</code> for tests, and live adapters for six vendor families — the sole path
+            to the network.</span></div>
+        <div class="feat"><b>Batch mode</b><span><code>BatchRater</code> drives vendors' async batch APIs at roughly
+            50% cheaper cost, producing byte-identical votes and decisions to the synchronous path.</span></div>
+        <div class="feat"><b><code>tau</code> as a step function</b><span><code>attest.ensemble.tau</code> proves
+            <code>tau</code> only attains a finite set of behaviorally distinct values per ensemble size, and
+            derives a safe one from policy instead of a hand-picked decimal.</span></div>
+        <div class="feat"><b>Confidence signal</b><span>Per-vote logprobs from vendors that support them, scored
+            only once at least 3 vendors return one — feeds confidence-stratified auditing and active-learning
+            selection.</span></div>
+        <div class="feat"><b>CLI</b><span>File-based subcommands over a run directory; only <code>screen</code> and
+            <code>batch-fetch</code> ever reach the network.</span></div>
+      </div>
+    </section>
+
+    <section id="integrity">
+      <h3>Integrity</h3>
+      <h4>Why the firewall needs care</h4>
+      <p class="lead">Three statistically separated planes were a deliberate
+        design choice, and it comes with a real risk this project is built
+        around rather than around ignoring.</p>
+      <div class="pgrid">
+        <div class="pcard"><b>Mechanically enforced boundary</b><span><code>tools/check_boundary.py</code>
+            statically scans every module and fails CI if a kernel module imports a scheduler, database, web
+            framework, or — outside <code>attest.vendors</code> — a network client.</span></div>
+        <div class="pcard"><b>Zero never auto-excludes</b><span>A vote vector whose mean is exactly zero either
+            escalates to a human or folds into <code>+1</code> — there is deliberately no path from ensemble
+            uncertainty to an auto-exclude.</span></div>
+        <div class="pcard"><b>Recall audit is the only source</b><span><code>recall_audit.build_strata</code>
+            refuses any row not tagged <code>PLANE_RECALL_AUDIT</code>; adjudication and active-learning
+            selections are firewalled out of the recall estimator.</span></div>
+        <div class="pcard"><b>Run directories are epoch-locked</b><span><code>RunStore.write_config</code>/
+            <code>write_epoch</code> both refuse a second, different value — a deliberate config change always
+            means a new run directory, never an in-place edit.</span></div>
+        <div class="pcard"><b>Append-only changelog</b><span><code>write_changelog</code> refuses any write that
+            would rewrite or shrink stored history; every epoch change is logged as
+            <code>initial_config</code>, <code>explicit_config_change</code>, or <code>sentinel_drift</code>.</span>
+        </div>
+        <div class="pcard"><b>Offline integrity verification</b><span><code>attest verify</code> recomputes a
+            SHA-256 per persisted artifact from the run manifest and exits <code>1</code> — no traceback — if
+            anything is missing or changed, so CI can gate on it directly.</span></div>
+      </div>
+    </section>
+
+  </div>
+
+  <footer>
+    <div class="links">
+      <a href="https://github.com/herbertkokholm/attest" target="_blank" rel="noopener">GitHub</a>
+      <a href="#integrity">Integrity</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="https://github.com/herbertkokholm/attest/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+      <a href="https://github.com/herbertkokholm/attest/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+    </div>
+    attest — AGPL-3.0-or-later. Commercial licensing available on request.
+  </footer>
+
+  <script>
+    var themetog = document.getElementById('themetog');
+    function setTheme(t) {
+      document.documentElement.setAttribute('data-theme', t);
+      localStorage.setItem('attest-theme', t);
+      themetog.textContent = t === 'dark' ? 'Light' : 'Dark';
+    }
+    setTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+    themetog.onclick = function () { setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'); };
+  </script>
+</body>
+
+</html>
