@@ -12,8 +12,21 @@ from attest.ensemble.confidence import UNSCORED_TIER
 from attest.ensemble.votes import build_vote_vector
 from attest.planes import PLANE_ACTIVE_LEARNING, PLANE_ADJUDICATION, PLANE_RECALL_AUDIT
 from attest.planes.active_learning import (
+    SELECTION_REASON_BOUNDARY,
+    SELECTION_REASON_DISPERSION,
+    SELECTION_REASON_LOW_CONFIDENCE,
     ActiveLearningError,
+    review_selection,
     select_for_review,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_BOUNDARY as ADJ_SELECTION_REASON_BOUNDARY,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_DISPERSION as ADJ_SELECTION_REASON_DISPERSION,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_TIE as ADJ_SELECTION_REASON_TIE,
 )
 from attest.planes.adjudication import (
     AdjudicationError,
@@ -115,6 +128,68 @@ def test_queue_resolve_rejects_invalid_human_label() -> None:
 
     with pytest.raises(AdjudicationError):
         queue.resolve("r8", 7)
+
+
+def test_enqueue_records_boundary_selection_reason() -> None:
+    decision = g(_votes("r9", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+
+    item = queue.enqueue("r9", _CONFIG_ID, decision)
+
+    assert item.selection_reason == ADJ_SELECTION_REASON_BOUNDARY
+
+
+def test_enqueue_records_dispersion_selection_reason() -> None:
+    decision = g(_votes("r10", (-1, 0, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+
+    # (-1, 0, 1) is both boundary and high-dispersion; boundary wins as the
+    # more specific reason (see escalation_reason's docstring).
+    item = queue.enqueue("r10", _CONFIG_ID, decision)
+    assert item.selection_reason == ADJ_SELECTION_REASON_BOUNDARY
+
+    # A pure dispersion escalation with no boundary: three vendors split
+    # (-1, 0, -1) around a non-zero, non-boundary mean under a tight tau.
+    dispersion_only = g(_votes("r10b", (-1, 0, -1)), tau=0.1)
+    assert dispersion_only.boundary is False
+    assert dispersion_only.escalate is True
+    item2 = queue.enqueue("r10b", _CONFIG_ID, dispersion_only)
+    assert item2.selection_reason == ADJ_SELECTION_REASON_DISPERSION
+
+
+def test_enqueue_records_tie_selection_reason_for_mean_zero_escalation() -> None:
+    decision = g(_votes("r11", (0, 0)), tau=0.0)
+    assert decision.boundary is False
+    assert decision.dispersion == 0.0
+    queue = AdjudicationQueue()
+
+    item = queue.enqueue("r11", _CONFIG_ID, decision)
+
+    assert item.selection_reason == ADJ_SELECTION_REASON_TIE
+
+
+def test_resolve_records_reviewer_and_protocol_provenance() -> None:
+    decision = g(_votes("r12", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+    queue.enqueue("r12", _CONFIG_ID, decision)
+
+    resolved = queue.resolve("r12", 1, reviewer="reviewer-a", protocol_id="proto-1")
+
+    assert resolved.reviewer == "reviewer-a"
+    assert resolved.protocol_id == "proto-1"
+    assert resolved.resolved_at is not None
+
+
+def test_resolve_without_reviewer_leaves_provenance_fields_none() -> None:
+    decision = g(_votes("r13", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+    queue.enqueue("r13", _CONFIG_ID, decision)
+
+    resolved = queue.resolve("r13", 1)
+
+    assert resolved.reviewer is None
+    assert resolved.protocol_id is None
+    assert resolved.resolved_at is not None  # always stamped, even without a reviewer id
 
 
 # --- active_learning.py -------------------------------------------------------
@@ -286,6 +361,48 @@ def test_select_for_review_sorts_by_dispersion_then_confidence_ascending() -> No
 def test_select_for_review_rejects_confidence_threshold_outside_unit_interval() -> None:
     with pytest.raises(ActiveLearningError):
         select_for_review([], confidence_threshold=1.5)
+
+
+def test_selection_reason_reports_boundary_and_dispersion() -> None:
+    votes = [_votes("boundary", (-1, 1)), _votes("dispersion", (-1, 0, 1, 1))]
+
+    selections = select_for_review(votes, dispersion_threshold=0.5)
+
+    by_id = {s.record_id: s for s in selections}
+    assert SELECTION_REASON_BOUNDARY in by_id["boundary"].selection_reason
+    assert SELECTION_REASON_DISPERSION in by_id["dispersion"].selection_reason
+    assert SELECTION_REASON_BOUNDARY in by_id["dispersion"].selection_reason
+
+
+def test_selection_reason_reports_low_confidence_for_unanimous_shaky_record() -> None:
+    votes = [_confidence_votes("shaky", (1, 1, 1))]
+    raw_responses = {
+        "shaky": {
+            "openai": _openai_shaped(math.log(0.4)),
+            "mistral": _openai_shaped(math.log(0.4)),
+            "together": _openai_shaped(math.log(0.4)),
+        }
+    }
+
+    [selection] = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert selection.selection_reason == (SELECTION_REASON_LOW_CONFIDENCE,)
+
+
+def test_review_selection_records_reviewer_provenance() -> None:
+    votes = [_votes("r1", (-1, 1))]
+    [selection] = select_for_review(votes)
+
+    review = review_selection(
+        selection, reviewer="reviewer-a", protocol_id="proto-1", notes="prompt needs clarifying"
+    )
+
+    assert review.record_id == "r1"
+    assert review.reviewer == "reviewer-a"
+    assert review.protocol_id == "proto-1"
+    assert review.notes == "prompt needs clarifying"
+    assert review.selection_reason == selection.selection_reason
+    assert review.plane == PLANE_ACTIVE_LEARNING
 
 
 # --- recall_audit.py: drawing -------------------------------------------------

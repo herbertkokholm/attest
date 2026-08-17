@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "project": "attest-sentinel-demo",
+  "records": [
+    {
+      "id": "sentinel-001",
+      "title": "A randomized controlled trial of a behavioral intervention",
+      "abstract": "Background: we evaluate a behavioral intervention in a randomized controlled trial with a clearly defined primary outcome and adequate follow-up.",
+      "track": "sentinel"
+    },
+    {
+      "id": "sentinel-002",
+      "title": "Case report: an unusual presentation",
+      "abstract": "A single case report describing an unusual clinical presentation, without a control group or systematic methodology.",
+      "track": "sentinel"
+    },
+    {
+      "id": "sentinel-003",
+      "title": "Editorial commentary on recent guideline changes",
+      "abstract": "An editorial opinion piece discussing recent changes to clinical guidelines, presenting no original data.",
+      "track": "sentinel"
+    },
+    {
+      "id": "sentinel-004",
+      "title": "Cross-sectional survey of clinician attitudes",
+      "abstract": "A cross-sectional survey instrument administered to clinicians, reporting descriptive statistics on attitudes toward a screening tool.",
+      "track": "sentinel"
+    },
+    {
+      "id": "sentinel-005",
+      "title": "Systematic review and meta-analysis of prior trials",
+      "abstract": "A systematic review and meta-analysis pooling results from prior randomized trials, with a pre-registered protocol and PRISMA-compliant reporting.",
+      "track": "sentinel"
+    }
+  ]
+}

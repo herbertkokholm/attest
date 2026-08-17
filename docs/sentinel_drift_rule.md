@@ -5,6 +5,16 @@ behavior has drifted from its own baseline on a frozen sentinel set, and
 recommends one. This is the rationale-of-record for the rule; the manuscript
 names it in one sentence and does not repeat this analysis.
 
+**Implementation status:** the recommended hybrid rule below is implemented
+in `attest.provenance.sentinel` (`SentinelBaseline`, `evaluate_sentinel`,
+`open_epoch_for_hard_trigger`), wired to the CLI as `attest sentinel-init`/
+`attest sentinel-check`, and covered by offline tests in
+`tests/test_sentinel.py` using a deterministic rater double -- no live
+vendor call required. See the README's "Latent-vendor-drift sentinel"
+section for the CLI walkthrough. Only sentinel *scheduling* (cadence,
+cross-run baseline persistence across a project's lifetime) remains a
+runbook concern, per "Split with the runbook" below.
+
 Reproducible probe: `tools/sentinel_drift_probe.py`. Imports only
 `attest.stats.agreement` and the standard library -- no scheduler, no
 storage, no network, matching the kernel's own boundary

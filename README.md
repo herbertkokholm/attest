@@ -215,13 +215,31 @@ inter-vendor independence argument behind the ensemble.
   - `recall_audit` — the *only* plane recall may be estimated from: a random
     probability sample of the screen-excluded population, gold-checked by a
     human auditor.
-- **Provenance** (`attest.provenance`) — immutable, content-hashed
-  `ensemble_config_id`, stable epochs, and run records.
+- **Provenance** (`attest.provenance`) — three separately versioned
+  descriptors and the machinery around them:
+  - `config` — the screening ensemble configuration and its immutable,
+    content-hashed `ensemble_config_id`.
+  - `epochs` — stable spans over which that configuration (or, for a
+    sentinel-drift trigger, the vendor behavior it hashes) is held fixed.
+  - `changelog` — the append-only, persisted record of *why* an epoch
+    changed: `initial_config`, `explicit_config_change` (with a
+    machine-readable field diff), or `sentinel_drift`. See [Configuration
+    governance](#configuration-governance-protocol-and-run-manifest) below.
+  - `protocol` — the validation-protocol descriptor (audit design,
+    adjudication protocol, sentinel thresholds, reporting spec), hashed into
+    its own `protocol_id`, deliberately disjoint from `ensemble_config_id`.
+  - `manifest` — a run manifest: software version, input hash, seeds, and a
+    SHA-256 per persisted artifact, for offline integrity verification.
+  - `sentinel` — the latent-vendor-drift detector (see [Latent-vendor-drift
+    sentinel](#latent-vendor-drift-sentinel) below).
+  - `runs` — per-run provenance records (what ran, on what track, under
+    which epoch).
 - **Stats** (`attest.stats`) — inter-rater agreement (Krippendorff's alpha),
   error correlation, and stratified recall with a rule-of-three floor. See
   [`docs/sentinel_drift_rule.md`](docs/sentinel_drift_rule.md) for the
-  threshold-rule rationale behind the (not yet implemented) latent-vendor-drift
-  sentinel, reusing this module's alpha; reproducible probe at
+  threshold-rule rationale behind the latent-vendor-drift sentinel
+  (`attest.provenance.sentinel`, implemented -- see below), reusing this
+  module's alpha; reproducible probe at
   [`tools/sentinel_drift_probe.py`](tools/sentinel_drift_probe.py).
 - **I/O** (`attest.io.store`) — the only module that touches a filesystem: a
   local, idempotent JSON run directory.
@@ -244,9 +262,10 @@ inter-vendor independence argument behind the ensemble.
   actual vendor/model support with
   [`tools/vendor_logprob_probe.py`](tools/vendor_logprob_probe.py) rather
   than assuming it.
-- **CLI** (`attest.cli`) — `screen`, `batch-fetch`, `adjudicate`,
-  `audit-draw`, `audit-apply`, `validate`, `ablate`: file-based subcommands
-  over a run directory.
+- **CLI** (`attest.cli`) — file-based subcommands over a run directory:
+  `screen`, `batch-fetch`, `adjudicate`, `audit-draw`, `audit-apply`,
+  `validate`, `ablate`, `protocol`, `manifest`, `verify`, `sentinel-init`,
+  `sentinel-check`, `active-learning-select`, `active-learning-review`.
 
 ## Running the CLI on the example data
 
@@ -388,6 +407,195 @@ the miss, the concrete illustration of what stratifying toward
 low-confidence records is for. `attest validate`'s output now also carries
 a `confidence_policy` key alongside `tau_report`, the same provenance
 treatment `tau` already gets.
+
+## Configuration governance, protocol, and run manifest
+
+Three provenance levels are kept deliberately separate (see
+`attest.provenance.protocol`'s module docstring):
+
+- **Screening config** (`attest.provenance.config.Config`) -- vendors,
+  models, prompts, aggregation, tau, zero policy. The only thing
+  `ensemble_config_id` hashes.
+- **Validation protocol** (`attest.provenance.protocol.ValidationProtocol`)
+  -- audit-strata/design, the adjudication protocol, the sentinel-drift
+  rule's thresholds, and the reporting/analysis spec. Hashed into its own
+  `protocol_id`, never into `ensemble_config_id`: a change to the audit
+  budget or the sentinel's advisory threshold is an analysis-plan revision,
+  not a new measurement instrument.
+- **Run manifest** (`attest.provenance.manifest.RunManifest`) -- one
+  execution's software version, the hash of the input file it screened,
+  every random seed used, and a SHA-256 per artifact the run directory holds
+  at manifest-build time.
+
+`attest screen`'s first invocation over a run directory logs a changelog
+event (`changelog.json`, append-only -- `attest.io.store.RunStore.write_changelog`
+refuses any write that would rewrite or shrink already-stored history): an
+`initial_config` event by default, or an `explicit_config_change` event --
+with a machine-readable, dot-flattened field diff
+(`attest.provenance.changelog.diff_config_fields`) -- when
+`--previous-run-dir`/`--change-reason` are given.
+
+A run directory is locked to one configuration/epoch forever
+(`RunStore.write_config`/`write_epoch` both refuse a second, different
+value), so a deliberate config change -- a bumped model version, a
+different prompt, a raised `tau` -- always means a *new* run directory, the
+"fresh `RUN_DIR` per epoch" convention the runbook already follows (e.g.
+`RUN_DIR=data/run_epoch2`). `--previous-run-dir` is how that new run
+directory's first `screen` call records *why* it exists instead of looking
+like an unrelated fresh start: it names the run directory of the epoch
+being replaced, so attest reads that predecessor's own persisted
+`config.json` back (not a hand-passed file, which could go stale) to
+compute the `before` id and the field diff.
+
+`/tmp/attest-demo` (screened in [Running the CLI on the example
+data](#running-the-cli-on-the-example-data) above with
+`data/example_config.json`) is epoch 1. Later, a deliberate change --
+`openai`'s `model_version` bumped after a vendor snapshot change -- always
+means a *new* run directory, e.g. `RUN_DIR=data/run_epoch2` in the runbook's
+own naming, or here:
+
+```bash
+# data/example_config_epoch2.json is identical to data/example_config.json
+# except for that one field -- a static, hand-authored example alongside
+# example_config.json and example_gold_set.json, not something attest
+# derives at run time.
+attest screen \
+  --input data/example_gold_set.json \
+  --config data/example_config_epoch2.json \
+  --run-dir /tmp/attest-epoch2 \
+  --deterministic-seed 42 \
+  --previous-run-dir /tmp/attest-demo \
+  --change-reason "bumped openai model_version after a vendor snapshot change" \
+  --approver reviewer-a
+```
+
+`/tmp/attest-epoch2/changelog.json` then records one `explicit_config_change`
+event: `before` is `/tmp/attest-demo`'s actual `ensemble_config_id`, `after`
+is `/tmp/attest-epoch2`'s, `changed_fields` is
+`["vendors.openai.model_version"]`, and `approver` is `"reviewer-a"` --
+`--approver` requires `--previous-run-dir`, since there is nothing to
+approve on an ordinary first run.
+
+Build and persist the protocol descriptor and the run manifest once a run
+directory's artifacts are in the state you want to freeze (typically after
+`validate`), then verify integrity any time afterward, entirely offline:
+
+```bash
+attest protocol --run-dir /tmp/attest-demo --stratify-by track --audit-size-policy "n=600"
+attest manifest --run-dir /tmp/attest-demo --input data/example_gold_set.json --seed screen=42
+attest verify --run-dir /tmp/attest-demo
+```
+
+`verify` recomputes the SHA-256 of every artifact the manifest recorded --
+config, protocol descriptor, votes, raw responses, decisions, epoch,
+changelog, the audit-draw snapshot, the audit-labels snapshot, and the
+validation-record snapshot (`RunStore.MANIFEST_ARTIFACTS`) -- and reports
+exactly which one is missing or has changed; it exits `1` (without printing
+a Python traceback) when anything fails, so a CI step can gate on it
+directly. The input file itself is hashed, not copied into the run
+directory, since it can be large (e.g. a multi-review SYNERGY gold set).
+
+## Latent-vendor-drift sentinel
+
+Implements the hybrid rule recommended in
+[`docs/sentinel_drift_rule.md`](docs/sentinel_drift_rule.md):
+`attest.provenance.sentinel` runs the same raters (or `DeterministicRater`s)
+that back `screen`, offline and network-free when seeded. A hard trigger
+(>= 2 one-directional polarity crossings per vendor, `baseline in {0, +1} ->
+current == -1`, on a frozen sentinel set) opens a new epoch and appends a
+`sentinel_drift` changelog event; a looser Krippendorff's-alpha bound is
+logged as an advisory-only signal that never opens an epoch on its own.
+
+```bash
+attest sentinel-init --run-dir /tmp/attest-demo \
+  --sentinel-input data/example_sentinel_set.json --deterministic-seed 42
+
+# ... periodically, e.g. from the runbook's own schedule ...
+attest sentinel-check --run-dir /tmp/attest-demo \
+  --sentinel-input data/example_sentinel_set.json --deterministic-seed 42
+```
+
+On a hard trigger, `sentinel-check` appends the `sentinel_drift` event to
+this run directory's changelog and prints the newly opened epoch; like an
+explicit config change, this run directory keeps its original epoch's
+artifacts, and continued screening under the new epoch belongs in a fresh
+run directory (the same convention `--previous-run-dir` follows for an
+explicit change). Sentinel *scheduling* (cadence, baseline persistence
+across runbook invocations) is deliberately left to the runbook -- see the
+doc's "Split with the runbook" section.
+
+## Adjudication and active-learning provenance
+
+`adjudicate --reviewer ID --protocol-id ID` and `active-learning-review
+--reviewer ID --protocol-id ID --notes TEXT` attach reviewer/selection
+provenance -- who resolved or reviewed a record, when, under which
+protocol, and why it was routed there in the first place
+(`selection_reason`: `boundary`, `dispersion`, `tie`, or, for active
+learning, `low_confidence`) -- to `adjudication_records.json` and
+`active_learning_reviews.json`. This is provenance only: attest never
+auto-tunes a prompt or retrains anything from either plane. A reviewer's
+notes may motivate a later, human-initiated `attest screen --previous-run-dir
+... --approver ...` call; recording the review and making that change are
+always two separate, explicit steps.
+
+`active-learning-select` persists `select_for_review`'s output
+(`active_learning_selections.json`) so a later `active-learning-review` call
+can look a record's selection reason back up without recomputing it.
+
+## Implemented, planned, and out of scope
+
+**Implemented:**
+
+- The three statistically separated planes, the boundary+dispersion
+  aggregation rule, tau/confidence provenance, versioned config/protocol/
+  manifest, the append-only changelog, the latent-vendor-drift sentinel
+  (hard trigger + advisory alpha), offline manifest-based artifact
+  integrity verification, and reviewer/selection provenance on adjudication
+  and active-learning records.
+- Screening recall (sensitivity), estimated *only* from the random
+  `recall_audit` plane's probability sample of the screen-excluded
+  population -- this logic is unchanged by any of the above; adjudication
+  and active-learning selections remain statistically firewalled out of the
+  recall estimator (`attest.planes.recall_audit.build_strata` refuses any
+  row not tagged `PLANE_RECALL_AUDIT`).
+
+**Aggregation rules:** `attest.ensemble.aggregate.AGGREGATION_BOUNDARY_DISPERSION`
+is the only aggregation rule with an implementation. `AGGREGATION_MAJORITY`
+and `AGGREGATION_UNANIMITY` are recognized names (`Config.aggregation`
+accepts them without raising) but `attest.ensemble.aggregate.g` raises
+`NotImplementedError` if either is actually selected. Do not configure a
+screening run with them expecting a working aggregation rule.
+
+**Planned (not implemented):**
+
+- **Inclusion audit.** `attest.contracts.validation_record.Recall`'s `TPc`
+  (true positives) is currently taken directly from the confusion matrix
+  against gold labels, which requires every included/escalated record to
+  already carry ground truth -- true for the planned SYNERGY-based empirical
+  evaluation, but not for a live deployment without full gold coverage. The
+  manuscript's inclusion-audit design (§2.9: a separate random/track-stratified
+  sample of the include-and-escalate set, its own confidence interval,
+  mirroring the exclusion audit) is a future live-deployment module, not
+  implemented here.
+- Automated prompt tuning or retraining from active-learning or adjudication
+  output. Both planes are provenance-recording only (see above); a config
+  change motivated by a review is always a separate, explicit,
+  human-initiated `attest screen --previous-run-dir ...` call.
+
+**Out of scope for this kernel:**
+
+- **Search recall / search completeness** (capture-recapture, relative
+  recall). Screening recall answers a different question than search
+  completeness and is reported separately, never multiplied together (see
+  the manuscript's Discussion); attest implements neither capture-recapture
+  nor relative recall.
+- Sentinel *scheduling* (cadence, cross-run baseline persistence) --
+  `attest.provenance.sentinel` is a pure, offline detector; wiring it into a
+  recurring job belongs to the runbook (see [`docs/sentinel_drift_rule.md`](docs/sentinel_drift_rule.md)'s
+  "Split with the runbook" section).
+- Everything the boundary rule already excludes: scheduling, collectors,
+  databases/object storage, and a UI. See [The boundary
+  rule](#the-boundary-rule).
 
 ## Running the tests
 

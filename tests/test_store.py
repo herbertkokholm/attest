@@ -10,14 +10,24 @@ import pytest
 
 from attest.contracts.input import ExternalId, Record
 from attest.ensemble.aggregate import g
+from attest.ensemble.confidence import RecordConfidence
 from attest.ensemble.tau import describe_tau
 from attest.ensemble.votes import VoteVector, build_vote_vector
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
+from attest.planes.active_learning import ActiveLearningReview, ActiveLearningSelection
+from attest.planes.adjudication import AdjudicationItem
 from attest.planes.recall_audit import AuditRow
 from attest.prefilter.framework import Prefilter, Prisma, require_nonempty
+from attest.provenance.changelog import ChangeLog, ConfigChangeEvent
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import open_epoch
+from attest.provenance.protocol import ValidationProtocol
 from attest.provenance.runs import start_run
+from attest.provenance.sentinel import (
+    SentinelBaseline,
+    capture_baseline,
+    evaluate_sentinel,
+)
 
 _VENDORS = ("v1", "v2", "v3")
 
@@ -409,3 +419,365 @@ def test_assemble_validation_record_requires_stored_votes(tmp_path: Path) -> Non
         assemble_validation_record(
             store, prefilter_prisma=empty_prisma, truths={}, population_sizes={}
         )
+
+
+# --- RunStore: changelog (append-only run artifact) -------------------------------
+
+
+def test_changelog_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    log = ChangeLog()
+    log.record(before=None, after="cfg-1", reason="initial")
+    log.record(before="cfg-1", after="cfg-2", reason="tau raised")
+
+    store.write_changelog(log)
+
+    assert store.read_changelog() == log
+
+
+def test_append_change_event_extends_stored_history(tmp_path: Path) -> None:
+    from attest.provenance.changelog import CHANGE_TYPE_INITIAL
+
+    store = RunStore(tmp_path / "run")
+    first = store.append_change_event(
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before=None,
+            after="cfg-1",
+            reason="initial",
+            change_type=CHANGE_TYPE_INITIAL,
+        )
+    )
+    assert first.events == store.read_changelog().events
+
+    store.append_change_event(
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 2, tzinfo=UTC),
+            before="cfg-1",
+            after="cfg-2",
+            reason="explicit change",
+        )
+    )
+
+    assert len(store.read_changelog().events) == 2
+
+
+def test_write_changelog_rejects_shrinking_stored_history(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    full_log = ChangeLog()
+    full_log.record(before=None, after="cfg-1", reason="initial")
+    full_log.record(before="cfg-1", after="cfg-2", reason="explicit change")
+    store.write_changelog(full_log)
+
+    shrunk = ChangeLog(events=full_log.events[:1])
+    with pytest.raises(StoreError):
+        store.write_changelog(shrunk)
+
+
+def test_write_changelog_rejects_rewriting_a_stored_event(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    log = ChangeLog()
+    log.record(
+        before=None, after="cfg-1", reason="initial", timestamp=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    store.write_changelog(log)
+
+    rewritten = ChangeLog()
+    rewritten.record(
+        before=None,
+        after="cfg-1",
+        reason="a different reason for the same event",
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    with pytest.raises(StoreError):
+        store.write_changelog(rewritten)
+
+
+def test_read_changelog_without_a_write_returns_empty_log(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_changelog() == ChangeLog()
+
+
+# --- RunStore: validation protocol -------------------------------------------------
+
+
+def test_protocol_round_trips_and_returns_stable_id(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    protocol = ValidationProtocol()
+
+    protocol_id = store.write_protocol(protocol)
+
+    assert store.read_protocol() == protocol
+    assert store.read_protocol_id() == protocol_id
+
+
+def test_protocol_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_protocol() is None
+    assert store.read_protocol_id() is None
+
+
+def test_protocol_can_be_overwritten_freely(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_protocol(ValidationProtocol())
+    from attest.provenance.protocol import AuditDesign
+
+    updated_id = store.write_protocol(
+        ValidationProtocol(audit_design=AuditDesign(stratify_by="track"))
+    )
+
+    assert store.read_protocol_id() == updated_id
+    assert store.read_protocol().audit_design.stratify_by == "track"  # type: ignore[union-attr]
+
+
+# --- RunStore: audit draw / audit labels snapshots ---------------------------------
+
+
+def test_audit_draw_and_labels_round_trip(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    rows = [
+        AuditRow(record_id="r1", stratum="all"),
+        AuditRow(record_id="r2", stratum="all"),
+    ]
+
+    store.write_audit_draw("cfg-1", rows)
+    store.write_audit_labels("cfg-1", {"r1": 1, "r2": -1})
+
+    assert store.read_audit_draw() == {"r1": "all", "r2": "all"}
+    assert store.read_audit_labels() == {"r1": 1, "r2": -1}
+
+
+def test_audit_draw_is_distinct_from_audit_json(tmp_path: Path) -> None:
+    # write_audit_rows (the existing combined file validate reads from) does
+    # not implicitly populate the audit_draw snapshot -- they are separate
+    # artifacts, written by separate calls.
+    store = RunStore(tmp_path / "run")
+    store.write_audit_rows("cfg-1", [AuditRow(record_id="r1", stratum="all")])
+
+    assert store.read_audit_draw() == {}
+
+
+# --- RunStore: validation record snapshot -------------------------------------------
+
+
+def test_validation_record_snapshot_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    payload = {"schema_version": "1.1", "ensemble_config_id": "cfg-1"}
+
+    store.write_validation_record_snapshot(payload)
+
+    assert store.read_validation_record_snapshot() == payload
+
+
+def test_validation_record_snapshot_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_validation_record_snapshot() is None
+
+
+# --- RunStore: sentinel baseline and evaluations -----------------------------------
+
+
+def _sentinel_baseline() -> SentinelBaseline:
+    return capture_baseline(
+        "sentinel-set-1",
+        "cfg-1",
+        "epoch-1",
+        {"v1": {"s0": -1, "s1": 0, "s2": 1}},
+        recorded_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_sentinel_baseline_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    baseline = _sentinel_baseline()
+
+    store.write_sentinel_baseline(baseline)
+
+    assert store.read_sentinel_baseline() == baseline
+
+
+def test_sentinel_baseline_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_sentinel_baseline() is None
+
+
+def test_sentinel_baseline_rejects_a_different_sentinel_set(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_sentinel_baseline(_sentinel_baseline())
+
+    other = capture_baseline("sentinel-set-2", "cfg-1", "epoch-1", {"v1": {"s0": -1}})
+    with pytest.raises(StoreError):
+        store.write_sentinel_baseline(other)
+
+
+def test_sentinel_evaluations_accumulate_history(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    baseline = _sentinel_baseline()
+    store.write_sentinel_baseline(baseline)
+
+    first = evaluate_sentinel(
+        baseline,
+        {"v1": {"s0": -1, "s1": 0, "s2": 1}},
+        evaluated_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    second = evaluate_sentinel(
+        baseline,
+        {"v1": {"s0": -1, "s1": 0, "s2": -1}},
+        evaluated_at=datetime(2026, 1, 3, tzinfo=UTC),
+    )
+    store.write_sentinel_evaluation(first)
+    store.write_sentinel_evaluation(second)
+
+    restored = store.read_sentinel_evaluations()
+    assert restored == [first, second]
+
+
+def test_sentinel_evaluations_read_without_a_write_returns_empty_list(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_sentinel_evaluations() == []
+
+
+# --- RunStore: adjudication provenance ----------------------------------------------
+
+
+def test_adjudication_record_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    item = AdjudicationItem(
+        record_id="r1",
+        ensemble_config_id="cfg-1",
+        dispersion=1.0,
+        boundary=True,
+        selection_reason="boundary",
+        human_label=1,
+        reviewer="reviewer-a",
+        resolved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        protocol_id="proto-1",
+    )
+
+    store.write_adjudication_record(item)
+
+    records = store.read_adjudication_records()
+    assert records["r1"]["human_label"] == 1
+    assert records["r1"]["reviewer"] == "reviewer-a"
+    assert records["r1"]["selection_reason"] == "boundary"
+    assert records["r1"]["protocol_id"] == "proto-1"
+    assert records["r1"]["resolved_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_adjudication_records_upsert_by_record_id(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_adjudication_record(
+        AdjudicationItem(record_id="r1", ensemble_config_id="cfg-1", dispersion=1.0, boundary=True)
+    )
+    store.write_adjudication_record(
+        AdjudicationItem(record_id="r2", ensemble_config_id="cfg-1", dispersion=0.5, boundary=False)
+    )
+
+    assert set(store.read_adjudication_records()) == {"r1", "r2"}
+
+
+# --- RunStore: active-learning provenance -------------------------------------------
+
+
+def test_active_learning_selections_round_trip(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    selection = ActiveLearningSelection(
+        record_id="r1",
+        ensemble_config_id="cfg-1",
+        dispersion=1.0,
+        boundary=True,
+        confidence=RecordConfidence(
+            record_id="r1", median_probability=0.4, n_supporting=3, n_total=3, scored=True
+        ),
+        selection_reason=("boundary", "low_confidence"),
+    )
+
+    store.write_active_learning_selections("cfg-1", [selection])
+
+    stored = store.read_active_learning_selections()
+    assert stored["r1"]["selection_reason"] == ["boundary", "low_confidence"]
+    assert stored["r1"]["confidence_median_probability"] == pytest.approx(0.4)
+
+
+def test_active_learning_reviews_accumulate_history(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    review = ActiveLearningReview(
+        record_id="r1",
+        ensemble_config_id="cfg-1",
+        selection_reason=("dispersion",),
+        reviewer="reviewer-a",
+        reviewed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        protocol_id=None,
+        notes="looks like a prompt gap",
+    )
+
+    store.write_active_learning_review(review)
+
+    reviews = store.read_active_learning_reviews()
+    assert len(reviews) == 1
+    assert reviews[0]["reviewer"] == "reviewer-a"
+    assert reviews[0]["notes"] == "looks like a prompt gap"
+
+
+# --- RunStore: run manifest and offline integrity verification ---------------------
+
+
+def test_manifest_hashes_existing_artifacts_and_round_trips(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    config = _config()
+    store.write_config(config)
+    config_id = compute_ensemble_config_id(config)
+
+    manifest = store.write_manifest(
+        ensemble_config_id=config_id,
+        input_hash="deadbeef",
+        input_source="gold.json",
+        seeds={"screen": 1},
+    )
+
+    assert manifest.artifact_hashes  # at least config.json was hashed
+    assert store.read_manifest() == manifest
+
+
+def test_manifest_read_without_a_write_returns_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_manifest() is None
+
+
+def test_verify_raises_without_a_stored_manifest(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    with pytest.raises(StoreError):
+        store.verify()
+
+
+def test_verify_ok_when_artifacts_are_unchanged(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    config = _config()
+    store.write_config(config)
+    store.write_manifest(ensemble_config_id=compute_ensemble_config_id(config))
+
+    report = store.verify()
+
+    assert report.ok is True
+
+
+def test_verify_detects_tampered_config(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    config = _config()
+    store.write_config(config)
+    store.write_manifest(ensemble_config_id=compute_ensemble_config_id(config))
+
+    # Simulate tampering: overwrite config.json directly on disk, bypassing the store.
+    (store.root / "config.json").write_text('{"tampered": true}', encoding="utf-8")
+
+    report = store.verify()
+
+    assert report.ok is False
+    assert any(p.artifact == "config.json" for p in report.problems)

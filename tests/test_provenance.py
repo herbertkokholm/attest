@@ -6,7 +6,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from attest.provenance.changelog import ChangeLog
+from attest.provenance.changelog import (
+    CHANGE_TYPE_EXPLICIT,
+    CHANGE_TYPE_INITIAL,
+    CHANGE_TYPE_SENTINEL_DRIFT,
+    ChangeLog,
+    ChangelogError,
+    ConfigChangeEvent,
+    diff_config_fields,
+)
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import maybe_open_epoch, open_epoch
 from attest.provenance.runs import RunRecord, start_run
@@ -276,3 +284,132 @@ def test_run_record_round_trips_to_and_from_dict() -> None:
     restored = RunRecord.from_dict(run.to_dict())
 
     assert restored == run
+
+
+# --- changelog: change_type inference, validation, and field diffing -----------
+
+
+def test_record_infers_initial_change_type_when_before_is_none() -> None:
+    log = ChangeLog()
+
+    event = log.record(before=None, after="cfg-1", reason="first configuration")
+
+    assert event.change_type == CHANGE_TYPE_INITIAL
+
+
+def test_record_infers_explicit_change_type_when_before_is_given() -> None:
+    log = ChangeLog()
+
+    event = log.record(before="cfg-1", after="cfg-2", reason="tau raised")
+
+    assert event.change_type == CHANGE_TYPE_EXPLICIT
+
+
+def test_record_accepts_explicit_sentinel_drift_change_type_with_equal_ids() -> None:
+    log = ChangeLog()
+
+    event = log.record(
+        before="cfg-1",
+        after="cfg-1",
+        reason="sentinel drift: vendor v1",
+        change_type=CHANGE_TYPE_SENTINEL_DRIFT,
+    )
+
+    assert event.change_type == CHANGE_TYPE_SENTINEL_DRIFT
+    assert event.before == event.after
+
+
+def test_change_event_rejects_unknown_change_type() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before="cfg-1",
+            after="cfg-2",
+            reason="x",
+            change_type="not_a_real_type",
+        )
+
+
+def test_change_event_rejects_initial_with_non_none_before() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before="cfg-1",
+            after="cfg-2",
+            reason="x",
+            change_type=CHANGE_TYPE_INITIAL,
+        )
+
+
+def test_change_event_rejects_non_initial_with_none_before() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before=None,
+            after="cfg-2",
+            reason="x",
+            change_type=CHANGE_TYPE_EXPLICIT,
+        )
+
+
+def test_change_event_round_trips_with_changed_fields_and_approver() -> None:
+    event = ConfigChangeEvent(
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        before="cfg-1",
+        after="cfg-2",
+        reason="model version bumped",
+        change_type=CHANGE_TYPE_EXPLICIT,
+        changed_fields=("vendors.openai.model_version",),
+        approver="reviewer-42",
+    )
+
+    restored = ConfigChangeEvent.from_dict(event.to_dict())
+
+    assert restored == event
+
+
+def test_changelog_to_list_and_from_list_round_trip() -> None:
+    log = ChangeLog()
+    log.record(before=None, after="cfg-1", reason="initial")
+    log.record(before="cfg-1", after="cfg-2", reason="tau raised")
+
+    restored = ChangeLog.from_list(log.to_list())
+
+    assert restored == log
+
+
+def test_diff_config_fields_lists_only_changed_dot_paths() -> None:
+    base = _config(tau=0.5)
+    changed = _config(tau=0.6)
+
+    diff = diff_config_fields(base, changed)
+
+    assert diff == ["tau"]
+
+
+def test_diff_config_fields_detects_nested_vendor_field_change() -> None:
+    base = _config()
+    changed = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-4o", model_version="2025-01-01", prompt_version="v1", temperature=0.0
+            ),
+            "anthropic": base.vendors["anthropic"],
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    diff = diff_config_fields(base, changed)
+
+    assert diff == ["vendors.openai.model_version"]
+
+
+def test_diff_config_fields_reports_every_field_when_before_is_none() -> None:
+    config = _config()
+
+    diff = diff_config_fields(None, config)
+
+    assert "tau" in diff
+    assert "aggregation" in diff
+    assert any(key.startswith("vendors.") for key in diff)

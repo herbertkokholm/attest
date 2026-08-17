@@ -27,12 +27,14 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from random import Random
 from typing import Any
 
 from attest.ablation.xsweep import DEFAULT_MAX_SUBSETS_PER_X, AblationReport, sweep
 from attest.contracts.input import NormalizedInput
+from attest.contracts.validation_record import SCHEMA_VERSION as VALIDATION_RECORD_SCHEMA_VERSION
 from attest.ensemble.aggregate import (
     AGGREGATION_BOUNDARY_DISPERSION,
     KNOWN_ZERO_POLICIES,
@@ -47,8 +49,15 @@ from attest.ensemble.confidence import (
     record_confidence,
 )
 from attest.ensemble.tau import validate_tau
-from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
-from attest.planes.adjudication import final_label
+from attest.io.store import (
+    RunStore,
+    StoreError,
+    assemble_validation_record,
+    hash_input_file,
+    load_input,
+)
+from attest.planes.active_learning import ActiveLearningReview, select_for_review
+from attest.planes.adjudication import AdjudicationItem, escalation_reason, final_label
 from attest.planes.recall_audit import (
     AuditRow,
     ExcludedRecord,
@@ -56,10 +65,35 @@ from attest.planes.recall_audit import (
     ingest_audit_labels,
 )
 from attest.prefilter.framework import Prefilter, PrefilterOutcome, require_nonempty
+from attest.provenance.changelog import (
+    CHANGE_TYPE_EXPLICIT,
+    CHANGE_TYPE_INITIAL,
+    ConfigChangeEvent,
+    diff_config_fields,
+)
 from attest.provenance.config import Config as EnsembleConfig
 from attest.provenance.config import VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import Epoch, maybe_open_epoch
+from attest.provenance.protocol import (
+    STRATIFY_CONFIDENCE,
+    STRATIFY_NONE,
+    STRATIFY_TRACK,
+    AdjudicationProtocol,
+    AuditDesign,
+    ReportingSpec,
+    SentinelPolicy,
+    ValidationProtocol,
+)
 from attest.provenance.runs import start_run
+from attest.provenance.sentinel import (
+    DEFAULT_ADVISORY_ALPHA_THRESHOLD,
+    DEFAULT_HARD_TRIGGER_CROSSINGS,
+    capture_baseline,
+    collect_sentinel_votes,
+    compute_sentinel_set_id,
+    evaluate_sentinel,
+    open_epoch_for_hard_trigger,
+)
 from attest.vendors.base import DeterministicRater, EnsembleRun, Rater, run_ensemble
 from attest.vendors.batch import (
     BatchRater,
@@ -392,6 +426,71 @@ def _write_or_print(payload: str, out: str | None) -> None:
         print(payload)
 
 
+def _record_screen_config_change(
+    store: RunStore,
+    args: argparse.Namespace,
+    config: EnsembleConfig,
+    ensemble_config_id: str,
+    epoch: Epoch,
+) -> None:
+    """Log this run directory's first epoch to its persisted changelog.
+
+    Called exactly once per run directory, when `screen` opens its epoch for
+    the first time (a run directory is locked to one config/epoch, so every
+    later `screen` invocation over the same directory reuses that epoch and
+    logs nothing further). Without `--previous-run-dir`, this is an
+    `initial_config` event (`before=None`); with it, this run directory is
+    understood to be the *new* run directory of a deliberate, explicit
+    configuration change (see `attest.io.store.RunStore` and the runbook's
+    own "fresh RUN_DIR per epoch" convention), and this logs an
+    `explicit_config_change` event carrying the machine-readable field diff.
+
+    `--previous-run-dir` points at the *predecessor run directory*, not a
+    hand-passed config file: the predecessor's own persisted `config.json`
+    (`RunStore.read_config`) is what actually produced that epoch's votes,
+    so reading it back is the only way to guarantee the logged `before` id
+    and field diff describe what really ran, rather than trusting a sidecar
+    file the caller might have edited or gone stale since then.
+    """
+    if args.previous_run_dir is None:
+        if args.approver is not None:
+            raise CliError("--approver requires --previous-run-dir")
+        store.append_change_event(
+            ConfigChangeEvent(
+                timestamp=epoch.opened_at,
+                before=None,
+                after=ensemble_config_id,
+                reason=args.change_reason
+                or "initial ensemble configuration for this run directory",
+                change_type=CHANGE_TYPE_INITIAL,
+            )
+        )
+        return
+
+    if not args.change_reason:
+        raise CliError("--change-reason is required when --previous-run-dir is given")
+    previous_store = RunStore(Path(args.previous_run_dir))
+    try:
+        previous_config = previous_store.read_config()
+    except StoreError as exc:
+        raise CliError(
+            f"--previous-run-dir '{args.previous_run_dir}' has no stored config; it must be "
+            "a run directory a prior 'screen' invocation already wrote to"
+        ) from exc
+    before_id = compute_ensemble_config_id(previous_config)
+    store.append_change_event(
+        ConfigChangeEvent(
+            timestamp=epoch.opened_at,
+            before=before_id,
+            after=ensemble_config_id,
+            reason=args.change_reason,
+            change_type=CHANGE_TYPE_EXPLICIT,
+            changed_fields=tuple(diff_config_fields(previous_config, config)),
+            approver=args.approver,
+        )
+    )
+
+
 def _cmd_screen(args: argparse.Namespace) -> int:
     """Run the deterministic prefilter, then the ensemble, over an input file.
 
@@ -414,6 +513,9 @@ def _cmd_screen(args: argparse.Namespace) -> int:
         current_epoch = None
     epoch = maybe_open_epoch(current_epoch, config)
     store.write_epoch(epoch)
+
+    if current_epoch is None:
+        _record_screen_config_change(store, args, config, ensemble_config_id, epoch)
 
     tau_report = validate_tau(config.tau, config.x)
     for message in tau_report.warnings:
@@ -508,6 +610,19 @@ def _cmd_adjudicate(args: argparse.Namespace) -> int:
         boundary=decision.boundary,
     )
     store.write_decisions(ensemble_config_id, {args.record_id: resolved_decision})
+    store.write_adjudication_record(
+        AdjudicationItem(
+            record_id=args.record_id,
+            ensemble_config_id=ensemble_config_id,
+            dispersion=decision.dispersion,
+            boundary=decision.boundary,
+            selection_reason=escalation_reason(decision),
+            human_label=resolved_label,
+            reviewer=args.reviewer,
+            resolved_at=datetime.now(UTC),
+            protocol_id=args.protocol_id,
+        )
+    )
 
     print(json.dumps({"record_id": args.record_id, "final_label": resolved_label}, indent=2))
     return 0
@@ -545,6 +660,7 @@ def _cmd_audit_draw(args: argparse.Namespace) -> int:
         rng=rng,
     )
     store.write_audit_rows(ensemble_config_id, rows)
+    store.write_audit_draw(ensemble_config_id, rows)
 
     drawn = [{"record_id": row.record_id, "stratum": row.stratum} for row in rows]
     print(json.dumps({"drawn": drawn}, indent=2))
@@ -564,6 +680,8 @@ def _cmd_audit_apply(args: argparse.Namespace) -> int:
 
     updated = ingest_audit_labels(unlabeled, labels)
     store.write_audit_rows(ensemble_config_id, updated)
+    applied = {row.record_id: row.human_label for row in updated if row.human_label is not None}
+    store.write_audit_labels(ensemble_config_id, applied)
 
     print(json.dumps({"labeled": [row.record_id for row in updated]}, indent=2))
     return 0
@@ -617,6 +735,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         # stratification actually used.
         payload["confidence_policy"] = confidence_policy
 
+    # Persist a run-directory-local copy so `attest manifest`/`verify` can
+    # hash "the validation record" as an artifact regardless of wherever
+    # --out (if any) pointed.
+    store.write_validation_record_snapshot(payload)
+
     _write_or_print(json.dumps(payload, indent=2), args.out)
     return 0
 
@@ -648,6 +771,257 @@ def _cmd_ablate(args: argparse.Namespace) -> int:
 
     payload = json.dumps(_ablation_report_to_dict(report), indent=2, sort_keys=True)
     _write_or_print(payload, args.out)
+    return 0
+
+
+def _cmd_protocol(args: argparse.Namespace) -> int:
+    """Build and persist this run directory's validation-protocol descriptor.
+
+    A validation protocol is analysis-plan provenance, not screening
+    behavior: it may be written or revised at any point in a run
+    directory's lifecycle, unlike `config.json`/`epoch.json` (see
+    `attest.provenance.protocol` and `RunStore.write_protocol`).
+    """
+    store = RunStore(Path(args.run_dir))
+    protocol = ValidationProtocol(
+        audit_design=AuditDesign(
+            stratify_by=args.stratify_by,
+            audit_size_policy=args.audit_size_policy,
+            confidence_level=args.confidence_level,
+        ),
+        adjudication_protocol=AdjudicationProtocol(
+            protocol_version=args.adjudication_protocol_version,
+            description=args.adjudication_description,
+        ),
+        sentinel_policy=SentinelPolicy(
+            hard_trigger_crossings=args.hard_trigger_crossings,
+            advisory_alpha_threshold=args.advisory_alpha_threshold,
+            cadence_note=args.sentinel_cadence_note,
+        ),
+        reporting_spec=ReportingSpec(
+            validation_record_schema_version=VALIDATION_RECORD_SCHEMA_VERSION,
+            notes=args.reporting_notes,
+        ),
+    )
+    protocol_id = store.write_protocol(protocol)
+    print(json.dumps({"protocol_id": protocol_id, **protocol.to_dict()}, indent=2, sort_keys=True))
+    return 0
+
+
+def _parse_seeds(values: Sequence[str] | None) -> dict[str, int]:
+    """Parse repeated `--seed NAME=VALUE` CLI arguments into a name-to-seed mapping."""
+    seeds: dict[str, int] = {}
+    for entry in values or ():
+        if "=" not in entry:
+            raise CliError(f"--seed must be NAME=VALUE, got {entry!r}")
+        name, _, value = entry.partition("=")
+        try:
+            seeds[name] = int(value)
+        except ValueError as exc:
+            raise CliError(f"--seed value for '{name}' must be an integer, got {value!r}") from exc
+    return seeds
+
+
+def _cmd_manifest(args: argparse.Namespace) -> int:
+    """Build and persist a run manifest hashing this run directory's current artifacts."""
+    store = RunStore(Path(args.run_dir))
+    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+    protocol_id = store.read_protocol_id()
+    input_hash = hash_input_file(args.input) if args.input else None
+    manifest = store.write_manifest(
+        ensemble_config_id=ensemble_config_id,
+        protocol_id=protocol_id,
+        input_hash=input_hash,
+        input_source=args.input,
+        seeds=_parse_seeds(args.seed),
+    )
+    print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Offline-verify a run directory's artifacts against its stored manifest.
+
+    Exits 1 (without raising) when integrity problems are found, so a CI
+    step can gate on this command's exit code without parsing its output.
+    """
+    store = RunStore(Path(args.run_dir))
+    report = store.verify()
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    return 0 if report.ok else 1
+
+
+def _cmd_sentinel_init(args: argparse.Namespace) -> int:
+    """Capture this ensemble configuration's baseline ratings on a frozen sentinel set."""
+    store = RunStore(Path(args.run_dir))
+    config = store.read_config()
+    ensemble_config_id = compute_ensemble_config_id(config)
+    epoch = store.read_epoch()
+
+    sentinel_input = load_input(args.sentinel_input)
+    sentinel_set_id = compute_sentinel_set_id(sentinel_input.records)
+
+    raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
+    votes = collect_sentinel_votes(sentinel_input.records, raters)
+    baseline = capture_baseline(sentinel_set_id, ensemble_config_id, epoch.id, votes)
+    store.write_sentinel_baseline(baseline)
+
+    print(
+        json.dumps(
+            {"sentinel_set_id": sentinel_set_id, "vendors": sorted(votes), "epoch": epoch.id},
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_sentinel_check(args: argparse.Namespace) -> int:
+    """Re-evaluate every vendor against its stored sentinel baseline.
+
+    On a hard trigger, opens a new epoch and appends a `sentinel_drift`
+    changelog event to this run directory (see
+    `attest.provenance.sentinel.open_epoch_for_hard_trigger`) -- but, like
+    an explicit config change, does not itself start writing further
+    screening artifacts under the new epoch: this run directory stays
+    locked to its original epoch, and continued screening under the new
+    epoch belongs in a fresh run directory (printed in the result).
+    """
+    store = RunStore(Path(args.run_dir))
+    config = store.read_config()
+    baseline = store.read_sentinel_baseline()
+    if baseline is None:
+        raise CliError(
+            "no sentinel baseline stored for this run directory; run sentinel-init first"
+        )
+
+    sentinel_input = load_input(args.sentinel_input)
+    sentinel_set_id = compute_sentinel_set_id(sentinel_input.records)
+    if sentinel_set_id != baseline.sentinel_set_id:
+        raise CliError(
+            f"--sentinel-input hashes to sentinel set '{sentinel_set_id}', which does not "
+            f"match the stored baseline's sentinel set '{baseline.sentinel_set_id}'"
+        )
+
+    raters = _build_raters(config, deterministic_seed=args.deterministic_seed)
+    current_votes = collect_sentinel_votes(sentinel_input.records, raters)
+
+    protocol = store.read_protocol()
+    sentinel_policy = protocol.sentinel_policy if protocol is not None else None
+    hard_trigger_crossings = (
+        args.hard_trigger_crossings
+        if args.hard_trigger_crossings is not None
+        else (
+            sentinel_policy.hard_trigger_crossings
+            if sentinel_policy is not None
+            else DEFAULT_HARD_TRIGGER_CROSSINGS
+        )
+    )
+    advisory_alpha_threshold = (
+        args.advisory_alpha_threshold
+        if args.advisory_alpha_threshold is not None
+        else (
+            sentinel_policy.advisory_alpha_threshold
+            if sentinel_policy is not None
+            else DEFAULT_ADVISORY_ALPHA_THRESHOLD
+        )
+    )
+
+    evaluation = evaluate_sentinel(
+        baseline,
+        current_votes,
+        hard_trigger_crossings=hard_trigger_crossings,
+        advisory_alpha_threshold=advisory_alpha_threshold,
+    )
+    store.write_sentinel_evaluation(evaluation)
+
+    result: dict[str, Any] = evaluation.to_dict()
+    if evaluation.triggered:
+        new_epoch, event = open_epoch_for_hard_trigger(config, evaluation)
+        store.append_change_event(event)
+        result["new_epoch"] = {
+            "id": new_epoch.id,
+            "ensemble_config_id": new_epoch.ensemble_config_id,
+            "opened_at": new_epoch.opened_at.isoformat(),
+        }
+        result["action_required"] = (
+            "hard trigger fired: this run directory's changelog now records the sentinel-drift "
+            "transition; continue screening this configuration under a new run directory "
+            "using the returned epoch, the same convention an explicit config change follows"
+        )
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_active_learning_select(args: argparse.Namespace) -> int:
+    """Select stored votes for active-learning review and persist their provenance."""
+    store = RunStore(Path(args.run_dir))
+    config = store.read_config()
+    ensemble_config_id = compute_ensemble_config_id(config)
+    votes = store.read_votes()
+    raw_responses = store.read_raw_responses()
+    confidence_threshold = (
+        args.confidence_threshold
+        if args.confidence_threshold is not None
+        else config.confidence_threshold
+    )
+
+    selections = select_for_review(
+        votes,
+        dispersion_threshold=args.dispersion_threshold,
+        include_boundary=not args.no_boundary,
+        confidence_threshold=confidence_threshold,
+        raw_responses=raw_responses,
+        limit=args.limit,
+    )
+    store.write_active_learning_selections(ensemble_config_id, selections)
+
+    payload = [
+        {
+            "record_id": s.record_id,
+            "dispersion": s.dispersion,
+            "boundary": s.boundary,
+            "selection_reason": list(s.selection_reason),
+        }
+        for s in selections
+    ]
+    print(json.dumps({"selected": payload}, indent=2))
+    return 0
+
+
+def _cmd_active_learning_review(args: argparse.Namespace) -> int:
+    """Record a human review of a previously selected active-learning record.
+
+    Provenance only: recording a review never itself tunes a prompt,
+    retrains anything, or writes a decision. A reviewer's `--notes` may
+    record that this review motivates a later explicit config change; that
+    change is then a separate, human-initiated `attest screen
+    --previous-run-dir ... --approver ...` invocation, not something this
+    command triggers.
+    """
+    store = RunStore(Path(args.run_dir))
+    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+    stored = store.read_active_learning_selections()
+    if args.record_id not in stored:
+        raise CliError(
+            f"record '{args.record_id}' has no stored active-learning selection; "
+            "run active-learning-select first"
+        )
+    selection_reason = tuple(stored[args.record_id].get("selection_reason", ()))
+
+    review = ActiveLearningReview(
+        record_id=args.record_id,
+        ensemble_config_id=ensemble_config_id,
+        selection_reason=selection_reason,
+        reviewer=args.reviewer,
+        reviewed_at=datetime.now(UTC),
+        protocol_id=args.protocol_id,
+        notes=args.notes or "",
+    )
+    store.write_active_learning_review(review)
+
+    print(json.dumps({"record_id": args.record_id, "reviewer": args.reviewer}, indent=2))
     return 0
 
 
@@ -693,6 +1067,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ask every vendor that supports it (see docs/logprob_support.md) for per-vote "
         "logprobs, retained in raw_responses.json. Required for --stratify-by-confidence "
         "on a later audit-draw, or for confidence-driven active-learning selection.",
+    )
+    screen.add_argument(
+        "--previous-run-dir",
+        default=None,
+        help="Path to the predecessor run directory this run directory's configuration "
+        "deliberately replaces -- its stored config.json (not a hand-passed file) is read "
+        "back as the 'before' configuration, so the logged diff always describes what that "
+        "epoch actually ran. When given, this run directory's first-epoch changelog event is "
+        "logged as an explicit_config_change (with a machine-readable field diff) instead of "
+        "the default initial_config -- the same 'fresh RUN_DIR per config change' convention "
+        "the runbook already follows (e.g. RUN_DIR=data/run_epoch2).",
+    )
+    screen.add_argument(
+        "--change-reason",
+        default=None,
+        help="Free-text reason for this run directory's first-epoch changelog event. Required "
+        "when --previous-run-dir is given; optional (with a generic default) otherwise.",
+    )
+    screen.add_argument(
+        "--approver",
+        default=None,
+        help="Id or pseudonym of the reviewer/approver who authorized this config change. "
+        "Requires --previous-run-dir.",
     )
     screen.set_defaults(handler=_cmd_screen)
 
@@ -746,6 +1143,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=(-1, 0, 1),
         help="Authoritative human label for --record-id.",
+    )
+    adjudicate.add_argument(
+        "--reviewer",
+        default=None,
+        help="Id or pseudonym of the resolving reviewer, recorded to adjudication_records.json.",
+    )
+    adjudicate.add_argument(
+        "--protocol-id",
+        default=None,
+        help="Id of the adjudication protocol in force (see 'attest protocol'), recorded to "
+        "adjudication_records.json.",
     )
     adjudicate.set_defaults(handler=_cmd_adjudicate)
 
@@ -827,6 +1235,146 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="Path to write the ablation report; defaults to stdout."
     )
     ablate.set_defaults(handler=_cmd_ablate)
+
+    protocol = subparsers.add_parser(
+        "protocol", help="Build and persist this run directory's validation-protocol descriptor."
+    )
+    protocol.add_argument("--run-dir", required=True, help="Run directory to read/write.")
+    protocol.add_argument(
+        "--stratify-by",
+        choices=(STRATIFY_NONE, STRATIFY_TRACK, STRATIFY_CONFIDENCE),
+        default=STRATIFY_NONE,
+        help="What the random recall audit stratifies by, for the protocol record.",
+    )
+    protocol.add_argument("--audit-size-policy", default="", help="Free-text audit-budget policy.")
+    protocol.add_argument(
+        "--confidence-level",
+        type=float,
+        default=0.95,
+        help="Two-sided confidence level for the recall floor/interval.",
+    )
+    protocol.add_argument("--adjudication-protocol-version", default="1")
+    protocol.add_argument("--adjudication-description", default="")
+    protocol.add_argument(
+        "--hard-trigger-crossings",
+        type=int,
+        default=DEFAULT_HARD_TRIGGER_CROSSINGS,
+        help="Sentinel hard-trigger threshold recorded into the protocol (see 'sentinel-check').",
+    )
+    protocol.add_argument(
+        "--advisory-alpha-threshold", type=float, default=DEFAULT_ADVISORY_ALPHA_THRESHOLD
+    )
+    protocol.add_argument("--sentinel-cadence-note", default="")
+    protocol.add_argument("--reporting-notes", default="")
+    protocol.set_defaults(handler=_cmd_protocol)
+
+    manifest = subparsers.add_parser(
+        "manifest",
+        help="Build and persist a run manifest hashing this run directory's current artifacts.",
+    )
+    manifest.add_argument("--run-dir", required=True, help="Run directory to read/write.")
+    manifest.add_argument(
+        "--input",
+        default=None,
+        help="Path to the input-contract file this run screened, hashed (not copied) into the "
+        "manifest as provenance of what was screened.",
+    )
+    manifest.add_argument(
+        "--seed",
+        action="append",
+        default=None,
+        metavar="NAME=VALUE",
+        help="A named random seed used by this run, e.g. --seed screen=42. Repeatable.",
+    )
+    manifest.set_defaults(handler=_cmd_manifest)
+
+    verify = subparsers.add_parser(
+        "verify", help="Offline-verify a run directory's artifacts against its stored manifest."
+    )
+    verify.add_argument("--run-dir", required=True, help="Run directory to verify.")
+    verify.set_defaults(handler=_cmd_verify)
+
+    sentinel_init = subparsers.add_parser(
+        "sentinel-init",
+        help="Capture this ensemble configuration's baseline ratings on a frozen sentinel set.",
+    )
+    sentinel_init.add_argument("--run-dir", required=True, help="Run directory to read/write.")
+    sentinel_init.add_argument(
+        "--sentinel-input",
+        required=True,
+        help="Input-contract JSON file holding the frozen sentinel set's records.",
+    )
+    sentinel_init.add_argument(
+        "--deterministic-seed",
+        type=int,
+        default=None,
+        help="Use network-free DeterministicRaters seeded with this value instead of live vendors.",
+    )
+    sentinel_init.set_defaults(handler=_cmd_sentinel_init)
+
+    sentinel_check = subparsers.add_parser(
+        "sentinel-check",
+        help="Re-evaluate every vendor against its stored sentinel baseline.",
+    )
+    sentinel_check.add_argument("--run-dir", required=True, help="Run directory to read/write.")
+    sentinel_check.add_argument(
+        "--sentinel-input",
+        required=True,
+        help="Input-contract JSON file holding the same frozen sentinel set used by sentinel-init.",
+    )
+    sentinel_check.add_argument(
+        "--deterministic-seed",
+        type=int,
+        default=None,
+        help="Use network-free DeterministicRaters seeded with this value instead of live vendors.",
+    )
+    sentinel_check.add_argument(
+        "--hard-trigger-crossings",
+        type=int,
+        default=None,
+        help="Override the hard-trigger crossing threshold; defaults to the stored protocol's "
+        "sentinel_policy, or the kernel default if no protocol is stored.",
+    )
+    sentinel_check.add_argument(
+        "--advisory-alpha-threshold",
+        type=float,
+        default=None,
+        help="Override the advisory alpha threshold; defaults as --hard-trigger-crossings does.",
+    )
+    sentinel_check.set_defaults(handler=_cmd_sentinel_check)
+
+    active_learning_select = subparsers.add_parser(
+        "active-learning-select",
+        help="Select stored votes for active-learning review and persist their provenance.",
+    )
+    active_learning_select.add_argument(
+        "--run-dir", required=True, help="Run directory to read/write."
+    )
+    active_learning_select.add_argument("--dispersion-threshold", type=float, default=0.0)
+    active_learning_select.add_argument(
+        "--no-boundary", action="store_true", help="Disable the boundary-split selection signal."
+    )
+    active_learning_select.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=None,
+        help="Override config.json's confidence_threshold for this selection.",
+    )
+    active_learning_select.add_argument("--limit", type=int, default=None)
+    active_learning_select.set_defaults(handler=_cmd_active_learning_select)
+
+    active_learning_review = subparsers.add_parser(
+        "active-learning-review",
+        help="Record a human review of a previously selected active-learning record.",
+    )
+    active_learning_review.add_argument(
+        "--run-dir", required=True, help="Run directory to read/write."
+    )
+    active_learning_review.add_argument("--record-id", required=True)
+    active_learning_review.add_argument("--reviewer", required=True)
+    active_learning_review.add_argument("--protocol-id", default=None)
+    active_learning_review.add_argument("--notes", default=None)
+    active_learning_review.set_defaults(handler=_cmd_active_learning_review)
 
     return parser
 

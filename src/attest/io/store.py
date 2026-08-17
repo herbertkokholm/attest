@@ -37,13 +37,19 @@ from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE, Decision
 from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
-from attest.planes.adjudication import AdjudicationError, final_label
+from attest.planes.active_learning import ActiveLearningReview, ActiveLearningSelection
+from attest.planes.adjudication import AdjudicationError, AdjudicationItem, final_label
 from attest.planes.recall_audit import AuditRow, build_strata
 from attest.prefilter.framework import Prisma as PrefilterPrisma
+from attest.provenance.changelog import ChangeLog, ConfigChangeEvent
 from attest.provenance.config import Config as EnsembleConfig
 from attest.provenance.config import VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import Epoch
+from attest.provenance.manifest import IntegrityReport as ManifestIntegrityReport
+from attest.provenance.manifest import RunManifest, build_manifest, hash_file, verify_artifacts
+from attest.provenance.protocol import ValidationProtocol, compute_protocol_id
 from attest.provenance.runs import RunRecord
+from attest.provenance.sentinel import SentinelBaseline, SentinelEvaluation
 from attest.stats.agreement import agreement_report, pairwise_alpha
 from attest.stats.confusion import RELEVANT_LABEL
 from attest.stats.confusion import confusion_matrix as _confusion_matrix
@@ -60,6 +66,38 @@ BATCH_HANDLES_FILENAME = "batch_handles.json"
 RAW_RESPONSES_FILENAME = "raw_responses.json"
 TAU_REPORT_FILENAME = "tau_report.json"
 CONFIDENCE_POLICY_FILENAME = "confidence_policy.json"
+CHANGELOG_FILENAME = "changelog.json"
+PROTOCOL_FILENAME = "protocol.json"
+MANIFEST_FILENAME = "manifest.json"
+AUDIT_DRAW_FILENAME = "audit_draw.json"
+AUDIT_LABELS_FILENAME = "audit_labels.json"
+VALIDATION_RECORD_FILENAME = "validation_record.json"
+SENTINEL_BASELINE_FILENAME = "sentinel_baseline.json"
+SENTINEL_EVALUATIONS_FILENAME = "sentinel_evaluations.json"
+ADJUDICATION_RECORDS_FILENAME = "adjudication_records.json"
+ACTIVE_LEARNING_SELECTIONS_FILENAME = "active_learning_selections.json"
+ACTIVE_LEARNING_REVIEWS_FILENAME = "active_learning_reviews.json"
+
+# The artifact set `attest manifest`/`attest verify` hash for offline
+# integrity verification (see attest.provenance.manifest). Deliberately not
+# every file `RunStore` can produce -- batch_handles.json and
+# confidence_policy.json are execution-strategy/policy plumbing, not one of
+# the manuscript's named artifact categories -- but every category task 4
+# names: config, protocol descriptor, input (hashed separately, see
+# RunManifest.input_hash), votes, raw responses, decisions, epoch,
+# changelog, audit draw, audit labels, and the validation record.
+MANIFEST_ARTIFACTS = (
+    CONFIG_FILENAME,
+    PROTOCOL_FILENAME,
+    VOTES_FILENAME,
+    RAW_RESPONSES_FILENAME,
+    DECISIONS_FILENAME,
+    EPOCH_FILENAME,
+    CHANGELOG_FILENAME,
+    AUDIT_DRAW_FILENAME,
+    AUDIT_LABELS_FILENAME,
+    VALIDATION_RECORD_FILENAME,
+)
 
 
 class StoreError(ValueError):
@@ -470,6 +508,353 @@ class RunStore:
         payload: dict[str, Any] | None = _read_json(self.root / CONFIDENCE_POLICY_FILENAME)
         return payload
 
+    # --- changelog: append-only run artifact ------------------------------
+
+    def write_changelog(self, changelog: ChangeLog) -> None:
+        """Persist an append-only changelog, refusing to rewrite already-stored history.
+
+        A stored changelog may only be *extended*: every previously written
+        event must appear, unchanged, as a prefix of `changelog.events`.
+        This is the mechanical enforcement of "append-only" -- once an event
+        is on disk, it is permanent provenance, not an editable log line.
+
+        Args:
+            changelog: The changelog to persist; must extend (or equal) what
+                is already stored.
+
+        Raises:
+            StoreError: If `changelog` would shrink or rewrite previously
+                stored history.
+        """
+        existing_events = self.read_changelog().events
+        new_events = list(changelog.events)
+        if (
+            len(new_events) < len(existing_events)
+            or new_events[: len(existing_events)] != existing_events
+        ):
+            raise StoreError(
+                f"changelog in run directory '{self.root}' is append-only; the given "
+                "changelog does not extend the previously stored history"
+            )
+        _write_json(self.root / CHANGELOG_FILENAME, [e.to_dict() for e in new_events])
+
+    def read_changelog(self) -> ChangeLog:
+        """Read the changelog stored for this run directory, empty if never written."""
+        raw: list[dict[str, Any]] = _read_json(self.root / CHANGELOG_FILENAME) or []
+        return ChangeLog.from_list(raw)
+
+    def append_change_event(self, event: ConfigChangeEvent) -> ChangeLog:
+        """Append one change event to this run directory's persisted changelog.
+
+        Args:
+            event: The change event to append.
+
+        Returns:
+            The changelog after appending, as persisted.
+        """
+        changelog = self.read_changelog()
+        changelog.events.append(event)
+        self.write_changelog(changelog)
+        return changelog
+
+    # --- validation protocol -----------------------------------------------
+
+    def write_protocol(self, protocol: ValidationProtocol) -> str:
+        """Persist the validation protocol in force for this run directory.
+
+        Unlike `write_config`, a run directory is not locked to one protocol
+        forever: the audit design, adjudication protocol, sentinel
+        thresholds, and reporting spec are pure analysis-plan choices (see
+        `attest.provenance.protocol`'s module docstring) that may legitimately
+        be revised without opening a new epoch. Each call simply overwrites
+        the stored protocol.
+
+        Args:
+            protocol: The validation protocol to persist.
+
+        Returns:
+            The content-derived `protocol_id` of `protocol`.
+        """
+        protocol_id = compute_protocol_id(protocol)
+        payload = protocol.to_dict()
+        payload["protocol_id"] = protocol_id
+        _write_json(self.root / PROTOCOL_FILENAME, payload)
+        return protocol_id
+
+    def read_protocol(self) -> ValidationProtocol | None:
+        """Read the validation protocol stored for this run directory, or None if never written."""
+        payload = _read_json(self.root / PROTOCOL_FILENAME)
+        if payload is None:
+            return None
+        return ValidationProtocol.from_dict(payload)
+
+    def read_protocol_id(self) -> str | None:
+        """Read the stored protocol's content-derived id, or None if never written."""
+        payload = _read_json(self.root / PROTOCOL_FILENAME)
+        if payload is None:
+            return None
+        protocol_id: str | None = payload.get("protocol_id")
+        return protocol_id
+
+    # --- audit draw/labels: immutable snapshots for manifest integrity -----
+
+    def write_audit_draw(self, ensemble_config_id: str, rows: Sequence[AuditRow]) -> None:
+        """Upsert the drawn (pre-label) recall-audit rows into `audit_draw.json`.
+
+        A snapshot distinct from `audit.json` (which `assemble_validation_record`
+        reads and which `audit-apply` later upserts labels into): this file
+        exists so the manifest can hash "what was drawn" and "what was
+        labeled" (`write_audit_labels`) as two separately verifiable
+        artifacts, matching the manuscript's own artifact list, without
+        changing `audit.json`'s existing combined read path.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn under.
+            rows: The freshly drawn (unlabeled) rows.
+        """
+        items = {row.record_id: row.stratum for row in rows}
+        self._write_stamped(AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items)
+
+    def read_audit_draw(self) -> dict[str, str]:
+        """Read the stored audit-draw snapshot, mapping record id to stratum."""
+        _ensemble_config_id, items = self._read_stamped(AUDIT_DRAW_FILENAME, "drawn")
+        return {record_id: stratum for record_id, stratum in items.items()}
+
+    def write_audit_labels(self, ensemble_config_id: str, labels: Mapping[str, int]) -> None:
+        """Upsert applied human gold-check labels into `audit_labels.json`.
+
+        Args:
+            ensemble_config_id: Configuration id in force when these labels
+                were applied.
+            labels: Mapping of record id to the human ordinal audit label
+                actually applied by `audit-apply`.
+        """
+        self._write_stamped(AUDIT_LABELS_FILENAME, "labels", ensemble_config_id, dict(labels))
+
+    def read_audit_labels(self) -> dict[str, int]:
+        """Read the stored audit-labels snapshot, mapping record id to human label."""
+        _ensemble_config_id, items = self._read_stamped(AUDIT_LABELS_FILENAME, "labels")
+        return {record_id: int(label) for record_id, label in items.items()}
+
+    # --- validation record snapshot -----------------------------------------
+
+    def write_validation_record_snapshot(self, payload: Mapping[str, Any]) -> None:
+        """Persist a copy of the assembled validation record inside the run directory.
+
+        `attest validate --out PATH` may write its human-facing copy
+        anywhere (e.g. a paper repo's `results/`); this snapshot is the
+        run-directory-local copy the manifest hashes as the "validation
+        record" artifact, so integrity verification does not depend on
+        wherever `--out` happened to point.
+        """
+        _write_json(self.root / VALIDATION_RECORD_FILENAME, dict(payload))
+
+    def read_validation_record_snapshot(self) -> dict[str, Any] | None:
+        """Read the stored validation-record snapshot, or None if never written."""
+        payload: dict[str, Any] | None = _read_json(self.root / VALIDATION_RECORD_FILENAME)
+        return payload
+
+    # --- sentinel drift ------------------------------------------------------
+
+    def write_sentinel_baseline(self, baseline: SentinelBaseline) -> None:
+        """Persist the frozen sentinel set's baseline ratings for this run directory.
+
+        Raises:
+            StoreError: If a baseline for a *different* sentinel set is
+                already stored -- a run directory's sentinel baseline is
+                pinned to one frozen set, like `write_config` pins one
+                ensemble configuration.
+        """
+        existing = _read_json(self.root / SENTINEL_BASELINE_FILENAME)
+        if existing is not None and existing.get("sentinel_set_id") != baseline.sentinel_set_id:
+            raise StoreError(
+                f"run directory '{self.root}' already holds a sentinel baseline for a "
+                f"different sentinel set (existing '{existing.get('sentinel_set_id')}', new "
+                f"'{baseline.sentinel_set_id}')"
+            )
+        _write_json(self.root / SENTINEL_BASELINE_FILENAME, baseline.to_dict())
+
+    def read_sentinel_baseline(self) -> SentinelBaseline | None:
+        """Read the stored sentinel baseline, or None if never written."""
+        payload = _read_json(self.root / SENTINEL_BASELINE_FILENAME)
+        if payload is None:
+            return None
+        return SentinelBaseline.from_dict(payload)
+
+    def write_sentinel_evaluation(self, evaluation: SentinelEvaluation) -> None:
+        """Append one sentinel evaluation to this run directory's evaluation history.
+
+        Every check is appended, not upserted -- the sentinel is run
+        periodically against the same baseline, and the full history of
+        readings (not just the latest) is itself provenance.
+        """
+        raw: list[dict[str, Any]] = _read_json(self.root / SENTINEL_EVALUATIONS_FILENAME) or []
+        raw.append(evaluation.to_dict())
+        _write_json(self.root / SENTINEL_EVALUATIONS_FILENAME, raw)
+
+    def read_sentinel_evaluations(self) -> list[SentinelEvaluation]:
+        """Read every stored sentinel evaluation, oldest first."""
+        raw: list[dict[str, Any]] = _read_json(self.root / SENTINEL_EVALUATIONS_FILENAME) or []
+        return [SentinelEvaluation.from_dict(e) for e in raw]
+
+    # --- adjudication and active-learning provenance --------------------------
+
+    def write_adjudication_record(self, item: AdjudicationItem) -> None:
+        """Upsert one adjudication item's reviewer/selection provenance, keyed by record id.
+
+        Distinct from `write_decisions` (the authoritative final label used
+        downstream by `assemble_validation_record`): this file exists purely
+        for the auditable reviewer trail -- who resolved this escalation,
+        when, under which protocol, and why it escalated in the first place.
+        """
+        raw: dict[str, Any] = _read_json(self.root / ADJUDICATION_RECORDS_FILENAME) or {}
+        raw[item.record_id] = {
+            "record_id": item.record_id,
+            "ensemble_config_id": item.ensemble_config_id,
+            "dispersion": item.dispersion,
+            "boundary": item.boundary,
+            "selection_reason": item.selection_reason,
+            "human_label": item.human_label,
+            "reviewer": item.reviewer,
+            "resolved_at": item.resolved_at.isoformat() if item.resolved_at is not None else None,
+            "protocol_id": item.protocol_id,
+        }
+        _write_json(self.root / ADJUDICATION_RECORDS_FILENAME, raw)
+
+    def read_adjudication_records(self) -> dict[str, dict[str, Any]]:
+        """Read every stored adjudication provenance record, keyed by record id."""
+        return _read_json(self.root / ADJUDICATION_RECORDS_FILENAME) or {}
+
+    def write_active_learning_selections(
+        self, ensemble_config_id: str, selections: Sequence[ActiveLearningSelection]
+    ) -> None:
+        """Upsert active-learning selections' provenance, keyed by record id."""
+        items = {
+            s.record_id: {
+                "dispersion": s.dispersion,
+                "boundary": s.boundary,
+                "selection_reason": list(s.selection_reason),
+                "confidence_scored": s.confidence.scored,
+                "confidence_median_probability": s.confidence.median_probability,
+            }
+            for s in selections
+        }
+        self._write_stamped(
+            ACTIVE_LEARNING_SELECTIONS_FILENAME, "selections", ensemble_config_id, items
+        )
+
+    def read_active_learning_selections(self) -> dict[str, dict[str, Any]]:
+        """Read stored active-learning selection provenance, keyed by record id."""
+        _ensemble_config_id, items = self._read_stamped(
+            ACTIVE_LEARNING_SELECTIONS_FILENAME, "selections"
+        )
+        return items
+
+    def write_active_learning_review(self, review: ActiveLearningReview) -> None:
+        """Append one human review of an active-learning selection, keyed by record id.
+
+        Appended, not upserted: the same selection may legitimately be
+        reviewed more than once over a project's lifetime (e.g. a second
+        pass after a prompt change), and each review is its own provenance
+        record.
+        """
+        raw: list[dict[str, Any]] = _read_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME) or []
+        raw.append(
+            {
+                "record_id": review.record_id,
+                "ensemble_config_id": review.ensemble_config_id,
+                "selection_reason": list(review.selection_reason),
+                "reviewer": review.reviewer,
+                "reviewed_at": review.reviewed_at.isoformat(),
+                "protocol_id": review.protocol_id,
+                "notes": review.notes,
+            }
+        )
+        _write_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME, raw)
+
+    def read_active_learning_reviews(self) -> list[dict[str, Any]]:
+        """Read every stored active-learning review, oldest first."""
+        return _read_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME) or []
+
+    # --- run manifest and offline integrity verification -----------------------
+
+    def write_manifest(
+        self,
+        *,
+        ensemble_config_id: str,
+        protocol_id: str | None = None,
+        input_hash: str | None = None,
+        input_source: str | None = None,
+        seeds: Mapping[str, int] | None = None,
+    ) -> RunManifest:
+        """Build and persist a `RunManifest` hashing this run directory's current artifacts.
+
+        Hashes exactly the artifact set named in `MANIFEST_ARTIFACTS` (see
+        that constant's docstring for why), skipping any not yet produced.
+        Overwrites any previously stored manifest -- like `tau_report.json`,
+        there is exactly one current manifest per run directory, describing
+        the artifacts as they stand right now.
+
+        Args:
+            ensemble_config_id: The screening configuration this run executed under.
+            protocol_id: The validation protocol this run executed under, if any.
+            input_hash: SHA-256 hex digest of the input file screened.
+            input_source: Free-text/path identifying the input file.
+            seeds: Named random seeds used by this run.
+
+        Returns:
+            The freshly built and persisted `RunManifest`.
+        """
+        manifest = build_manifest(
+            root=self.root,
+            artifact_filenames=MANIFEST_ARTIFACTS,
+            ensemble_config_id=ensemble_config_id,
+            protocol_id=protocol_id,
+            input_hash=input_hash,
+            input_source=input_source,
+            seeds=seeds,
+        )
+        _write_json(self.root / MANIFEST_FILENAME, manifest.to_dict())
+        return manifest
+
+    def read_manifest(self) -> RunManifest | None:
+        """Read the stored manifest, or None if `write_manifest` was never called."""
+        payload = _read_json(self.root / MANIFEST_FILENAME)
+        if payload is None:
+            return None
+        return RunManifest.from_dict(payload)
+
+    def verify(self) -> ManifestIntegrityReport:
+        """Offline-verify this run directory's artifacts against its stored manifest.
+
+        Returns:
+            An `attest.provenance.manifest.IntegrityReport`: `ok=True` iff
+            every artifact the manifest recorded a hash for is present and
+            byte-identical to when the manifest was built.
+
+        Raises:
+            StoreError: If no manifest has been written for this run directory.
+        """
+        manifest = self.read_manifest()
+        if manifest is None:
+            raise StoreError(
+                f"run directory '{self.root}' has no stored manifest to verify against"
+            )
+        return verify_artifacts(self.root, manifest)
+
+
+def hash_input_file(path: str | Path) -> str | None:
+    """Return the SHA-256 hex digest of an input-contract file's raw bytes, for manifest provenance.
+
+    Hashes the file the caller loaded (e.g. via `load_input`) without
+    duplicating its (potentially large) content into the run directory --
+    only the hash is recorded (see `attest.provenance.manifest.RunManifest.input_hash`).
+
+    Returns:
+        The digest, or None if `path` does not exist.
+    """
+    return hash_file(Path(path))
+
 
 def _final_labels(
     decisions: Mapping[str, Decision], human_labels: Mapping[str, int]
@@ -595,17 +980,31 @@ def assemble_validation_record(
 
 
 __all__ = [
-    "CONFIG_FILENAME",
+    "ACTIVE_LEARNING_REVIEWS_FILENAME",
+    "ACTIVE_LEARNING_SELECTIONS_FILENAME",
+    "ADJUDICATION_RECORDS_FILENAME",
+    "AUDIT_DRAW_FILENAME",
     "AUDIT_FILENAME",
+    "AUDIT_LABELS_FILENAME",
     "BATCH_HANDLES_FILENAME",
+    "CHANGELOG_FILENAME",
+    "CONFIDENCE_POLICY_FILENAME",
+    "CONFIG_FILENAME",
     "DECISIONS_FILENAME",
     "EPOCH_FILENAME",
+    "MANIFEST_ARTIFACTS",
+    "MANIFEST_FILENAME",
+    "PROTOCOL_FILENAME",
     "RAW_RESPONSES_FILENAME",
     "RUNS_FILENAME",
+    "SENTINEL_BASELINE_FILENAME",
+    "SENTINEL_EVALUATIONS_FILENAME",
     "TAU_REPORT_FILENAME",
+    "VALIDATION_RECORD_FILENAME",
     "VOTES_FILENAME",
     "RunStore",
     "StoreError",
     "assemble_validation_record",
+    "hash_input_file",
     "load_input",
 ]
