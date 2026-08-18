@@ -405,6 +405,17 @@ def test_assemble_validation_record_end_to_end(tmp_path: Path) -> None:
     assert record.recall.audit_n == 1
     assert record.unresolved_escalations == 0
 
+    # Every vendor voted unanimously and correctly on both relevant records
+    # (rel-1, rel-2), so every pair's error indicators have zero variance --
+    # correlation is undefined for all three pairs. Before this was fixed,
+    # an undefined pair was silently dropped from the record entirely; now
+    # every pair is still present, with its joint counts standing in.
+    correlations = record.error_correlation.pairwise_fn_on_relevant
+    assert set(correlations) == {"v1|v2", "v1|v3", "v2|v3"}
+    for pair in correlations.values():
+        assert pair.correlation is None
+        assert (pair.n, pair.both, pair.only_a, pair.only_b, pair.neither) == (2, 0, 0, 0, 2)
+
 
 def test_assemble_validation_record_fails_closed_on_unresolved_escalation(tmp_path: Path) -> None:
     records = [

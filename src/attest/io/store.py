@@ -28,6 +28,7 @@ from attest.contracts.input import NormalizedInput, validate_and_normalize
 from attest.contracts.validation_record import (
     Agreement,
     ErrorCorrelation,
+    PairwiseFnCorrelation,
     Recall,
     ValidationRecord,
 )
@@ -1025,9 +1026,15 @@ def assemble_validation_record(
     correlations = pairwise_fn_correlation(predictions_by_vendor, ordered_truths)
     record.error_correlation = ErrorCorrelation(
         pairwise_fn_on_relevant={
-            key: result.correlation
+            key: PairwiseFnCorrelation(
+                correlation=result.correlation,
+                n=result.n,
+                both=result.both,
+                only_a=result.only_a,
+                only_b=result.only_b,
+                neither=result.neither,
+            )
             for key, result in correlations.items()
-            if result.correlation is not None
         }
     )
 

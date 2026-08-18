@@ -1,4 +1,4 @@
-"""Validation-record contract v1.2: one self-validation record per stable ensemble epoch.
+"""Validation-record contract v1.3: one self-validation record per stable ensemble epoch.
 
 This is a stable, versioned interface. Changing the shape produced here
 requires a version bump to ``SCHEMA_VERSION``, not an in-place edit. v1.1
@@ -7,7 +7,14 @@ unknown fields see no other change). v1.2 added ``unresolved_escalations``
 (additive): the count of escalated decisions omitted from ``confusion``,
 ``recall``, and ``prisma`` because they had no resolved human label when
 this record was assembled -- always 0 unless the caller explicitly opted
-into `assemble_validation_record`'s `allow_unresolved_escalations`.
+into `assemble_validation_record`'s `allow_unresolved_escalations`. v1.3
+changes (not additive) ``error_correlation.pairwise_fn_on_relevant``'s
+per-pair value from a bare float to an object (``correlation``, ``n``,
+``both``, ``only_a``, ``only_b``, ``neither``): a consumer reading last
+version's bare number needs updating. This also stops omitting a pair
+whose correlation is undefined -- every vendor pair present in the run is
+now reported, with `n`/joint counts standing in when `correlation` is
+`None`, rather than that pair silently disappearing.
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -26,7 +33,7 @@ from typing import Any
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
 
 
 @dataclass
@@ -85,21 +92,65 @@ class Agreement:
         return {"krippendorff_alpha": self.krippendorff_alpha, "pairwise": dict(self.pairwise)}
 
 
+@dataclass(frozen=True)
+class PairwiseFnCorrelation:
+    """One vendor pair's conditional false-negative correlation, with its joint counts.
+
+    Attributes:
+        correlation: Pearson correlation coefficient of the two vendors'
+            false-negative indicators, or `None` if undefined (fewer than
+            two relevant records, or one vendor made either no false
+            negatives or false-negatived on every relevant record in this
+            stratum) -- never coerced to 0.0.
+        n: Number of gold-relevant records this pair's correlation was
+            computed over.
+        both: Records where both vendors produced a false negative.
+        only_a: Records where only the first-named vendor did.
+        only_b: Records where only the second-named vendor did.
+        neither: Records where neither vendor did.
+    """
+
+    correlation: float | None
+    n: int
+    both: int
+    only_a: int
+    only_b: int
+    neither: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return this pair's correlation summary as a plain dict."""
+        return {
+            "correlation": self.correlation,
+            "n": self.n,
+            "both": self.both,
+            "only_a": self.only_a,
+            "only_b": self.only_b,
+            "neither": self.neither,
+        }
+
+
 @dataclass
 class ErrorCorrelation:
     """Correlation of ensemble member errors on the relevant class.
 
     Attributes:
-        pairwise_fn_on_relevant: Mapping of "vendorA|vendorB" to the
-            correlation of false negatives between the two members, computed
-            over records that are actually relevant (gold include).
+        pairwise_fn_on_relevant: Mapping of "vendorA|vendorB" to that pair's
+            `PairwiseFnCorrelation`, computed over records that are
+            actually relevant (gold include). Every vendor pair present in
+            the run is included, even when `correlation` is `None`: a
+            sparse stratum's undefined correlation is reported with its
+            `n` and joint counts rather than silently omitted.
     """
 
-    pairwise_fn_on_relevant: dict[str, float] = field(default_factory=dict)
+    pairwise_fn_on_relevant: dict[str, PairwiseFnCorrelation] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return this error-correlation summary as a plain dict."""
-        return {"pairwise_fn_on_relevant": dict(self.pairwise_fn_on_relevant)}
+        return {
+            "pairwise_fn_on_relevant": {
+                key: result.to_dict() for key, result in self.pairwise_fn_on_relevant.items()
+            }
+        }
 
 
 @dataclass

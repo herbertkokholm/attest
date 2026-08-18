@@ -244,12 +244,23 @@ def test_error_correlation_zero_variance_is_undefined_not_zero() -> None:
 
     assert result.correlation is None
     assert result.n == 3
+    # Joint counts remain well-defined even though correlation is not:
+    # record 1 and 3 are joint errors, record 2 is only-A.
+    assert (result.both, result.only_a, result.only_b, result.neither) == (2, 1, 0, 0)
 
 
 def test_error_correlation_fewer_than_two_records_is_undefined() -> None:
     result = error_correlation([True], [False])
 
     assert result.correlation is None
+    assert (result.both, result.only_a, result.only_b, result.neither) == (0, 1, 0, 0)
+
+
+def test_error_correlation_joint_counts_sum_to_n() -> None:
+    result = error_correlation([True, False, True, False, True], [True, True, False, False, False])
+
+    assert result.both + result.only_a + result.only_b + result.neither == result.n
+    assert (result.both, result.only_a, result.only_b, result.neither) == (1, 2, 1, 1)
 
 
 def test_pairwise_fn_correlation_covers_all_vendor_pairs() -> None:
