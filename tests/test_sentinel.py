@@ -19,7 +19,9 @@ from attest.provenance.changelog import CHANGE_TYPE_SENTINEL_DRIFT
 from attest.provenance.config import Config, VendorSpec
 from attest.provenance.sentinel import (
     SentinelError,
+    SentinelEvaluation,
     capture_baseline,
+    check_sentinel_staleness,
     collect_sentinel_votes,
     compute_sentinel_set_id,
     evaluate_sentinel,
@@ -248,6 +250,62 @@ def test_sentinel_evaluation_round_trips_through_dict() -> None:
 
 
 # --- open_epoch_for_hard_trigger: epoch + changelog event wiring ----------------
+
+
+def _evaluation_at(when: datetime) -> SentinelEvaluation:
+    records = _sentinel_records()
+    sentinel_set_id, baseline_votes = _capture(records, _BASELINE_RATINGS)
+    baseline = capture_baseline(sentinel_set_id, "cfg-1", "epoch-1", baseline_votes)
+    _current_id, current_votes = _capture(records, _BASELINE_RATINGS)
+    return evaluate_sentinel(baseline, current_votes, evaluated_at=when)
+
+
+# --- check_sentinel_staleness ---------------------------------------------------
+
+
+def test_staleness_not_stale_within_cadence() -> None:
+    evaluation = _evaluation_at(datetime(2026, 1, 1, tzinfo=UTC))
+
+    result = check_sentinel_staleness(
+        [evaluation], max_staleness_days=7, as_of=datetime(2026, 1, 3, tzinfo=UTC)
+    )
+
+    assert result.stale is False
+    assert result.last_checked_at == datetime(2026, 1, 1, tzinfo=UTC)
+    assert result.staleness_days == pytest.approx(2.0)
+
+
+def test_staleness_stale_beyond_cadence() -> None:
+    evaluation = _evaluation_at(datetime(2026, 1, 1, tzinfo=UTC))
+
+    result = check_sentinel_staleness(
+        [evaluation], max_staleness_days=7, as_of=datetime(2026, 1, 10, tzinfo=UTC)
+    )
+
+    assert result.stale is True
+    assert result.staleness_days == pytest.approx(9.0)
+
+
+def test_staleness_stale_when_never_checked() -> None:
+    result = check_sentinel_staleness(
+        [], max_staleness_days=7, as_of=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+    assert result.stale is True
+    assert result.last_checked_at is None
+    assert result.staleness_days is None
+
+
+def test_staleness_uses_the_most_recent_of_several_evaluations() -> None:
+    older = _evaluation_at(datetime(2025, 1, 1, tzinfo=UTC))
+    newer = _evaluation_at(datetime(2026, 1, 1, tzinfo=UTC))
+
+    result = check_sentinel_staleness(
+        [older, newer], max_staleness_days=7, as_of=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+
+    assert result.last_checked_at == datetime(2026, 1, 1, tzinfo=UTC)
+    assert result.stale is False
 
 
 def test_open_epoch_for_hard_trigger_requires_a_triggered_evaluation() -> None:

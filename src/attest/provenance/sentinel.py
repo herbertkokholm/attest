@@ -451,14 +451,81 @@ def open_epoch_for_hard_trigger(
     return new_epoch, event
 
 
+@dataclass(frozen=True)
+class SentinelStaleness:
+    """Whether the most recent sentinel evaluation is within an allowed check cadence.
+
+    A periodic sentinel check is specified as an *external* responsibility
+    (see the module docstring and `docs/sentinel_drift_rule.md`) -- this
+    kernel never itself schedules or polls one. What it can do is refuse to
+    pretend a check is current when it manifestly is not: this is a pure
+    comparison of already-recorded evaluation timestamps against a caller-
+    supplied cadence, not a scheduler.
+
+    Attributes:
+        last_checked_at: `evaluated_at` of the most recent recorded sentinel
+            evaluation, or `None` if none has ever been recorded.
+        as_of: The timestamp staleness was computed relative to.
+        max_staleness_days: The configured cadence being checked against.
+        stale: True if `last_checked_at` is `None` (no check ever recorded),
+            or older than `max_staleness_days` relative to `as_of`.
+    """
+
+    last_checked_at: datetime | None
+    as_of: datetime
+    max_staleness_days: float
+    stale: bool
+
+    @property
+    def staleness_days(self) -> float | None:
+        """Days since the last sentinel check, or `None` if one never ran."""
+        if self.last_checked_at is None:
+            return None
+        return (self.as_of - self.last_checked_at).total_seconds() / 86400.0
+
+
+def check_sentinel_staleness(
+    evaluations: Sequence[SentinelEvaluation],
+    *,
+    max_staleness_days: float,
+    as_of: datetime | None = None,
+) -> SentinelStaleness:
+    """Check whether the most recent sentinel evaluation is within `max_staleness_days`.
+
+    Args:
+        evaluations: This run's recorded sentinel evaluations, any order
+            (e.g. `attest.io.store.RunStore.read_sentinel_evaluations`).
+        max_staleness_days: Maximum age, in days, a sentinel check may be
+            before it counts as stale.
+        as_of: Timestamp to measure staleness relative to; defaults to now (UTC).
+
+    Returns:
+        A `SentinelStaleness` summarizing the result.
+    """
+    now = as_of or datetime.now(UTC)
+    last_checked_at = max((e.evaluated_at for e in evaluations), default=None)
+    stale = (
+        last_checked_at is None
+        or (now - last_checked_at).total_seconds() / 86400.0 > max_staleness_days
+    )
+    return SentinelStaleness(
+        last_checked_at=last_checked_at,
+        as_of=now,
+        max_staleness_days=max_staleness_days,
+        stale=stale,
+    )
+
+
 __all__ = [
     "DEFAULT_ADVISORY_ALPHA_THRESHOLD",
     "DEFAULT_HARD_TRIGGER_CROSSINGS",
     "SentinelBaseline",
     "SentinelError",
     "SentinelEvaluation",
+    "SentinelStaleness",
     "VendorSentinelResult",
     "capture_baseline",
+    "check_sentinel_staleness",
     "collect_sentinel_votes",
     "compute_sentinel_set_id",
     "evaluate_sentinel",

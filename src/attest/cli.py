@@ -90,6 +90,7 @@ from attest.provenance.sentinel import (
     DEFAULT_ADVISORY_ALPHA_THRESHOLD,
     DEFAULT_HARD_TRIGGER_CROSSINGS,
     capture_baseline,
+    check_sentinel_staleness,
     collect_sentinel_votes,
     compute_sentinel_set_id,
     evaluate_sentinel,
@@ -765,6 +766,34 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         # stratification actually used.
         payload["confidence_policy"] = confidence_policy
 
+    if args.max_staleness_days is not None:
+        staleness = check_sentinel_staleness(
+            store.read_sentinel_evaluations(), max_staleness_days=args.max_staleness_days
+        )
+        payload["sentinel_staleness"] = {
+            "last_checked_at": (
+                staleness.last_checked_at.isoformat()
+                if staleness.last_checked_at is not None
+                else None
+            ),
+            "staleness_days": staleness.staleness_days,
+            "max_staleness_days": staleness.max_staleness_days,
+            "stale": staleness.stale,
+        }
+        if staleness.stale:
+            detail = (
+                "no sentinel evaluation has ever been recorded for this run"
+                if staleness.last_checked_at is None
+                else f"the sentinel was last checked {staleness.staleness_days:.1f} day(s) ago"
+            )
+            message = (
+                f"sentinel staleness: {detail}, exceeding the configured max of "
+                f"{args.max_staleness_days} day(s) -- see 'attest sentinel-check'"
+            )
+            if args.fail_on_stale_sentinel:
+                raise CliError(message)
+            print(f"warning: {message}", file=sys.stderr)
+
     # Persist a run-directory-local copy so `attest manifest`/`verify` can
     # hash "the validation record" as an artifact regardless of wherever
     # --out (if any) pointed.
@@ -1270,6 +1299,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "them from the confusion matrix, PRISMA counts, and recall's TP (reported in the "
         "output's 'unresolved_escalations' field). Default: refuse to validate until every "
         "escalation is resolved.",
+    )
+    validate.add_argument(
+        "--max-staleness-days",
+        type=float,
+        default=None,
+        help="If given, check this run's most recent sentinel evaluation (see "
+        "'attest sentinel-check') against this cadence in days, reporting the result in the "
+        "output's 'sentinel_staleness' field. A stale or never-checked sentinel prints a "
+        "warning by default; pass --fail-on-stale-sentinel to make it a hard failure instead. "
+        "Omit for no check at all (default).",
+    )
+    validate.add_argument(
+        "--fail-on-stale-sentinel",
+        action="store_true",
+        help="With --max-staleness-days, refuse to validate (instead of warning) when the "
+        "sentinel is stale or was never checked.",
     )
     validate.add_argument(
         "--out", default=None, help="Path to write the validation record; defaults to stdout."

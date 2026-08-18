@@ -1631,6 +1631,192 @@ def test_sentinel_init_then_check_with_identical_seed_shows_no_drift(
     assert len(evaluations) == 1
 
 
+def test_validate_omits_sentinel_staleness_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert "sentinel_staleness" not in record
+
+
+def test_validate_warns_by_default_when_sentinel_never_checked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    record = json.loads(captured.out)
+    assert record["sentinel_staleness"] == {
+        "last_checked_at": None,
+        "staleness_days": None,
+        "max_staleness_days": 7.0,
+        "stale": True,
+    }
+    assert "sentinel staleness" in captured.err
+
+
+def test_validate_fails_on_stale_sentinel_when_requested(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+            "--fail-on-stale-sentinel",
+        ]
+    )
+    assert rc == 1
+    assert "sentinel staleness" in capsys.readouterr().err
+
+
+def test_validate_not_stale_after_a_fresh_sentinel_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    sentinel_input_path = tmp_path / "sentinel.json"
+    _write_sentinel_input(sentinel_input_path)
+    main(
+        [
+            "sentinel-init",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    capsys.readouterr()
+    main(
+        [
+            "sentinel-check",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+            "--fail-on-stale-sentinel",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["sentinel_staleness"]["stale"] is False
+    assert record["sentinel_staleness"]["last_checked_at"] is not None
+
+
 def test_sentinel_check_without_baseline_errors(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
