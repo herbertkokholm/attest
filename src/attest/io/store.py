@@ -1075,6 +1075,7 @@ def assemble_validation_record(
         record.recall = Recall(
             point=estimate.point,
             floor=estimate.floor,
+            exact_floor=estimate.exact_floor,
             ci=estimate.ci,
             audit_n=audit_n,
             audit_budget_note=f"{audit_n} of {audited_population} screen-excluded records audited",

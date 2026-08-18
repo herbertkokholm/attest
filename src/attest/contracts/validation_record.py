@@ -1,4 +1,4 @@
-"""Validation-record contract v1.3: one self-validation record per stable ensemble epoch.
+"""Validation-record contract v1.4: one self-validation record per stable ensemble epoch.
 
 This is a stable, versioned interface. Changing the shape produced here
 requires a version bump to ``SCHEMA_VERSION``, not an in-place edit. v1.1
@@ -14,7 +14,11 @@ per-pair value from a bare float to an object (``correlation``, ``n``,
 version's bare number needs updating. This also stops omitting a pair
 whose correlation is undefined -- every vendor pair present in the run is
 now reported, with `n`/joint counts standing in when `correlation` is
-`None`, rather than that pair silently disappearing.
+`None`, rather than that pair silently disappearing. v1.4 added
+``recall.exact_floor`` (additive): an exact, hypergeometric one-sided
+recall floor (see `attest.stats.recall.hypergeometric_upper_bound`),
+reported alongside `recall.floor`'s asymptotic rule-of-three/Wilson
+approximation as a genuine design-based alternative, `None` until audited.
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -33,7 +37,7 @@ from typing import Any
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.3"
+SCHEMA_VERSION = "1.4"
 
 
 @dataclass
@@ -163,7 +167,12 @@ class Recall:
 
     Attributes:
         point: Point estimate of recall, or None if not yet audited.
-        floor: Rule-of-three worst-case floor for recall, or None if not yet audited.
+        floor: Rule-of-three/Wilson worst-case floor for recall (an
+            asymptotic approximation), or None if not yet audited.
+        exact_floor: Exact, hypergeometric one-sided recall floor (see
+            `attest.stats.recall.hypergeometric_upper_bound`), or None if
+            not yet audited. A genuine finite-population design-based
+            bound, reported alongside `floor` rather than replacing it.
         ci: Optional confidence interval as (low, high).
         audit_n: Number of records drawn in the random recall audit.
         audit_budget_note: Free-text note on the audit sampling budget.
@@ -171,6 +180,7 @@ class Recall:
 
     point: float | None = None
     floor: float | None = None
+    exact_floor: float | None = None
     ci: tuple[float, float] | None = None
     audit_n: int = 0
     audit_budget_note: str = ""
@@ -180,6 +190,7 @@ class Recall:
         return {
             "point": self.point,
             "floor": self.floor,
+            "exact_floor": self.exact_floor,
             "ci": list(self.ci) if self.ci is not None else None,
             "audit_n": self.audit_n,
             "audit_budget_note": self.audit_budget_note,

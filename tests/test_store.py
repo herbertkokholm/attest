@@ -402,6 +402,8 @@ def test_assemble_validation_record_end_to_end(tmp_path: Path) -> None:
     assert record.recall.point is not None
     assert record.recall.floor is not None
     assert record.recall.floor <= record.recall.point
+    assert record.recall.exact_floor is not None
+    assert record.recall.exact_floor <= record.recall.point
     assert record.recall.audit_n == 1
     assert record.unresolved_escalations == 0
 

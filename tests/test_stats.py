@@ -27,8 +27,10 @@ from attest.stats.correlation import (
 from attest.stats.recall import (
     RecallError,
     Stratum,
+    exclusion_count_upper_bound,
     exclusion_error_rate,
     exclusion_error_rate_floor,
+    hypergeometric_upper_bound,
     recall_with_floor,
     stratified_recall,
     wilson_interval,
@@ -470,6 +472,103 @@ def test_floor_never_drops_below_point_estimate_with_fpc() -> None:
 
     for stratum in strata:
         assert exclusion_error_rate_floor(stratum) >= exclusion_error_rate(stratum)
+
+
+# --- hypergeometric_upper_bound: exact finite-population recall floor ---------
+
+
+def test_hypergeometric_upper_bound_satisfies_its_own_defining_condition() -> None:
+    from scipy import stats as scipy_stats
+
+    m, n, population, confidence = 2, 40, 400, 0.95
+    alpha = 1 - confidence
+
+    k = hypergeometric_upper_bound(m, n, population, confidence=confidence)
+
+    # K itself must still satisfy P(X<=m|K) >= alpha ...
+    assert scipy_stats.hypergeom.cdf(m, population, k, n) >= alpha
+    # ... and K+1 must not (K is the *largest* such value).
+    assert scipy_stats.hypergeom.cdf(m, population, k + 1, n) < alpha
+
+
+def test_hypergeometric_upper_bound_at_census_returns_m_exactly() -> None:
+    # n == population: the sample is the whole population, K is m with certainty.
+    assert hypergeometric_upper_bound(0, 500, 500) == 0
+    assert hypergeometric_upper_bound(17, 500, 500) == 17
+
+
+def test_hypergeometric_upper_bound_is_at_least_m() -> None:
+    assert hypergeometric_upper_bound(3, 40, 400) >= 3
+
+
+def test_hypergeometric_upper_bound_tightens_as_sampling_fraction_grows() -> None:
+    tiny_fraction = hypergeometric_upper_bound(2, 20, 200_000)
+    large_fraction = hypergeometric_upper_bound(2, 20, 22)
+
+    assert large_fraction < tiny_fraction
+
+
+def test_hypergeometric_upper_bound_rejects_invalid_inputs() -> None:
+    with pytest.raises(RecallError):
+        hypergeometric_upper_bound(5, 3, 100)  # m > n
+    with pytest.raises(RecallError):
+        hypergeometric_upper_bound(1, 100, 50)  # n > population
+    with pytest.raises(RecallError):
+        hypergeometric_upper_bound(1, 10, 100, confidence=1.0)
+
+
+def test_exclusion_count_upper_bound_wraps_stratum_fields() -> None:
+    stratum = Stratum(name="s", n=40, m=2, population=400)
+
+    assert exclusion_count_upper_bound(stratum) == hypergeometric_upper_bound(2, 40, 400)
+
+
+def test_exact_floor_single_stratum_uses_unadjusted_confidence() -> None:
+    stratum = Stratum(name="only", n=40, m=2, population=400)
+
+    estimate = stratified_recall([stratum], true_positives=100)
+    expected_k = exclusion_count_upper_bound(stratum, confidence=0.95)
+
+    assert estimate.estimated_fn_exact_floor == pytest.approx(expected_k)
+    assert estimate.exact_floor == pytest.approx(100 / (100 + expected_k))
+
+
+def test_exact_floor_bonferroni_adjusts_across_multiple_strata() -> None:
+    strata = [
+        Stratum(name="a", n=20, m=0, population=200),
+        Stratum(name="b", n=30, m=3, population=500),
+    ]
+
+    estimate = stratified_recall(strata, true_positives=100, confidence=0.95)
+
+    bonferroni_confidence = 1 - (1 - 0.95) / 2
+    expected_fn = sum(
+        exclusion_count_upper_bound(s, confidence=bonferroni_confidence) for s in strata
+    )
+    assert estimate.estimated_fn_exact_floor == pytest.approx(expected_fn)
+
+
+def test_exact_floor_never_exceeds_point_estimate() -> None:
+    strata = [
+        Stratum(name="census-zero", n=500, m=0, population=500),
+        Stratum(name="census-nonzero", n=500, m=17, population=500),
+        Stratum(name="tiny", n=20, m=2, population=200_000),
+        Stratum(name="large", n=20, m=2, population=22),
+        Stratum(name="mid", n=20, m=0, population=200),
+    ]
+
+    for stratum in strata:
+        estimate = stratified_recall([stratum], true_positives=100)
+        assert estimate.exact_floor <= estimate.point
+
+
+def test_exact_floor_at_census_matches_point_exactly() -> None:
+    stratum = Stratum(name="census", n=500, m=0, population=500)
+
+    estimate = stratified_recall([stratum], true_positives=100)
+
+    assert estimate.exact_floor == pytest.approx(1.0)
+    assert estimate.exact_floor == pytest.approx(estimate.point)
 
 
 # --- confusion.py -------------------------------------------------------------

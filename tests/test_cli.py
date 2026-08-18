@@ -132,7 +132,7 @@ def test_end_to_end_screen_audit_validate(
     assert validate_rc == 0
     record = json.loads(capsys.readouterr().out)
 
-    assert record["schema_version"] == "1.3"
+    assert record["schema_version"] == "1.4"
     assert record["config"]["zero_policy"] == "escalate"
     assert record["prisma"]["identified"] == 6
     assert record["prisma"]["duplicates_removed"] == 1
@@ -146,6 +146,8 @@ def test_end_to_end_screen_audit_validate(
     assert record["recall"]["point"] is not None
     assert record["recall"]["floor"] is not None
     assert record["recall"]["floor"] <= record["recall"]["point"]
+    assert record["recall"]["exact_floor"] is not None
+    assert record["recall"]["exact_floor"] <= record["recall"]["point"]
     assert record["recall"]["audit_n"] == 2
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
@@ -671,7 +673,7 @@ def test_validate_surfaces_the_tau_report_as_provenance(
     # The tau_report addition is CLI-output-only, not a validation-record
     # schema change; schema_version here reflects workstream C's
     # zero_policy field on Config instead.
-    assert record["schema_version"] == "1.3"
+    assert record["schema_version"] == "1.4"
 
 
 def test_screen_batch_mode_then_batch_fetch_matches_sync(

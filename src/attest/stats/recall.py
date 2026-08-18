@@ -60,6 +60,22 @@ anti-conservative below the tiny-fraction regime it was already used in,
 and it agrees with the exact bound at both endpoints (tiny fraction and
 census).
 
+Because that approximation is only ever anti-conservative in a specific,
+bounded regime rather than provably valid everywhere, this module also
+computes an exact, design-based alternative: `exclusion_count_upper_bound`
+finds the one-sided hypergeometric upper confidence limit on K_h directly
+(the population count of missed-relevant records in stratum h), rather
+than bounding a rate and rescaling it. This requires no separate
+finite-population correction -- the hypergeometric distribution *is* the
+exact finite-population sampling distribution -- and it collapses to
+`m_h` exactly at a census, matching the heuristic floor's boundary
+behavior with a provable bound rather than an approximation everywhere in
+between. `stratified_recall`'s `exact_floor` combines these across strata
+at Bonferroni-adjusted per-stratum confidence (dividing `1 - confidence`
+by the stratum count), the standard simultaneous-coverage correction for
+reporting several one-sided bounds together; with one stratum this
+reduces to the unadjusted per-stratum bound.
+
 `scipy` is imported locally within functions so that `contracts`,
 `prefilter`, `ensemble`, and `provenance` remain importable without it
 installed.
@@ -126,6 +142,15 @@ class RecallEstimate:
         true_positives: TP used in both `point` and `floor`.
         estimated_fn: Point estimate of sum_h FN_h.
         estimated_fn_floor: Conservative estimate of sum_h FN_h underlying `floor`.
+        exact_floor: TP / (TP + sum_h K_h_upper), substituting each
+            stratum's exact one-sided hypergeometric upper confidence bound
+            on missed-relevant count (see `exclusion_count_upper_bound`),
+            combined at Bonferroni-adjusted per-stratum confidence. A
+            genuine design-based bound rather than `floor`'s asymptotic
+            approximation -- always <= `point`, but not guaranteed to sit
+            on either side of `floor`.
+        estimated_fn_exact_floor: Sum of each stratum's exact K_h upper
+            bound underlying `exact_floor`.
     """
 
     point: float
@@ -134,6 +159,8 @@ class RecallEstimate:
     true_positives: int
     estimated_fn: float
     estimated_fn_floor: float
+    exact_floor: float
+    estimated_fn_exact_floor: float
 
 
 def wilson_interval(successes: int, n: int, confidence: float = 0.95) -> tuple[float, float]:
@@ -219,6 +246,87 @@ def exclusion_error_rate_floor(stratum: Stratum, confidence: float = 0.95) -> fl
     return min(1.0, point + (infinite_floor - point) * fpc)
 
 
+def hypergeometric_upper_bound(m: int, n: int, population: int, confidence: float = 0.95) -> int:
+    """Exact one-sided upper confidence bound on a finite population's total relevant-count K.
+
+    Given `m` relevant records found in a simple random sample of `n` drawn
+    without replacement from a population of size `population`, returns the
+    largest integer K in `[m, population]` such that
+
+        P(X <= m | X ~ Hypergeometric(population, K, n)) >= 1 - confidence
+
+    -- the finite-population, exact analog of a one-sided Clopper-Pearson
+    upper bound: for any true population count above the returned K, seeing
+    this few or fewer relevant records in the sample would have been rarer
+    than `1 - confidence`. `P(X <= m | K)` is non-increasing in K (more
+    relevant records in the population makes seeing few in the sample less
+    likely), which is what makes the returned K well-defined and the binary
+    search below correct.
+
+    At `n == population` (a full census), this returns exactly `m`: sampling
+    the whole population leaves no uncertainty about K, and this bound
+    correctly reflects that with no separate finite-population correction
+    needed -- the hypergeometric distribution already models the finite
+    population directly.
+
+    Args:
+        m: Number of relevant records found in the sample (m_h).
+        n: Sample size (n_h).
+        population: Total population size the sample was drawn from (|U_h|).
+        confidence: One-sided confidence level, in (0, 1). Defaults to 0.95.
+
+    Returns:
+        The exact upper confidence bound on K, as an integer count.
+
+    Raises:
+        RecallError: If `0 <= m <= n <= population` does not hold, or
+            `confidence` is not strictly between 0 and 1.
+    """
+    if not (0 <= m <= n <= population):
+        raise RecallError(
+            f"require 0 <= m <= n <= population, got m={m}, n={n}, population={population}"
+        )
+    if not (0.0 < confidence < 1.0):
+        raise RecallError(f"confidence must be strictly between 0 and 1, got {confidence}")
+
+    from scipy import stats as scipy_stats
+
+    alpha = 1 - confidence
+
+    def survives(k: int) -> bool:
+        return bool(scipy_stats.hypergeom.cdf(m, population, k, n) >= alpha)
+
+    lo, hi = m, population
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if survives(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def exclusion_count_upper_bound(stratum: Stratum, confidence: float = 0.95) -> int:
+    """Exact one-sided upper confidence bound on K_h, the total missed-relevant count in a stratum.
+
+    Thin wrapper over `hypergeometric_upper_bound` for a `Stratum`'s own
+    fields. Unlike `exclusion_error_rate_floor`, this bounds the absolute
+    missed count directly rather than a rate that then gets multiplied back
+    by `stratum.population` -- no separate finite-population correction is
+    needed or applied.
+
+    Args:
+        stratum: The audit stratum.
+        confidence: One-sided confidence level for the bound.
+
+    Returns:
+        The exact upper confidence bound on K_h.
+    """
+    return hypergeometric_upper_bound(
+        stratum.m, stratum.n, stratum.population, confidence=confidence
+    )
+
+
 def estimated_missed_fn(
     stratum: Stratum, *, floor: bool = False, confidence: float = 0.95
 ) -> float:
@@ -272,16 +380,30 @@ def stratified_recall(
     decreasing in `FN`, the lower/upper bounds on `FN` map to the
     upper/lower bounds on recall respectively.
 
+    `exact_floor` is a separate, exact alternative to `floor`: each
+    stratum's `exclusion_count_upper_bound` is computed at Bonferroni-
+    adjusted per-stratum confidence (`1 - (1 - confidence) / len(strata)`,
+    so the strata's *simultaneous* one-sided coverage is still >=
+    `confidence`) and combined by direct summation of the exact counts --
+    no MOVER/half-width propagation needed, since each bound is already a
+    single-sided limit, not a two-sided interval to recombine. `confidence`
+    is interpreted one-sided here, unlike its two-sided use for `floor`'s
+    Wilson interval and `ci` above: a one-sided reading is the natural, and
+    tighter, interpretation for a bound that is only ever reported as an
+    upper limit.
+
     Args:
         strata: One or more audit strata. Passing a single stratum reduces
-            exactly to the single-stratum (unstratified) case.
+            exactly to the single-stratum (unstratified) case, and the
+            Bonferroni adjustment on `exact_floor` becomes a no-op.
         true_positives: TP: records included by screening that are truly
             relevant, from the confusion matrix against gold labels.
         confidence: Two-sided confidence level for `ci` and for the
-            Wilson-based part of the floor. Defaults to 0.95.
+            Wilson-based part of `floor`; one-sided simultaneous confidence
+            level for `exact_floor` (see above). Defaults to 0.95.
 
     Returns:
-        A `RecallEstimate` with point, floor, and interval.
+        A `RecallEstimate` with point, floor, exact_floor, and interval.
 
     Raises:
         RecallError: If `strata` is empty or `true_positives` is negative.
@@ -303,8 +425,14 @@ def stratified_recall(
     fn_low = max(0.0, fn_point - fn_half_width)
     fn_high = fn_point + fn_half_width
 
+    bonferroni_confidence = 1 - (1 - confidence) / len(strata)
+    fn_exact_floor = float(
+        sum(exclusion_count_upper_bound(s, confidence=bonferroni_confidence) for s in strata)
+    )
+
     point = _recall(true_positives, fn_point)
     floor = _recall(true_positives, fn_floor)
+    exact_floor = _recall(true_positives, fn_exact_floor)
     # recall is decreasing in FN, so FN's lower/upper bounds give recall's upper/lower bounds.
     ci_high = _recall(true_positives, fn_low)
     ci_low = _recall(true_positives, fn_high)
@@ -316,6 +444,8 @@ def stratified_recall(
         true_positives=true_positives,
         estimated_fn=fn_point,
         estimated_fn_floor=fn_floor,
+        exact_floor=exact_floor,
+        estimated_fn_exact_floor=fn_exact_floor,
     )
 
 
