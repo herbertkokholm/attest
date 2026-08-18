@@ -40,6 +40,7 @@ from attest.planes.recall_audit import (
     build_strata,
     draw_audit_sample,
     ingest_audit_labels,
+    population_frame_hash,
 )
 from attest.stats.recall import stratified_recall
 
@@ -552,6 +553,43 @@ def test_ingest_audit_labels_rejects_invalid_label() -> None:
 
     with pytest.raises(AuditError):
         ingest_audit_labels(rows, {"r1": 5})
+
+
+def test_ingest_audit_labels_records_reviewer_and_blinded_provenance() -> None:
+    rows = [AuditRow(record_id="r1", stratum="all"), AuditRow(record_id="r2", stratum="all")]
+
+    labeled = ingest_audit_labels(rows, {"r1": 1, "r2": -1}, reviewer="auditor-a", blinded=True)
+
+    assert all(r.reviewer == "auditor-a" for r in labeled)
+    assert all(r.blinded is True for r in labeled)
+
+
+def test_ingest_audit_labels_leaves_reviewer_and_blinded_none_when_not_supplied() -> None:
+    rows = [AuditRow(record_id="r1", stratum="all")]
+
+    labeled = ingest_audit_labels(rows, {"r1": 1})
+
+    assert labeled[0].reviewer is None
+    assert labeled[0].blinded is None
+
+
+# --- recall_audit.py: sampling-frame hash --------------------------------------
+
+
+def test_population_frame_hash_is_order_independent() -> None:
+    population = _population(track_a=5, track_b=5)
+
+    forward = population_frame_hash(population)
+    backward = population_frame_hash(list(reversed(population)))
+
+    assert forward == backward
+
+
+def test_population_frame_hash_changes_with_population_membership() -> None:
+    population = _population(track_a=5, track_b=5)
+    narrowed = population[:-1]
+
+    assert population_frame_hash(population) != population_frame_hash(narrowed)
 
 
 def test_build_strata_produces_counts_usable_by_stats_recall() -> None:

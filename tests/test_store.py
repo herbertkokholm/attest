@@ -610,6 +610,59 @@ def test_audit_draw_is_distinct_from_audit_json(tmp_path: Path) -> None:
     assert store.read_audit_draw() == {}
 
 
+def test_audit_draw_persists_sampling_frame_hash(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    rows = [AuditRow(record_id="r1", stratum="all")]
+
+    store.write_audit_draw("cfg-1", rows, sampling_frame_hash="deadbeef")
+
+    assert store.read_audit_sampling_frame_hash() == "deadbeef"
+
+
+def test_audit_draw_sampling_frame_hash_defaults_to_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_audit_sampling_frame_hash() is None
+
+    store.write_audit_draw("cfg-1", [AuditRow(record_id="r1", stratum="all")])
+
+    assert store.read_audit_sampling_frame_hash() is None
+
+
+def test_audit_draw_rejects_a_conflicting_sampling_frame_hash(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_audit_draw(
+        "cfg-1", [AuditRow(record_id="r1", stratum="all")], sampling_frame_hash="first"
+    )
+
+    with pytest.raises(StoreError, match="sampling_frame_hash"):
+        store.write_audit_draw(
+            "cfg-1", [AuditRow(record_id="r2", stratum="all")], sampling_frame_hash="second"
+        )
+
+
+def test_audit_draw_repeated_calls_with_the_same_hash_are_fine(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_audit_draw(
+        "cfg-1", [AuditRow(record_id="r1", stratum="all")], sampling_frame_hash="same"
+    )
+    store.write_audit_draw(
+        "cfg-1", [AuditRow(record_id="r2", stratum="all")], sampling_frame_hash="same"
+    )
+
+    assert store.read_audit_sampling_frame_hash() == "same"
+    assert store.read_audit_draw() == {"r1": "all", "r2": "all"}
+
+
+def test_audit_rows_round_trip_reviewer_and_blinded(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    row = AuditRow(record_id="r1", stratum="all", human_label=1, reviewer="auditor-a", blinded=True)
+
+    store.write_audit_rows("cfg-1", [row])
+
+    assert store.read_audit_rows() == [row]
+
+
 # --- RunStore: validation record snapshot -------------------------------------------
 
 

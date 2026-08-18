@@ -95,17 +95,38 @@ def test_end_to_end_screen_audit_validate(
         ]
     )
     assert draw_rc == 0
-    drawn = json.loads(capsys.readouterr().out)["drawn"]
+    draw_output = json.loads(capsys.readouterr().out)
+    drawn = draw_output["drawn"]
     drawn_ids = {row["record_id"] for row in drawn}
     assert drawn_ids == {"rec-001", "rec-004"}
+    assert draw_output["sampling_frame_hash"]
+    assert (
+        json.loads((run_dir / "audit_draw.json").read_text())["sampling_frame_hash"]
+        == draw_output["sampling_frame_hash"]
+    )
 
     labels_path = tmp_path / "labels.json"
     labels_path.write_text(json.dumps({"rec-001": 1, "rec-004": -1}))
 
-    apply_rc = main(["audit-apply", "--run-dir", str(run_dir), "--labels", str(labels_path)])
+    apply_rc = main(
+        [
+            "audit-apply",
+            "--run-dir",
+            str(run_dir),
+            "--labels",
+            str(labels_path),
+            "--reviewer",
+            "auditor-a",
+            "--blinded",
+        ]
+    )
     assert apply_rc == 0
     labeled = json.loads(capsys.readouterr().out)["labeled"]
     assert set(labeled) == drawn_ids
+
+    audit_rows = json.loads((run_dir / "audit.json").read_text())["audit_rows"]
+    assert audit_rows["rec-001"]["reviewer"] == "auditor-a"
+    assert audit_rows["rec-001"]["blinded"] is True
 
     validate_rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
     assert validate_rc == 0

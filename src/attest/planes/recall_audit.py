@@ -12,6 +12,7 @@ row not tagged `PLANE_RECALL_AUDIT` is refused outright, not silently ignored.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 from collections import defaultdict
@@ -61,6 +62,18 @@ class AuditRow:
         stratum: Stratum name this row was drawn from.
         human_label: Ordinal audit label from gold-checking, or None before
             the row has been audited.
+        reviewer: Id or pseudonym of the human who gold-checked this row,
+            or None while pending or when not supplied. Optional, like
+            `attest.planes.adjudication.AdjudicationItem.reviewer` --
+            attest never requires reviewer identity to function, only
+            records it when supplied.
+        blinded: Whether the reviewer gold-checked this row without seeing
+            the ensemble's screen-excluded decision for it, or None when
+            not recorded. Provenance only, like `reviewer`: this plane's
+            statistical validity comes from `population` being a
+            probability sample (see `draw_audit_sample`'s
+            `sampling_frame_hash`), not from blinding, but an unblinded
+            audit is worth being able to see in the record.
         plane: Fixed to `PLANE_RECALL_AUDIT`; the tag `build_strata` checks
             to refuse rows that did not come from this plane.
     """
@@ -68,6 +81,8 @@ class AuditRow:
     record_id: str
     stratum: str
     human_label: int | None = None
+    reviewer: str | None = None
+    blinded: bool | None = None
     plane: str = field(default=PLANE_RECALL_AUDIT, init=False)
 
 
@@ -103,6 +118,29 @@ def _confidence_key(record: ExcludedRecord) -> str:
             "records rather than None) -- got None"
         )
     return record.confidence_tier
+
+
+def population_frame_hash(population: Sequence[ExcludedRecord]) -> str:
+    """Return a content hash of the eligible population a draw was sampled from.
+
+    Persisted alongside a draw (see `attest.io.store.RunStore.write_audit_draw`)
+    so the sampling frame is provably fixed before any row is labeled: a
+    reviewer can recompute this hash from an independently reconstructed
+    screen-excluded population and confirm it matches what the draw actually
+    ran against, rather than trusting an unverifiable claim that the frame
+    wasn't narrowed or widened after the fact. Order-independent: two
+    populations containing the same records in a different order hash the
+    same, since population order has no statistical meaning here.
+
+    Args:
+        population: The screen-excluded records eligible for the draw.
+
+    Returns:
+        A SHA-256 hex digest of the sorted, deduplicated record ids.
+    """
+    ids = sorted({record.record_id for record in population})
+    digest = hashlib.sha256("\n".join(ids).encode("utf-8"))
+    return digest.hexdigest()
 
 
 def draw_audit_sample(
@@ -201,16 +239,29 @@ def _allocate_proportionally(n: int, sizes: Mapping[str, int]) -> dict[str, int]
     return floors
 
 
-def ingest_audit_labels(rows: Sequence[AuditRow], labels: Mapping[str, int]) -> list[AuditRow]:
+def ingest_audit_labels(
+    rows: Sequence[AuditRow],
+    labels: Mapping[str, int],
+    *,
+    reviewer: str | None = None,
+    blinded: bool | None = None,
+) -> list[AuditRow]:
     """Attach human gold-check labels to drawn, unlabeled audit rows.
 
     Args:
         rows: Rows previously drawn by `draw_audit_sample`.
         labels: Mapping of record id to the human ordinal audit label.
+        reviewer: Id or pseudonym of the human who produced every label in
+            `labels`, recorded on each updated row. Applies uniformly to
+            this whole call -- a labeling pass split across reviewers is
+            two separate `ingest_audit_labels` calls, one per reviewer.
+        blinded: Whether `reviewer` gold-checked these rows without seeing
+            the ensemble's screen-excluded decision, recorded on every
+            updated row.
 
     Returns:
-        New `AuditRow`s with `human_label` set from `labels`; still tagged
-        `PLANE_RECALL_AUDIT`.
+        New `AuditRow`s with `human_label` (and `reviewer`/`blinded`, if
+        given) set; still tagged `PLANE_RECALL_AUDIT`.
 
     Raises:
         AuditError: If a row's record id has no entry in `labels`, or its
@@ -225,7 +276,7 @@ def ingest_audit_labels(rows: Sequence[AuditRow], labels: Mapping[str, int]) -> 
             raise AuditError(
                 f"record '{row.record_id}': human_label must be one of {VALID_RATINGS}, got {label}"
             )
-        updated.append(replace(row, human_label=label))
+        updated.append(replace(row, human_label=label, reviewer=reviewer, blinded=blinded))
     return updated
 
 

@@ -248,7 +248,13 @@ class RunStore:
         return ensemble_config_id, dict(items)
 
     def _write_stamped(
-        self, filename: str, key: str, ensemble_config_id: str, items: Mapping[str, Any]
+        self,
+        filename: str,
+        key: str,
+        ensemble_config_id: str,
+        items: Mapping[str, Any],
+        *,
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         existing_id, existing_items = self._read_stamped(filename, key)
         if existing_id is not None and existing_id != ensemble_config_id:
@@ -258,9 +264,10 @@ class RunStore:
                 f"'{ensemble_config_id}'"
             )
         existing_items.update(items)
-        _write_json(
-            self.root / filename, {"ensemble_config_id": ensemble_config_id, key: existing_items}
-        )
+        payload: dict[str, Any] = {"ensemble_config_id": ensemble_config_id, key: existing_items}
+        if extra:
+            payload.update(extra)
+        _write_json(self.root / filename, payload)
 
     def write_config(self, config: EnsembleConfig) -> str:
         """Persist the ensemble configuration in force for this run directory.
@@ -409,7 +416,13 @@ class RunStore:
             rows: The audit rows to persist, labeled or not.
         """
         items = {
-            row.record_id: {"stratum": row.stratum, "human_label": row.human_label} for row in rows
+            row.record_id: {
+                "stratum": row.stratum,
+                "human_label": row.human_label,
+                "reviewer": row.reviewer,
+                "blinded": row.blinded,
+            }
+            for row in rows
         }
         self._write_stamped(AUDIT_FILENAME, "audit_rows", ensemble_config_id, items)
 
@@ -417,7 +430,13 @@ class RunStore:
         """Read all stored recall-audit rows, ordered by record id."""
         _ensemble_config_id, items = self._read_stamped(AUDIT_FILENAME, "audit_rows")
         return [
-            AuditRow(record_id=record_id, stratum=row["stratum"], human_label=row["human_label"])
+            AuditRow(
+                record_id=record_id,
+                stratum=row["stratum"],
+                human_label=row["human_label"],
+                reviewer=row.get("reviewer"),
+                blinded=row.get("blinded"),
+            )
             for record_id, row in sorted(items.items())
         ]
 
@@ -598,7 +617,13 @@ class RunStore:
 
     # --- audit draw/labels: immutable snapshots for manifest integrity -----
 
-    def write_audit_draw(self, ensemble_config_id: str, rows: Sequence[AuditRow]) -> None:
+    def write_audit_draw(
+        self,
+        ensemble_config_id: str,
+        rows: Sequence[AuditRow],
+        *,
+        sampling_frame_hash: str | None = None,
+    ) -> None:
         """Upsert the drawn (pre-label) recall-audit rows into `audit_draw.json`.
 
         A snapshot distinct from `audit.json` (which `assemble_validation_record`
@@ -611,14 +636,47 @@ class RunStore:
         Args:
             ensemble_config_id: Configuration id these rows were drawn under.
             rows: The freshly drawn (unlabeled) rows.
+            sampling_frame_hash: This draw's
+                `attest.planes.recall_audit.population_frame_hash`, if
+                available -- the eligible population's content hash,
+                recorded so the sampling frame this draw ran against is
+                independently verifiable later. Once written for a given
+                `ensemble_config_id`, later draws under the same id must
+                supply the identical hash (the frame is fixed per epoch);
+                a mismatch raises `StoreError`.
+
+        Raises:
+            StoreError: If `sampling_frame_hash` conflicts with a hash
+                already stored for this run directory.
         """
         items = {row.record_id: row.stratum for row in rows}
-        self._write_stamped(AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items)
+        existing_hash = self.read_audit_sampling_frame_hash()
+        if (
+            sampling_frame_hash is not None
+            and existing_hash is not None
+            and sampling_frame_hash != existing_hash
+        ):
+            raise StoreError(
+                f"run directory '{self.root}' already recorded sampling_frame_hash "
+                f"'{existing_hash}' for a prior draw; refusing to record a different hash "
+                f"'{sampling_frame_hash}' for the same ensemble_config_id -- the screen-excluded "
+                "population must not change within an epoch's audit draws"
+            )
+        extra = {"sampling_frame_hash": sampling_frame_hash or existing_hash}
+        self._write_stamped(AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items, extra=extra)
 
     def read_audit_draw(self) -> dict[str, str]:
         """Read the stored audit-draw snapshot, mapping record id to stratum."""
         _ensemble_config_id, items = self._read_stamped(AUDIT_DRAW_FILENAME, "drawn")
         return {record_id: stratum for record_id, stratum in items.items()}
+
+    def read_audit_sampling_frame_hash(self) -> str | None:
+        """Read the stored draw's sampling-frame hash, or None if never recorded."""
+        payload = _read_json(self.root / AUDIT_DRAW_FILENAME)
+        if payload is None:
+            return None
+        frame_hash: str | None = payload.get("sampling_frame_hash")
+        return frame_hash
 
     def write_audit_labels(self, ensemble_config_id: str, labels: Mapping[str, int]) -> None:
         """Upsert applied human gold-check labels into `audit_labels.json`.

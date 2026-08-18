@@ -63,6 +63,7 @@ from attest.planes.recall_audit import (
     ExcludedRecord,
     draw_audit_sample,
     ingest_audit_labels,
+    population_frame_hash,
 )
 from attest.prefilter.framework import Prefilter, PrefilterOutcome, require_nonempty
 from attest.provenance.changelog import (
@@ -659,11 +660,12 @@ def _cmd_audit_draw(args: argparse.Namespace) -> int:
         stratify_by_confidence=args.stratify_by_confidence,
         rng=rng,
     )
+    frame_hash = population_frame_hash(population)
     store.write_audit_rows(ensemble_config_id, rows)
-    store.write_audit_draw(ensemble_config_id, rows)
+    store.write_audit_draw(ensemble_config_id, rows, sampling_frame_hash=frame_hash)
 
     drawn = [{"record_id": row.record_id, "stratum": row.stratum} for row in rows]
-    print(json.dumps({"drawn": drawn}, indent=2))
+    print(json.dumps({"drawn": drawn, "sampling_frame_hash": frame_hash}, indent=2))
     return 0
 
 
@@ -678,7 +680,7 @@ def _cmd_audit_apply(args: argparse.Namespace) -> int:
     if not unlabeled:
         raise CliError("no unlabeled audit rows are pending")
 
-    updated = ingest_audit_labels(unlabeled, labels)
+    updated = ingest_audit_labels(unlabeled, labels, reviewer=args.reviewer, blinded=args.blinded)
     store.write_audit_rows(ensemble_config_id, updated)
     applied = {row.record_id: row.human_label for row in updated if row.human_label is not None}
     store.write_audit_labels(ensemble_config_id, applied)
@@ -1220,6 +1222,19 @@ def _build_parser() -> argparse.ArgumentParser:
     audit_apply.add_argument("--run-dir", required=True, help="Run directory to read/write.")
     audit_apply.add_argument(
         "--labels", required=True, help="JSON file mapping record id to human ordinal label."
+    )
+    audit_apply.add_argument(
+        "--reviewer",
+        default=None,
+        help="Id or pseudonym of the human who produced every label in --labels, recorded on "
+        "each updated audit row.",
+    )
+    audit_apply.add_argument(
+        "--blinded",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether --reviewer gold-checked these rows without seeing the ensemble's "
+        "screen-excluded decision, recorded on each updated audit row.",
     )
     audit_apply.set_defaults(handler=_cmd_audit_apply)
 
