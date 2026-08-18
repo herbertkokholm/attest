@@ -866,6 +866,52 @@ def test_screen_rejects_an_unrecognized_zero_policy(
     assert not (run_dir / "votes.json").exists()
 
 
+def test_screen_rejects_an_unresolved_todo_placeholder_in_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    unresolved_vendor_spec = {
+        "model": "TODO:pin-openai-current-gen-dated-snapshot",
+        "model_version": "TODO:capture-served-snapshot-before-freeze",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": unresolved_vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 1
+    assert "unresolved placeholder" in capsys.readouterr().err
+    assert not (run_dir / "votes.json").exists()
+
+
 def test_screen_with_zero_policy_include_auto_labels_the_tie(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

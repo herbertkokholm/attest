@@ -140,7 +140,10 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
     Raises:
         ValueError: If "zero_policy" names an unrecognized policy, or
             "confidence_threshold" is outside `[0, 1]` (both propagated
-            from `EnsembleConfig.__post_init__`).
+            from `EnsembleConfig.__post_init__`); or if any vendor's
+            "model"/"model_version"/"prompt_version" is still an unresolved
+            `TODO:`-prefixed placeholder (propagated from
+            `VendorSpec.__post_init__`).
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     vendors = {

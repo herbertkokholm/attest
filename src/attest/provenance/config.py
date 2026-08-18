@@ -25,6 +25,14 @@ from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 # back the other way would be circular. `attest.vendors.base` re-exports it.
 OUTPUT_CONTRACT_VERSION = "1"
 
+# Convention (not enforced elsewhere) for a config field whose real value is
+# not yet known -- e.g. a served model snapshot string that must be captured
+# from a live vendor before a run is frozen. `VendorSpec.__post_init__`
+# refuses to construct with one of these left in place, so a placeholder can
+# never silently reach a live screening run: a content hash of "TODO:..." is
+# provenance for a plan, not for the instrument that actually ran.
+TODO_PLACEHOLDER_PREFIX = "TODO:"
+
 
 @dataclass(frozen=True)
 class VendorSpec:
@@ -46,6 +54,19 @@ class VendorSpec:
     model_version: str
     prompt_version: str
     temperature: float
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("model", self.model),
+            ("model_version", self.model_version),
+            ("prompt_version", self.prompt_version),
+        ):
+            if value.startswith(TODO_PLACEHOLDER_PREFIX):
+                raise ValueError(
+                    f"VendorSpec.{field_name} is an unresolved placeholder ('{value}'): "
+                    "resolve it to the real value before this configuration can be used -- "
+                    "a TODO-prefixed field must never reach a live screening run"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return this vendor spec as a plain dict."""

@@ -41,6 +41,26 @@ def _config(tau: float = 0.5, temperature: float = 0.0) -> Config:
     )
 
 
+@pytest.mark.parametrize("field_name", ["model", "model_version", "prompt_version"])
+def test_vendor_spec_rejects_a_todo_placeholder(field_name: str) -> None:
+    kwargs = {
+        "model": "gpt-4o",
+        "model_version": "2024-08-06",
+        "prompt_version": "v1",
+        "temperature": 0.0,
+    }
+    kwargs[field_name] = "TODO:pin-openai-current-gen-dated-snapshot"
+
+    with pytest.raises(ValueError, match="unresolved placeholder"):
+        VendorSpec(**kwargs)
+
+
+def test_vendor_spec_accepts_a_value_merely_containing_todo() -> None:
+    # Only a literal TODO:-prefix is rejected -- a real value that happens to
+    # contain the substring elsewhere must not false-positive.
+    VendorSpec(model="not-a-TODO:-value", model_version="1", prompt_version="v1", temperature=0.0)
+
+
 def test_same_descriptor_yields_same_ensemble_config_id() -> None:
     id_a = compute_ensemble_config_id(_config())
     id_b = compute_ensemble_config_id(_config())
