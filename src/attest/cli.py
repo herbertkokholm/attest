@@ -103,6 +103,7 @@ from attest.vendors.batch import (
     submit_batch,
 )
 from attest.vendors.registry import build_batch_raters, build_raters
+from attest.vendors.sdk_versions import sdk_versions
 
 _RELEVANT_LABEL = 1
 
@@ -854,7 +855,8 @@ def _parse_seeds(values: Sequence[str] | None) -> dict[str, int]:
 def _cmd_manifest(args: argparse.Namespace) -> int:
     """Build and persist a run manifest hashing this run directory's current artifacts."""
     store = RunStore(Path(args.run_dir))
-    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+    config = store.read_config()
+    ensemble_config_id = compute_ensemble_config_id(config)
     protocol_id = store.read_protocol_id()
     input_hash = hash_input_file(args.input) if args.input else None
     manifest = store.write_manifest(
@@ -863,6 +865,7 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
         input_hash=input_hash,
         input_source=args.input,
         seeds=_parse_seeds(args.seed),
+        sdk_versions=sdk_versions(config.vendors),
     )
     print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
     return 0

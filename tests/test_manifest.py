@@ -137,8 +137,41 @@ def test_manifest_round_trips_through_dict(tmp_path: Path) -> None:
         input_hash="deadbeef",
         input_source="data/gold.json",
         seeds={"screen": 42},
+        sdk_versions={"openai": "2.53.0"},
     )
 
     restored = type(manifest).from_dict(manifest.to_dict())
 
     assert restored == manifest
+    assert manifest.sdk_versions == {"openai": "2.53.0"}
+
+
+def test_sdk_versions_defaults_to_empty(tmp_path: Path) -> None:
+    manifest = build_manifest(
+        root=tmp_path, artifact_filenames=_ARTIFACTS, ensemble_config_id="cfg-1"
+    )
+
+    assert manifest.sdk_versions == {}
+
+
+def test_manifest_id_changes_when_sdk_versions_differ(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    fixed_time = datetime(2026, 1, 1, tzinfo=UTC)
+    without = build_manifest(
+        root=tmp_path,
+        artifact_filenames=_ARTIFACTS,
+        ensemble_config_id="cfg-1",
+        created_at=fixed_time,
+        sw_version="attest 0.0.0",
+    )
+    with_version = build_manifest(
+        root=tmp_path,
+        artifact_filenames=_ARTIFACTS,
+        ensemble_config_id="cfg-1",
+        created_at=fixed_time,
+        sw_version="attest 0.0.0",
+        sdk_versions={"openai": "2.53.0"},
+    )
+
+    assert without.manifest_id != with_version.manifest_id

@@ -80,6 +80,12 @@ class RunManifest:
             `{"screen_deterministic": 42, "audit_draw": 7}`).
         artifact_hashes: Mapping of run-directory filename to the SHA-256
             hex digest of its content at manifest-build time.
+        sdk_versions: Mapping of vendor name to its provider SDK's installed
+            version at manifest-build time (see
+            `attest.vendors.sdk_versions.sdk_versions`), for every vendor
+            this was resolvable for. Best-effort, like `software_version`:
+            a vendor with no SDK dependency or an unresolvable package is
+            simply absent, not mapped to `None`.
     """
 
     manifest_id: str
@@ -91,6 +97,7 @@ class RunManifest:
     input_source: str | None = None
     seeds: dict[str, int] = field(default_factory=dict)
     artifact_hashes: dict[str, str] = field(default_factory=dict)
+    sdk_versions: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return this manifest as a plain, JSON-serializable dict."""
@@ -104,6 +111,7 @@ class RunManifest:
             "input_source": self.input_source,
             "seeds": dict(self.seeds),
             "artifact_hashes": dict(self.artifact_hashes),
+            "sdk_versions": dict(self.sdk_versions),
         }
 
     @classmethod
@@ -119,6 +127,7 @@ class RunManifest:
             input_source=payload.get("input_source"),
             seeds=dict(payload.get("seeds", {})),
             artifact_hashes=dict(payload.get("artifact_hashes", {})),
+            sdk_versions=dict(payload.get("sdk_versions", {})),
         )
 
 
@@ -132,6 +141,7 @@ def _payload_for_id(
     input_source: str | None,
     seeds: Mapping[str, int],
     artifact_hashes: Mapping[str, str],
+    sdk_versions: Mapping[str, str],
 ) -> dict[str, Any]:
     return {
         "created_at": created_at.isoformat(),
@@ -142,6 +152,7 @@ def _payload_for_id(
         "input_source": input_source,
         "seeds": dict(seeds),
         "artifact_hashes": dict(artifact_hashes),
+        "sdk_versions": dict(sdk_versions),
     }
 
 
@@ -173,6 +184,7 @@ def build_manifest(
     seeds: Mapping[str, int] | None = None,
     created_at: datetime | None = None,
     sw_version: str | None = None,
+    sdk_versions: Mapping[str, str] | None = None,
 ) -> RunManifest:
     """Build a `RunManifest` by hashing every existing artifact in `artifact_filenames`.
 
@@ -187,6 +199,9 @@ def build_manifest(
         seeds: Named random seeds used by this run.
         created_at: Timestamp to record; defaults to now (UTC).
         sw_version: Software version string; defaults to `software_version()`.
+        sdk_versions: Mapping of vendor name to its provider SDK's installed
+            version (see `attest.vendors.sdk_versions.sdk_versions`);
+            defaults to empty when not given.
 
     Returns:
         A `RunManifest` with `manifest_id` derived from every other field.
@@ -195,6 +210,7 @@ def build_manifest(
     sw = sw_version or software_version()
     seeds_dict = dict(seeds or {})
     artifact_hashes = compute_artifact_hashes(root, artifact_filenames)
+    sdk_versions_dict = dict(sdk_versions or {})
     payload = _payload_for_id(
         created_at=created,
         sw_version=sw,
@@ -204,6 +220,7 @@ def build_manifest(
         input_source=input_source,
         seeds=seeds_dict,
         artifact_hashes=artifact_hashes,
+        sdk_versions=sdk_versions_dict,
     )
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     manifest_id = hash_bytes(canonical.encode("utf-8"))
@@ -217,6 +234,7 @@ def build_manifest(
         input_source=input_source,
         seeds=seeds_dict,
         artifact_hashes=artifact_hashes,
+        sdk_versions=sdk_versions_dict,
     )
 
 

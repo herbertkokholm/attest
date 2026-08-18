@@ -1461,6 +1461,11 @@ def test_protocol_manifest_verify_end_to_end(
     assert manifest_payload["seeds"] == {"screen": 17}
     assert "config.json" in manifest_payload["artifact_hashes"]
     assert "changelog.json" in manifest_payload["artifact_hashes"]
+    # "v1"/"v2" (_write_config's vendor names) aren't real provider names, so
+    # sdk_versions resolves to empty here -- see
+    # test_manifest_includes_sdk_versions_for_real_vendor_names below for the
+    # populated case.
+    assert manifest_payload["sdk_versions"] == {}
 
     verify_rc = main(["verify", "--run-dir", str(run_dir)])
     assert verify_rc == 0
@@ -1475,6 +1480,58 @@ def test_protocol_manifest_verify_end_to_end(
     tampered_payload = json.loads(capsys.readouterr().out)
     assert tampered_payload["ok"] is False
     assert any(p["artifact"] == "config.json" for p in tampered_payload["problems"])
+
+
+def test_manifest_includes_sdk_versions_for_real_vendor_names(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from importlib import metadata
+
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"openai": vendor_spec, "anthropic": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+            }
+        )
+    )
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    def _version(dist: str) -> str:
+        if dist == "openai":
+            return "2.53.0"
+        raise metadata.PackageNotFoundError(dist)
+
+    monkeypatch.setattr(metadata, "version", _version)
+
+    manifest_rc = main(["manifest", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert manifest_rc == 0
+    manifest_payload = json.loads(capsys.readouterr().out)
+    # "anthropic" resolves to no version here (monkeypatch only covers
+    # "openai") and is correctly absent, not mapped to null.
+    assert manifest_payload["sdk_versions"] == {"openai": "2.53.0"}
 
 
 def test_verify_without_a_manifest_errors(

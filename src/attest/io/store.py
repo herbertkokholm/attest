@@ -845,6 +845,7 @@ class RunStore:
         input_hash: str | None = None,
         input_source: str | None = None,
         seeds: Mapping[str, int] | None = None,
+        sdk_versions: Mapping[str, str] | None = None,
     ) -> RunManifest:
         """Build and persist a `RunManifest` hashing this run directory's current artifacts.
 
@@ -860,6 +861,9 @@ class RunStore:
             input_hash: SHA-256 hex digest of the input file screened.
             input_source: Free-text/path identifying the input file.
             seeds: Named random seeds used by this run.
+            sdk_versions: Mapping of vendor name to its provider SDK's
+                installed version (see
+                `attest.vendors.sdk_versions.sdk_versions`).
 
         Returns:
             The freshly built and persisted `RunManifest`.
@@ -872,6 +876,7 @@ class RunStore:
             input_hash=input_hash,
             input_source=input_source,
             seeds=seeds,
+            sdk_versions=sdk_versions,
         )
         _write_json(self.root / MANIFEST_FILENAME, manifest.to_dict())
         return manifest
