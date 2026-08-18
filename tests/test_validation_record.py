@@ -44,6 +44,6 @@ def test_to_json_contains_point_and_floor_keys() -> None:
 
     assert "point" in payload["recall"]
     assert "floor" in payload["recall"]
-    assert payload["schema_version"] == "1.1"
+    assert payload["schema_version"] == "1.2"
     assert payload["ensemble_config_id"] == "cfg-1"
     assert payload["config"]["zero_policy"] == "escalate"

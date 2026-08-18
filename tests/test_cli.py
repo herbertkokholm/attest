@@ -111,7 +111,7 @@ def test_end_to_end_screen_audit_validate(
     assert validate_rc == 0
     record = json.loads(capsys.readouterr().out)
 
-    assert record["schema_version"] == "1.1"
+    assert record["schema_version"] == "1.2"
     assert record["config"]["zero_policy"] == "escalate"
     assert record["prisma"]["identified"] == 6
     assert record["prisma"]["duplicates_removed"] == 1
@@ -121,10 +121,110 @@ def test_end_to_end_screen_audit_validate(
     # rec-004's escalation was resolved before this validate ran, so the
     # decisions store no longer shows it as escalating.
     assert record["escalation_rate"] == pytest.approx(0.0)
+    assert record["unresolved_escalations"] == 0
     assert record["recall"]["point"] is not None
     assert record["recall"]["floor"] is not None
     assert record["recall"]["floor"] <= record["recall"]["point"]
     assert record["recall"]["audit_n"] == 2
+    assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
+
+
+def test_validate_fails_closed_on_unresolved_escalation_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    # rec-004 escalates and is never adjudicated here: validate must refuse
+    # to silently drop it from the confusion matrix/recall TP.
+    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "rec-004" in err
+    assert "allow_unresolved_escalations" in err or "allow-unresolved-escalations" in err
+
+    rc_allowed = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
+    assert rc_allowed == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["unresolved_escalations"] == 1
+    # rec-004 has no gold label at all (see data/example_gold_set.json), so
+    # its resolution status never affects the confusion matrix -- this is
+    # identical to test_end_to_end_screen_audit_validate's fully-resolved
+    # result. What differs is PRISMA: rec-004 is dropped from both
+    # screen_excluded and included (3 resolved records, not 4) rather than
+    # being counted as screen_excluded.
+    assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
+    assert record["prisma"]["screen_excluded"] == 1
+    assert record["prisma"]["included"] == 2
+
+
+def test_validate_resolves_escalations_via_human_labels_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    # Resolve rec-004 via an externally-supplied labels file instead of
+    # 'attest adjudicate', e.g. an inclusion audit or an external review tool.
+    human_labels_path = tmp_path / "human_labels.json"
+    human_labels_path.write_text(json.dumps({"rec-004": -1}))
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--human-labels",
+            str(human_labels_path),
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["unresolved_escalations"] == 0
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
@@ -529,15 +629,28 @@ def test_validate_surfaces_the_tau_report_as_provenance(
     )
     capsys.readouterr()
 
-    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    # rec-004's tie escalates and is deliberately left unadjudicated here --
+    # this test is about tau_report surfacing, not escalation handling -- so
+    # it must opt in to validating over the unresolved escalation.
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
     assert rc == 0
     record = json.loads(capsys.readouterr().out)
 
     assert record["tau_report"] == describe_tau(1.0, 2).to_dict()
+    assert record["unresolved_escalations"] == 1
     # The tau_report addition is CLI-output-only, not a validation-record
     # schema change; schema_version here reflects workstream C's
     # zero_policy field on Config instead.
-    assert record["schema_version"] == "1.1"
+    assert record["schema_version"] == "1.2"
 
 
 def test_screen_batch_mode_then_batch_fetch_matches_sync(

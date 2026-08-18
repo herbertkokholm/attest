@@ -403,6 +403,57 @@ def test_assemble_validation_record_end_to_end(tmp_path: Path) -> None:
     assert record.recall.floor is not None
     assert record.recall.floor <= record.recall.point
     assert record.recall.audit_n == 1
+    assert record.unresolved_escalations == 0
+
+
+def test_assemble_validation_record_fails_closed_on_unresolved_escalation(tmp_path: Path) -> None:
+    records = [
+        Record(id="rel-1", title="t", abstract="a", track=1, gold_label=1),
+        Record(id="tie-1", title="t", abstract="a", track=1, gold_label=1),
+    ]
+    outcome = Prefilter(rules=[require_nonempty("abstract")]).run(records)
+
+    config = _config()
+    epoch = open_epoch(config, opened_at=datetime(2026, 1, 1, tzinfo=UTC))
+    config_id = epoch.ensemble_config_id
+
+    votes = [
+        _unanimous_votes("rel-1", config_id, 1),
+        _unanimous_votes("tie-1", config_id, 0),  # mean-zero vote: escalates under
+        # the default zero_policy="escalate", regardless of tau.
+    ]
+    decisions = {
+        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau) for vv in votes
+    }
+    assert decisions["tie-1"].escalate
+
+    truths = {r.id: r.gold_label for r in records if r.has_gold and r.gold_label is not None}
+
+    store = RunStore(tmp_path / "run")
+    store.write_config(config)
+    store.write_epoch(epoch)
+    store.write_votes(votes)
+    store.write_decisions(config_id, decisions)
+
+    with pytest.raises(StoreError, match="tie-1"):
+        assemble_validation_record(
+            store, prefilter_prisma=outcome.prisma, truths=truths, population_sizes={}
+        )
+
+    record = assemble_validation_record(
+        store,
+        prefilter_prisma=outcome.prisma,
+        truths=truths,
+        population_sizes={},
+        allow_unresolved_escalations=True,
+    )
+    assert record.unresolved_escalations == 1
+    # tie-1 is excluded from confusion/PRISMA counts, exactly as before this
+    # was surfaced -- only now the omission is visible in the record itself.
+    # rel-1 (unanimous include, gold-relevant) is still resolved and correct.
+    assert record.confusion == {"tp": 1, "fp": 0, "fn": 0, "tn": 0}
+    assert record.prisma.included == 1
+    assert record.prisma.screen_excluded == 0
 
 
 def test_assemble_validation_record_requires_stored_votes(tmp_path: Path) -> None:

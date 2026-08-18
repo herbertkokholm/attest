@@ -1,9 +1,13 @@
-"""Validation-record contract v1.1: one self-validation record per stable ensemble epoch.
+"""Validation-record contract v1.2: one self-validation record per stable ensemble epoch.
 
 This is a stable, versioned interface. Changing the shape produced here
 requires a version bump to ``SCHEMA_VERSION``, not an in-place edit. v1.1
 added ``config.zero_policy`` (additive: existing v1.0 consumers ignoring
-unknown fields see no other change).
+unknown fields see no other change). v1.2 added ``unresolved_escalations``
+(additive): the count of escalated decisions omitted from ``confusion``,
+``recall``, and ``prisma`` because they had no resolved human label when
+this record was assembled -- always 0 unless the caller explicitly opted
+into `assemble_validation_record`'s `allow_unresolved_escalations`.
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -22,7 +26,7 @@ from typing import Any
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 
 @dataclass
@@ -191,6 +195,7 @@ class ValidationRecord:
     agreement: Agreement = field(default_factory=Agreement)
     error_correlation: ErrorCorrelation = field(default_factory=ErrorCorrelation)
     escalation_rate: float | None = None
+    unresolved_escalations: int = 0
     recall: Recall = field(default_factory=Recall)
     confusion: dict[str, int] = field(default_factory=dict)
     prisma: Prisma = field(default_factory=Prisma)
@@ -206,6 +211,7 @@ class ValidationRecord:
             "agreement": self.agreement.to_dict(),
             "error_correlation": self.error_correlation.to_dict(),
             "escalation_rate": self.escalation_rate,
+            "unresolved_escalations": self.unresolved_escalations,
             "recall": self.recall.to_dict(),
             "confusion": dict(self.confusion),
             "prisma": self.prisma.to_dict(),

@@ -713,12 +713,36 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         population, include_confidence=confidence_policy is not None
     )
 
+    # Auto-resolve escalations from this run's own 'attest adjudicate' provenance
+    # first, since that's the authoritative in-kernel resolution path; an
+    # optional --human-labels file can supply (and override) resolutions made
+    # outside 'attest adjudicate'. Restricted to record ids still marked
+    # escalate=True in decisions.json: 'attest adjudicate' already rewrites a
+    # resolved record's stored Decision (auto_label set, escalate cleared),
+    # and final_label() rejects a human_label supplied for a decision that
+    # isn't escalated -- so re-forwarding an already-applied resolution here
+    # would turn an already-resolved record into a falsely "unresolved" one.
+    still_escalated = {
+        record_id for record_id, decision in store.read_decisions().items() if decision.escalate
+    }
+    human_labels: dict[str, int] = {
+        record_id: item["human_label"]
+        for record_id, item in store.read_adjudication_records().items()
+        if item.get("human_label") is not None and record_id in still_escalated
+    }
+    if args.human_labels:
+        human_labels.update(
+            {k: v for k, v in _load_labels(Path(args.human_labels)).items() if k in still_escalated}
+        )
+
     record = assemble_validation_record(
         store,
         prefilter_prisma=outcome.prisma,
         truths=truths,
         population_sizes=population_sizes,
+        human_labels=human_labels,
         confidence=args.confidence,
+        allow_unresolved_escalations=args.allow_unresolved_escalations,
     )
 
     payload = record.to_dict()
@@ -1210,6 +1234,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument(
         "--confidence", type=float, default=0.95, help="Confidence level for the recall floor."
+    )
+    validate.add_argument(
+        "--human-labels",
+        default=None,
+        help="JSON file mapping record id to human ordinal label, merged on top of this run's "
+        "stored 'attest adjudicate' resolutions (read automatically) to resolve escalated "
+        "decisions. Only needed for escalations resolved outside 'attest adjudicate'.",
+    )
+    validate.add_argument(
+        "--allow-unresolved-escalations",
+        action="store_true",
+        help="Proceed even if some escalated decisions have no resolved human label, omitting "
+        "them from the confusion matrix, PRISMA counts, and recall's TP (reported in the "
+        "output's 'unresolved_escalations' field). Default: refuse to validate until every "
+        "escalation is resolved.",
     )
     validate.add_argument(
         "--out", default=None, help="Path to write the validation record; defaults to stdout."

@@ -858,14 +858,24 @@ def hash_input_file(path: str | Path) -> str | None:
 
 def _final_labels(
     decisions: Mapping[str, Decision], human_labels: Mapping[str, int]
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[str]]:
+    """Resolve every decision to its final label, tracking which escalations could not be resolved.
+
+    Returns:
+        A `(resolved, unresolved_ids)` pair: `resolved` maps record id to
+        final label for every decision that could be resolved; `unresolved_ids`
+        lists, in decision order, the ids of escalated decisions with no
+        entry in `human_labels` -- callers must not treat `resolved` as the
+        complete decision set without accounting for these.
+    """
     resolved: dict[str, int] = {}
+    unresolved: list[str] = []
     for record_id, decision in decisions.items():
         try:
             resolved[record_id] = final_label(record_id, decision, human_labels.get(record_id))
         except AdjudicationError:
-            continue
-    return resolved
+            unresolved.append(record_id)
+    return resolved, unresolved
 
 
 def assemble_validation_record(
@@ -876,6 +886,7 @@ def assemble_validation_record(
     population_sizes: Mapping[str, int],
     human_labels: Mapping[str, int] | None = None,
     confidence: float = 0.95,
+    allow_unresolved_escalations: bool = False,
 ) -> ValidationRecord:
     """Assemble a full `ValidationRecord` for an epoch from a completed run directory.
 
@@ -900,18 +911,30 @@ def assemble_validation_record(
             through to `attest.planes.recall_audit.build_strata`.
         human_labels: Authoritative human labels for escalated decisions,
             keyed by record id. A stored decision that escalated and has no
-            entry here is left out of the confusion matrix and PRISMA
-            screen_excluded/included counts, since it is not yet resolved.
+            entry here is unresolved: by default this raises `StoreError`,
+            since the manuscript's true-positive definition (methods §2.9)
+            requires every include-and-escalate record to be either
+            adjudicated or covered by a separate inclusion audit -- a
+            validation record built over silently-dropped escalations does
+            not support that definition.
         confidence: Two-sided confidence level for the recall floor and
             interval.
+        allow_unresolved_escalations: If True, proceed even when some
+            escalated decisions have no entry in `human_labels`, omitting
+            them from the confusion matrix and PRISMA screen_excluded/included
+            counts as before. The omitted count is still reported in the
+            returned record's `unresolved_escalations` field so this choice
+            is never silent in the output. Default False: fail closed.
 
     Returns:
         A `ValidationRecord` with every field the stored run supports filled in.
 
     Raises:
-        StoreError: If the run directory has no stored votes, or its stored
+        StoreError: If the run directory has no stored votes, its stored
             epoch was opened for a different ensemble configuration than
-            the one currently stored.
+            the one currently stored, or (unless `allow_unresolved_escalations`
+            is set) one or more escalated decisions have no resolved
+            human label.
     """
     config = store.read_config()
     epoch = store.read_epoch()
@@ -953,7 +976,18 @@ def assemble_validation_record(
     if decisions:
         record.escalation_rate = sum(1 for d in decisions.values() if d.escalate) / len(decisions)
 
-    resolved_labels = _final_labels(decisions, human_labels or {})
+    resolved_labels, unresolved_ids = _final_labels(decisions, human_labels or {})
+    record.unresolved_escalations = len(unresolved_ids)
+    if unresolved_ids and not allow_unresolved_escalations:
+        shown = ", ".join(sorted(unresolved_ids)[:10])
+        more = f" (+{len(unresolved_ids) - 10} more)" if len(unresolved_ids) > 10 else ""
+        raise StoreError(
+            f"{len(unresolved_ids)} escalated decision(s) have no resolved human label: "
+            f"{shown}{more} -- resolve them (e.g. via 'attest adjudicate' and "
+            "human_labels/read_adjudication_records) before validating, or pass "
+            "allow_unresolved_escalations=True to explicitly accept that they will be "
+            "excluded from the confusion matrix, PRISMA counts, and recall's TP"
+        )
     record.prisma.screen_excluded = sum(
         1 for label in resolved_labels.values() if label != RELEVANT_LABEL
     )
