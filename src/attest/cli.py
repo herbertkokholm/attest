@@ -1,13 +1,14 @@
 """Command-line entry point for the attest kernel.
 
-Wires the prefilter, ensemble, adjudication, recall-audit, validation, and
-ablation engine modules into file-based subcommands over a local run
-directory (`attest.io.store.RunStore`). Every subcommand reads and writes
-its state exclusively through `attest.io.store`; `screen` and `batch-fetch`
-are the only ones that may reach the network, and only through a `Rater` or
-`BatchRater` built by `attest.vendors`. All other subcommands -- `adjudicate`,
-`audit-draw`, `audit-apply`, `validate`, `ablate` -- run entirely offline
-over files already written to the run directory.
+Wires the prefilter, ensemble, adjudication, recall-audit, inclusion-audit,
+validation, and ablation engine modules into file-based subcommands over a
+local run directory (`attest.io.store.RunStore`). Every subcommand reads and
+writes its state exclusively through `attest.io.store`; `screen` and
+`batch-fetch` are the only ones that may reach the network, and only through
+a `Rater` or `BatchRater` built by `attest.vendors`. All other subcommands --
+`adjudicate`, `audit-draw`, `audit-apply`, `inclusion-audit-draw`,
+`inclusion-audit-apply`, `validate`, `ablate` -- run entirely offline over
+files already written to the run directory.
 
 `screen --mode batch` submits one vendor batch per rater and persists the
 resulting handles; with `--wait` it then polls each to completion before
@@ -58,6 +59,14 @@ from attest.io.store import (
 )
 from attest.planes.active_learning import ActiveLearningReview, select_for_review
 from attest.planes.adjudication import AdjudicationItem, escalation_reason, final_label
+from attest.planes.inclusion_audit import (
+    STATUS_ESCALATED,
+    STATUS_INCLUDED,
+    IncludedRecord,
+    InclusionAuditRow,
+    draw_inclusion_audit_sample,
+    ingest_inclusion_audit_labels,
+)
 from attest.planes.recall_audit import (
     AuditRow,
     ExcludedRecord,
@@ -350,6 +359,61 @@ def _attach_confidence_tiers(
         tier = confidence_tier(confidence, low_threshold=low_threshold)
         tiered.append(replace(record, confidence_tier=tier))
     return tiered
+
+
+def _screen_included_population(
+    store: RunStore, normalized: NormalizedInput
+) -> list[IncludedRecord]:
+    """Recompute the include-and-escalate population from stored decisions.
+
+    A record is in the include-and-escalate set if its stored decision
+    either escalated or auto-labeled it relevant -- the complement of
+    `_screen_excluded_population`, and a screening-time property that,
+    unlike the excluded population, does not depend on whether escalations
+    have since been adjudicated (manuscript §2.9's "records the ensemble
+    did not exclude"). An inclusion-audit draw can therefore run as soon as
+    `attest screen` has written decisions, in parallel with `attest
+    adjudicate`.
+
+    Args:
+        store: A `RunStore` holding written decisions for this epoch.
+        normalized: The original input, used to look up each record's track.
+    """
+    track_by_id = {record.id: record.track for record in normalized.records}
+    population: list[IncludedRecord] = []
+    for record_id, decision in store.read_decisions().items():
+        if not (decision.escalate or decision.auto_label == _RELEVANT_LABEL):
+            continue
+        status = STATUS_ESCALATED if decision.escalate else STATUS_INCLUDED
+        population.append(
+            IncludedRecord(
+                record_id=record_id, track=track_by_id.get(record_id, "unknown"), status=status
+            )
+        )
+    return population
+
+
+def _inclusion_population_sizes(population: Sequence[IncludedRecord]) -> dict[str, int]:
+    """Build inclusion-audit stratum population sizes, mirroring `_population_sizes`.
+
+    Returns an "all" entry (for unstratified draws) plus one entry per
+    distinct track (for `stratify_by_track=True` draws) and one entry per
+    distinct `status` (for `stratify_by_status=True` draws), sharing one
+    flat namespace exactly as `_population_sizes` does for track and
+    confidence tier -- the two inclusion-side stratification modes are
+    mutually exclusive per draw (see `draw_inclusion_audit_sample`), so in
+    practice only one of the two ever populates a given run's
+    inclusion-audit rows. Simpler than `_population_sizes`: `IncludedRecord`
+    has no confidence tier (there is no established inclusion-side analog
+    of confidence stratification yet -- see `draw_inclusion_audit_sample`'s
+    docstring).
+    """
+    sizes: dict[str, int] = defaultdict(int)
+    sizes["all"] = len(population)
+    for record in population:
+        sizes[str(record.track)] += 1
+        sizes[record.status] += 1
+    return dict(sizes)
 
 
 def _audit_draw_size(value: str) -> int | None:
@@ -698,6 +762,54 @@ def _cmd_audit_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inclusion_audit_draw(args: argparse.Namespace) -> int:
+    """Draw a random inclusion-audit sample from the current include-and-escalate population."""
+    store = RunStore(Path(args.run_dir))
+    normalized = load_input(args.input)
+    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+
+    population = _screen_included_population(store, normalized)
+    if not population:
+        raise CliError("no include-or-escalate records are available to audit")
+
+    size = args.size if args.size is not None else len(population)
+    rng = Random(args.seed) if args.seed is not None else None
+    rows = draw_inclusion_audit_sample(
+        population,
+        size,
+        stratify_by_track=args.stratify_by_track,
+        stratify_by_status=args.stratify_by_status,
+        rng=rng,
+    )
+    frame_hash = population_frame_hash(population)
+    store.write_inclusion_audit_rows(ensemble_config_id, rows)
+    store.write_inclusion_audit_draw(ensemble_config_id, rows, sampling_frame_hash=frame_hash)
+
+    drawn = [{"record_id": row.record_id, "stratum": row.stratum} for row in rows]
+    print(json.dumps({"drawn": drawn, "sampling_frame_hash": frame_hash}, indent=2))
+    return 0
+
+
+def _cmd_inclusion_audit_apply(args: argparse.Namespace) -> int:
+    """Apply human gold-check labels to previously drawn, unlabeled inclusion-audit rows."""
+    store = RunStore(Path(args.run_dir))
+    ensemble_config_id = compute_ensemble_config_id(store.read_config())
+    labels = _load_labels(Path(args.labels))
+
+    rows: list[InclusionAuditRow] = store.read_inclusion_audit_rows()
+    unlabeled = [row for row in rows if row.human_label is None]
+    if not unlabeled:
+        raise CliError("no unlabeled inclusion-audit rows are pending")
+
+    updated = ingest_inclusion_audit_labels(
+        unlabeled, labels, reviewer=args.reviewer, blinded=args.blinded
+    )
+    store.write_inclusion_audit_rows(ensemble_config_id, updated)
+
+    print(json.dumps({"labeled": [row.record_id for row in updated]}, indent=2))
+    return 0
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     """Assemble a full validation record for the run directory's current epoch."""
     store = RunStore(Path(args.run_dir))
@@ -723,6 +835,14 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     population_sizes = _population_sizes(
         population, include_confidence=confidence_policy is not None
     )
+
+    # Built unconditionally, like population_sizes above: cheap to compute,
+    # and assemble_validation_record only engages the audited-TP path when
+    # this run also has at least one labeled inclusion-audit row (see
+    # attest.planes.inclusion_audit) -- otherwise TP is taken as exact,
+    # unchanged from prior behavior.
+    included_population = _screen_included_population(store, normalized)
+    inclusion_population_sizes = _inclusion_population_sizes(included_population)
 
     # Auto-resolve escalations from this run's own 'attest adjudicate' provenance
     # first, since that's the authoritative in-kernel resolution path; an
@@ -754,6 +874,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         human_labels=human_labels,
         confidence=args.confidence,
         allow_unresolved_escalations=args.allow_unresolved_escalations,
+        inclusion_population_sizes=inclusion_population_sizes,
     )
 
     payload = record.to_dict()
@@ -1276,6 +1397,61 @@ def _build_parser() -> argparse.ArgumentParser:
         "screen-excluded decision, recorded on each updated audit row.",
     )
     audit_apply.set_defaults(handler=_cmd_audit_apply)
+
+    inclusion_audit_draw = subparsers.add_parser(
+        "inclusion-audit-draw",
+        help="Draw a random inclusion-audit sample from the include-and-escalate population.",
+    )
+    inclusion_audit_draw.add_argument(
+        "--run-dir", required=True, help="Run directory to read/write."
+    )
+    inclusion_audit_draw.add_argument(
+        "--input", required=True, help="Original input-contract JSON file, for track lookup."
+    )
+    inclusion_audit_draw.add_argument(
+        "--size",
+        type=_audit_draw_size,
+        required=True,
+        help="Number of records to draw, or 'all' to draw the entire "
+        "include-and-escalate population (for exact, not just floored, TP).",
+    )
+    inclusion_audit_draw.add_argument(
+        "--stratify-by-track", action="store_true", help="Stratify the draw by record track."
+    )
+    inclusion_audit_draw.add_argument(
+        "--stratify-by-status",
+        action="store_true",
+        help="Stratify the draw by include-vs-escalate status instead of track "
+        "(mutually exclusive with --stratify-by-track).",
+    )
+    inclusion_audit_draw.add_argument(
+        "--seed", type=int, default=None, help="Seed for a reproducible random draw."
+    )
+    inclusion_audit_draw.set_defaults(handler=_cmd_inclusion_audit_draw)
+
+    inclusion_audit_apply = subparsers.add_parser(
+        "inclusion-audit-apply", help="Apply human gold-check labels to drawn inclusion-audit rows."
+    )
+    inclusion_audit_apply.add_argument(
+        "--run-dir", required=True, help="Run directory to read/write."
+    )
+    inclusion_audit_apply.add_argument(
+        "--labels", required=True, help="JSON file mapping record id to human ordinal label."
+    )
+    inclusion_audit_apply.add_argument(
+        "--reviewer",
+        default=None,
+        help="Id or pseudonym of the human who produced every label in --labels, recorded on "
+        "each updated inclusion-audit row.",
+    )
+    inclusion_audit_apply.add_argument(
+        "--blinded",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether --reviewer gold-checked these rows without seeing the ensemble's "
+        "include-or-escalate decision, recorded on each updated inclusion-audit row.",
+    )
+    inclusion_audit_apply.set_defaults(handler=_cmd_inclusion_audit_apply)
 
     validate = subparsers.add_parser(
         "validate", help="Assemble a validation record from a run directory."

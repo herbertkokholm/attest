@@ -13,7 +13,6 @@ row not tagged `PLANE_RECALL_AUDIT` is refused outright, not silently ignored.
 from __future__ import annotations
 
 import hashlib
-import math
 import random
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -23,6 +22,7 @@ from typing import Protocol
 from attest.ensemble.confidence import UNSCORED_TIER
 from attest.ensemble.votes import VALID_RATINGS
 from attest.planes import PLANE_RECALL_AUDIT
+from attest.planes._apportionment import allocate_proportionally
 from attest.stats.recall import Stratum
 
 _UNSTRATIFIED_NAME = "all"
@@ -120,7 +120,19 @@ def _confidence_key(record: ExcludedRecord) -> str:
     return record.confidence_tier
 
 
-def population_frame_hash(population: Sequence[ExcludedRecord]) -> str:
+class _HasRecordId(Protocol):
+    """Structural shape `population_frame_hash` requires: just a record id.
+
+    Both `ExcludedRecord` and `attest.planes.inclusion_audit.IncludedRecord`
+    satisfy this, so both planes hash their sampling frame with the exact
+    same function.
+    """
+
+    @property
+    def record_id(self) -> str: ...
+
+
+def population_frame_hash(population: Sequence[_HasRecordId]) -> str:
     """Return a content hash of the eligible population a draw was sampled from.
 
     Persisted alongside a draw (see `attest.io.store.RunStore.write_audit_draw`)
@@ -214,29 +226,13 @@ def draw_audit_sample(
     for record in population:
         by_stratum[key_fn(record)].append(record)
 
-    allocation = _allocate_proportionally(n, {name: len(recs) for name, recs in by_stratum.items()})
+    allocation = allocate_proportionally(n, {name: len(recs) for name, recs in by_stratum.items()})
 
     rows: list[AuditRow] = []
     for stratum_name, count in allocation.items():
         sampled = active_rng.sample(by_stratum[stratum_name], count)
         rows.extend(AuditRow(record_id=r.record_id, stratum=stratum_name) for r in sampled)
     return rows
-
-
-def _allocate_proportionally(n: int, sizes: Mapping[str, int]) -> dict[str, int]:
-    """Allocate n draws across strata proportional to size, via largest-remainder apportionment.
-
-    Guarantees each stratum's allocation never exceeds its size, and the
-    allocations sum exactly to n.
-    """
-    total = sum(sizes.values())
-    raw = {name: n * size / total for name, size in sizes.items()}
-    floors = {name: math.floor(value) for name, value in raw.items()}
-    remainder = n - sum(floors.values())
-    by_largest_fraction = sorted(sizes, key=lambda name: raw[name] - floors[name], reverse=True)
-    for name in by_largest_fraction[:remainder]:
-        floors[name] += 1
-    return floors
 
 
 def ingest_audit_labels(
@@ -328,6 +324,12 @@ def build_strata(
             raise AuditError(f"stratum '{name}': no population size given")
         m = sum(1 for row in stratum_rows if row.human_label in relevant_labels)
         strata.append(
-            Stratum(name=name, n=len(stratum_rows), m=m, population=population_sizes[name])
+            Stratum(
+                name=name,
+                n=len(stratum_rows),
+                m=m,
+                population=population_sizes[name],
+                role="exclusion",
+            )
         )
     return strata

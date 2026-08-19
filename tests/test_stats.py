@@ -27,12 +27,17 @@ from attest.stats.correlation import (
 from attest.stats.recall import (
     RecallError,
     Stratum,
+    estimated_missed_fn,
+    estimated_true_positives,
     exclusion_count_upper_bound,
     exclusion_error_rate,
     exclusion_error_rate_floor,
+    hypergeometric_lower_bound,
     hypergeometric_upper_bound,
+    inclusion_count_lower_bound,
     recall_with_floor,
     stratified_recall,
+    stratified_recall_with_audited_tp,
     wilson_interval,
 )
 from attest.stats.recall import _finite_population_correction as fpc
@@ -569,6 +574,258 @@ def test_exact_floor_at_census_matches_point_exactly() -> None:
 
     assert estimate.exact_floor == pytest.approx(1.0)
     assert estimate.exact_floor == pytest.approx(estimate.point)
+
+
+# --- hypergeometric_lower_bound: exact finite-population TP floor -------------
+
+
+def test_hypergeometric_lower_bound_satisfies_its_own_defining_condition() -> None:
+    from scipy import stats as scipy_stats
+
+    k, n, population, confidence = 5, 50, 500, 0.95
+    alpha = 1 - confidence
+
+    lower = hypergeometric_lower_bound(k, n, population, confidence=confidence)
+
+    # K itself must still satisfy P(X>=k|K) >= alpha ...
+    assert scipy_stats.hypergeom.sf(k - 1, population, lower, n) >= alpha
+    # ... and K-1 must not (K is the *smallest* such value), unless K is
+    # already at the domain floor (k itself).
+    if lower > k:
+        assert scipy_stats.hypergeom.sf(k - 1, population, lower - 1, n) < alpha
+
+
+def test_hypergeometric_lower_bound_at_census_returns_k_exactly() -> None:
+    # n == population: the sample is the whole population, K is k with certainty.
+    assert hypergeometric_lower_bound(0, 500, 500) == 0
+    assert hypergeometric_lower_bound(17, 500, 500) == 17
+
+
+def test_hypergeometric_lower_bound_at_zero_found_is_zero() -> None:
+    # No true positives observed rules out nothing about K from below.
+    assert hypergeometric_lower_bound(0, 50, 500) == 0
+
+
+def test_hypergeometric_lower_bound_is_at_least_k() -> None:
+    # K (total true positives in the population) can never be less than k
+    # (true positives already found in the sample), so the lower bound is
+    # never below the sample count itself.
+    assert hypergeometric_lower_bound(5, 40, 400) >= 5
+
+
+def test_hypergeometric_lower_bound_tightens_as_sampling_fraction_grows() -> None:
+    tiny_fraction = hypergeometric_lower_bound(2, 20, 200_000)
+    large_fraction = hypergeometric_lower_bound(2, 20, 22)
+
+    # A larger sampling fraction pulls the bound closer to k (here 2), the
+    # same direction hypergeometric_upper_bound tightens toward m as the
+    # sampling fraction grows.
+    assert large_fraction < tiny_fraction
+
+
+def test_hypergeometric_lower_bound_rejects_invalid_inputs() -> None:
+    with pytest.raises(RecallError):
+        hypergeometric_lower_bound(5, 3, 100)  # k > n
+    with pytest.raises(RecallError):
+        hypergeometric_lower_bound(1, 100, 50)  # n > population
+    with pytest.raises(RecallError):
+        hypergeometric_lower_bound(1, 10, 100, confidence=1.0)
+
+
+def test_inclusion_count_lower_bound_wraps_stratum_fields() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500)
+
+    assert inclusion_count_lower_bound(stratum) == hypergeometric_lower_bound(5, 50, 500)
+
+
+def test_estimated_true_positives_scales_sample_rate_to_population() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500)
+
+    assert estimated_true_positives(stratum) == pytest.approx(50.0)
+
+
+# --- Stratum.role: misuse guard against swapping exclusion/inclusion strata ---
+
+
+def test_stratum_role_defaults_to_none_and_is_unchecked() -> None:
+    # A Stratum built directly, as most tests here do, carries no role and
+    # is usable on either side -- there is no firewall to enforce for a
+    # caller who bypassed the builder functions entirely.
+    stratum = Stratum(name="s", n=50, m=5, population=500)
+
+    assert stratum.role is None
+    assert exclusion_count_upper_bound(stratum) >= 0
+    assert inclusion_count_lower_bound(stratum) >= 0
+
+
+def test_stratum_rejects_an_invalid_role() -> None:
+    with pytest.raises(RecallError):
+        Stratum(name="s", n=50, m=5, population=500, role="not-a-real-role")
+
+
+def test_exclusion_count_upper_bound_refuses_an_inclusion_tagged_stratum() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500, role="inclusion")
+
+    with pytest.raises(RecallError):
+        exclusion_count_upper_bound(stratum)
+
+
+def test_estimated_missed_fn_refuses_an_inclusion_tagged_stratum() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500, role="inclusion")
+
+    with pytest.raises(RecallError):
+        estimated_missed_fn(stratum)
+
+
+def test_inclusion_count_lower_bound_refuses_an_exclusion_tagged_stratum() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500, role="exclusion")
+
+    with pytest.raises(RecallError):
+        inclusion_count_lower_bound(stratum)
+
+
+def test_estimated_true_positives_refuses_an_exclusion_tagged_stratum() -> None:
+    stratum = Stratum(name="s", n=50, m=5, population=500, role="exclusion")
+
+    with pytest.raises(RecallError):
+        estimated_true_positives(stratum)
+
+
+def test_stratified_recall_with_audited_tp_refuses_swapped_strata_lists() -> None:
+    # The mistake the role tag exists to catch: an exclusion-audit stratum
+    # and an inclusion-audit stratum passed to the wrong side.
+    exclusion_shaped = Stratum(name="excl", n=20, m=1, population=200, role="exclusion")
+    inclusion_shaped = Stratum(name="incl", n=50, m=5, population=500, role="inclusion")
+
+    with pytest.raises(RecallError):
+        stratified_recall_with_audited_tp(
+            [inclusion_shaped], true_positives=50, inclusion_strata=[exclusion_shaped]
+        )
+
+
+# --- stratified_recall_with_audited_tp: joint TP/FN exact floor ---------------
+
+
+def test_audited_tp_without_inclusion_strata_matches_stratified_recall() -> None:
+    exclusion_strata = [Stratum(name="only", n=40, m=2, population=400)]
+
+    plain = stratified_recall(exclusion_strata, true_positives=100)
+    audited_none = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=100, inclusion_strata=None
+    )
+    audited_empty = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=100, inclusion_strata=[]
+    )
+
+    assert audited_none == plain
+    assert audited_empty == plain
+
+
+def test_audited_tp_bonferroni_adjusts_jointly_across_both_sides() -> None:
+    exclusion_strata = [
+        Stratum(name="a", n=20, m=0, population=200),
+        Stratum(name="b", n=30, m=3, population=500),
+    ]
+    inclusion_strata = [Stratum(name="incl", n=50, m=5, population=500)]
+
+    estimate = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=50, inclusion_strata=inclusion_strata, confidence=0.95
+    )
+
+    total_strata = len(exclusion_strata) + len(inclusion_strata)
+    bonferroni_confidence = 1 - (1 - 0.95) / total_strata
+
+    expected_fn = sum(
+        exclusion_count_upper_bound(s, confidence=bonferroni_confidence) for s in exclusion_strata
+    )
+    expected_tp_lower = sum(
+        inclusion_count_lower_bound(s, confidence=bonferroni_confidence) for s in inclusion_strata
+    )
+
+    assert estimate.estimated_fn_exact_floor == pytest.approx(expected_fn)
+    assert estimate.exact_floor == pytest.approx(
+        expected_tp_lower / (expected_tp_lower + expected_fn)
+    )
+
+
+def test_bonferroni_is_unconditionally_valid_but_sidak_is_strictly_tighter_here() -> None:
+    """Documents the module docstring's Bonferroni-vs-Sidak argument with numbers.
+
+    Bonferroni's union bound needs no independence assumption -- it is
+    used here deliberately (matching the manuscript's stated method and as
+    a hedge against a future change quietly breaking independence), not
+    because independence is required for it to be valid. The strata this
+    module combines *are* independent by construction (disjoint
+    populations, separate SRS draws per stratum -- see the module
+    docstring), so Sidak's per-stratum confidence is a genuine, currently
+    unused alternative that would give a strictly tighter (smaller
+    required per-stratum confidence, hence smaller upper / larger lower
+    bound magnitude) result at the same joint confidence -- not merely a
+    hypothetical one.
+    """
+    confidence = 0.95
+    total_strata = 3
+
+    bonferroni_confidence = 1 - (1 - confidence) / total_strata
+    sidak_confidence = confidence ** (1 / total_strata)
+
+    assert bonferroni_confidence == pytest.approx(0.9833333333333333)
+    assert sidak_confidence == pytest.approx(0.9830475724915585)
+    # Sidak's per-stratum requirement is strictly lower (less conservative)
+    # than Bonferroni's for any total_strata > 1, which is exactly what
+    # makes it a strictly tighter bound at the same joint confidence.
+    assert sidak_confidence < bonferroni_confidence
+
+    # Both, independently, do achieve the claimed joint one-sided coverage
+    # under genuine independence: 3 independent one-sided bounds each at
+    # per-stratum confidence c all holding simultaneously has probability
+    # c**3 (independence), which must be >= the target joint confidence.
+    assert bonferroni_confidence**total_strata >= confidence
+    assert sidak_confidence**total_strata == pytest.approx(confidence)
+
+
+def test_audited_tp_exact_floor_never_exceeds_point_estimate() -> None:
+    exclusion_strata = [Stratum(name="excl", n=20, m=1, population=200)]
+    inclusion_strata = [Stratum(name="incl", n=50, m=5, population=500)]
+
+    estimate = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=50, inclusion_strata=inclusion_strata
+    )
+
+    assert estimate.exact_floor <= estimate.point
+
+
+def test_audited_tp_leaves_point_untouched_but_nulls_fn_only_floor_and_ci() -> None:
+    # point is unaffected by how TP was obtained -- it already treats
+    # true_positives as a fixed input either way. floor/ci are different:
+    # both are FN-only bounds that would otherwise silently understate
+    # point's uncertainty once TP itself carries sampling error, so
+    # stratified_recall_with_audited_tp nulls them rather than reporting a
+    # number that looks like the usual conservative bound but isn't one.
+    # exact_floor is the one bound in this dataclass still valid here.
+    exclusion_strata = [Stratum(name="excl", n=20, m=1, population=200)]
+    inclusion_strata = [Stratum(name="incl", n=50, m=5, population=500)]
+
+    plain = stratified_recall(exclusion_strata, true_positives=50)
+    audited = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=50, inclusion_strata=inclusion_strata
+    )
+
+    assert audited.point == pytest.approx(plain.point)
+    assert audited.floor is None
+    assert audited.ci is None
+    assert audited.exact_floor != pytest.approx(plain.exact_floor)
+
+
+def test_audited_tp_at_full_census_both_sides_returns_exact_recall() -> None:
+    exclusion_strata = [Stratum(name="excl", n=200, m=0, population=200)]
+    inclusion_strata = [Stratum(name="incl", n=500, m=25, population=500)]
+
+    estimate = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=25, inclusion_strata=inclusion_strata
+    )
+
+    assert estimate.exact_floor == pytest.approx(1.0)
 
 
 # --- confusion.py -------------------------------------------------------------

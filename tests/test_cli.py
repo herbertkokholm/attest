@@ -133,7 +133,7 @@ def test_end_to_end_screen_audit_validate(
     assert validate_rc == 0
     record = json.loads(capsys.readouterr().out)
 
-    assert record["schema_version"] == "1.5"
+    assert record["schema_version"] == "1.6"
     assert record["config"]["zero_policy"] == "escalate"
     assert record["prisma"]["identified"] == 6
     assert record["prisma"]["duplicates_removed"] == 1
@@ -151,6 +151,128 @@ def test_end_to_end_screen_audit_validate(
     assert record["recall"]["exact_floor"] <= record["recall"]["point"]
     assert record["recall"]["audit_n"] == 2
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
+
+
+def test_end_to_end_inclusion_audit_draw_apply_validate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """As test_end_to_end_screen_audit_validate, but also exercises the TP-side audit.
+
+    rec-002 and rec-002-duplicate are the only two records screening
+    included (see _write_config/_DETERMINISTIC_SEED above); both are
+    actually gold-irrelevant (gold_label -1), so a full inclusion audit
+    over them should estimate TP as 0 -- matching the full-review
+    confusion["tp"] the sibling test already confirms is 0.
+    """
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    assert (
+        main(
+            [
+                "screen",
+                "--input",
+                _GOLD_SET,
+                "--config",
+                str(config_path),
+                "--run-dir",
+                str(run_dir),
+                "--deterministic-seed",
+                str(_DETERMINISTIC_SEED),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(["adjudicate", "--run-dir", str(run_dir), "--record-id", "rec-004", "--label", "-1"])
+        == 0
+    )
+    capsys.readouterr()
+
+    inclusion_draw_rc = main(
+        [
+            "inclusion-audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+        ]
+    )
+    assert inclusion_draw_rc == 0
+    inclusion_draw_output = json.loads(capsys.readouterr().out)
+    inclusion_drawn = inclusion_draw_output["drawn"]
+    inclusion_drawn_ids = {row["record_id"] for row in inclusion_drawn}
+    assert inclusion_drawn_ids == {"rec-002", "rec-002-duplicate"}
+    assert inclusion_draw_output["sampling_frame_hash"]
+    assert (
+        json.loads((run_dir / "inclusion_audit_draw.json").read_text())["sampling_frame_hash"]
+        == inclusion_draw_output["sampling_frame_hash"]
+    )
+
+    inclusion_labels_path = tmp_path / "inclusion_labels.json"
+    inclusion_labels_path.write_text(json.dumps({"rec-002": -1, "rec-002-duplicate": -1}))
+    inclusion_apply_rc = main(
+        [
+            "inclusion-audit-apply",
+            "--run-dir",
+            str(run_dir),
+            "--labels",
+            str(inclusion_labels_path),
+            "--reviewer",
+            "auditor-b",
+        ]
+    )
+    assert inclusion_apply_rc == 0
+    inclusion_labeled = json.loads(capsys.readouterr().out)["labeled"]
+    assert set(inclusion_labeled) == inclusion_drawn_ids
+
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "2",
+            "--seed",
+            "1",
+        ]
+    )
+    assert draw_rc == 0
+    capsys.readouterr()
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps({"rec-001": 1, "rec-004": -1}))
+    assert (
+        main(
+            [
+                "audit-apply",
+                "--run-dir",
+                str(run_dir),
+                "--labels",
+                str(labels_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    validate_rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert validate_rc == 0
+    record = json.loads(capsys.readouterr().out)
+
+    assert record["recall"]["tp_estimation_method"] == "inclusion_audit"
+    assert record["recall"]["estimated_true_positives"] == pytest.approx(0.0)
+    # confusion["tp"] is still computed from truths as always, and happens
+    # to agree with the audited estimate here -- both are 0.
+    assert record["confusion"]["tp"] == 0
+    assert record["recall"]["exact_floor"] is not None
 
 
 def test_validate_fails_closed_on_unresolved_escalation_by_default(
@@ -721,7 +843,7 @@ def test_validate_surfaces_the_tau_report_as_provenance(
     # The tau_report addition is CLI-output-only, not a validation-record
     # schema change; schema_version here just tracks the current
     # SCHEMA_VERSION (see attest.contracts.validation_record).
-    assert record["schema_version"] == "1.5"
+    assert record["schema_version"] == "1.6"
 
 
 def test_screen_batch_mode_then_batch_fetch_matches_sync(
@@ -1108,6 +1230,8 @@ def test_build_parser_registers_every_command() -> None:
         "adjudicate",
         "audit-draw",
         "audit-apply",
+        "inclusion-audit-draw",
+        "inclusion-audit-apply",
         "validate",
         "ablate",
         "protocol",

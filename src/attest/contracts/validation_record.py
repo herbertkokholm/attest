@@ -23,7 +23,17 @@ v1.5 added ``config.batch_size`` (additive): the request batch size `b_e`
 this epoch's configuration declares (see manuscript Eq. 1 and
 `attest.provenance.config.Config.batch_size`), hashed unconditionally into
 ``ensemble_config_id`` and now reported alongside the rest of the
-configuration for the same reason `zero_policy` is.
+configuration for the same reason `zero_policy` is. v1.6 added
+``recall.tp_estimation_method`` and ``recall.estimated_true_positives``
+(additive): which of the two ways TP was obtained -- ``"full_review"``
+(the include-and-escalate set was reviewed in full; unchanged default
+behavior) or ``"inclusion_audit"`` (TP was scaled up from a sampled
+inclusion audit, see `attest.stats.recall.stratified_recall_with_audited_tp`
+and `attest.planes.inclusion_audit`) -- and, in the latter case, the
+audit-scaled point estimate that was used. This makes the manuscript's own
+reporting requirement (Section 2.9: a recall floor must be reported
+together with the audit budget that produced it) machine-checkable rather
+than implicit in which CLI flags a run happened to use.
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -42,7 +52,7 @@ from typing import Any
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.5"
+SCHEMA_VERSION = "1.6"
 
 
 @dataclass
@@ -182,9 +192,25 @@ class Recall:
             `attest.stats.recall.hypergeometric_upper_bound`), or None if
             not yet audited. A genuine finite-population design-based
             bound, reported alongside `floor` rather than replacing it.
+            When `tp_estimation_method` is `"inclusion_audit"`, this is the
+            *joint* floor from `stratified_recall_with_audited_tp` --
+            valid at the requested confidence simultaneously across both
+            the TP-side and FN-side bounds, not just the FN side.
         ci: Optional confidence interval as (low, high).
         audit_n: Number of records drawn in the random recall audit.
         audit_budget_note: Free-text note on the audit sampling budget.
+        tp_estimation_method: How TP (the numerator of `point`/`floor`/
+            `exact_floor`) was obtained: `"full_review"` if the
+            include-and-escalate set was reviewed in full (TP known
+            exactly), or `"inclusion_audit"` if TP was instead scaled up
+            from a sampled inclusion audit (see
+            `attest.planes.inclusion_audit`), in which case `exact_floor`
+            carries the joint TP/FN propagation described above.
+        estimated_true_positives: The audit-scaled point estimate of TP
+            used, when `tp_estimation_method` is `"inclusion_audit"`.
+            `None` when TP was fully reviewed (the count is then exact and
+            already visible in `confusion["tp"]`, with no separate
+            estimate to report).
     """
 
     point: float | None = None
@@ -193,6 +219,8 @@ class Recall:
     ci: tuple[float, float] | None = None
     audit_n: int = 0
     audit_budget_note: str = ""
+    tp_estimation_method: str = "full_review"
+    estimated_true_positives: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return this recall summary as a plain dict."""
@@ -203,6 +231,8 @@ class Recall:
             "ci": list(self.ci) if self.ci is not None else None,
             "audit_n": self.audit_n,
             "audit_budget_note": self.audit_budget_note,
+            "tp_estimation_method": self.tp_estimation_method,
+            "estimated_true_positives": self.estimated_true_positives,
         }
 
 

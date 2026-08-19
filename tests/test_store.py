@@ -16,6 +16,7 @@ from attest.ensemble.votes import VoteVector, build_vote_vector
 from attest.io.store import RunStore, StoreError, assemble_validation_record, load_input
 from attest.planes.active_learning import ActiveLearningReview, ActiveLearningSelection
 from attest.planes.adjudication import AdjudicationItem
+from attest.planes.inclusion_audit import InclusionAuditRow
 from attest.planes.recall_audit import AuditRow
 from attest.prefilter.framework import Prefilter, Prisma, require_nonempty
 from attest.provenance.changelog import ChangeLog, ConfigChangeEvent
@@ -325,6 +326,32 @@ def test_audit_rows_round_trip(tmp_path: Path) -> None:
     assert store.read_audit_rows() == rows
 
 
+def test_inclusion_audit_rows_round_trip(tmp_path: Path) -> None:
+    rows = [
+        InclusionAuditRow(record_id="r1", stratum="all", human_label=1),
+        InclusionAuditRow(record_id="r2", stratum="all", human_label=-1),
+    ]
+    store = RunStore(tmp_path / "run")
+
+    store.write_inclusion_audit_rows("cfg-1", rows)
+
+    assert store.read_inclusion_audit_rows() == rows
+
+
+def test_inclusion_audit_rows_are_stored_separately_from_recall_audit_rows(tmp_path: Path) -> None:
+    # The two audit planes must never share a file: mixing them would let a
+    # TP-side row silently contribute to the FN-side estimate or vice versa.
+    exclusion_rows = [AuditRow(record_id="r1", stratum="all", human_label=-1)]
+    inclusion_rows = [InclusionAuditRow(record_id="r1", stratum="all", human_label=1)]
+    store = RunStore(tmp_path / "run")
+
+    store.write_audit_rows("cfg-1", exclusion_rows)
+    store.write_inclusion_audit_rows("cfg-1", inclusion_rows)
+
+    assert store.read_audit_rows() == exclusion_rows
+    assert store.read_inclusion_audit_rows() == inclusion_rows
+
+
 def test_run_records_round_trip_and_upsert(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "run")
     run = start_run(
@@ -417,6 +444,113 @@ def test_assemble_validation_record_end_to_end(tmp_path: Path) -> None:
     for pair in correlations.values():
         assert pair.correlation is None
         assert (pair.n, pair.both, pair.only_a, pair.only_b, pair.neither) == (2, 0, 0, 0, 2)
+
+
+def test_tp_full_review_used_without_inclusion_audit_rows(
+    tmp_path: Path,
+) -> None:
+    # Sanity check for the branch condition itself: passing
+    # inclusion_population_sizes with no stored, labeled inclusion-audit
+    # rows must not change anything -- confirms the audited-TP path is
+    # opt-in via stored rows, not merely via the parameter being present.
+    records = [
+        Record(id="rel-1", title="t", abstract="a", track=1, gold_label=1),
+        Record(id="rel-2", title="t", abstract="a", track=1, gold_label=1),
+        Record(id="exc-1", title="t", abstract="a", track=1, gold_label=-1),
+    ]
+    outcome = Prefilter(rules=[require_nonempty("abstract")]).run(records)
+
+    config = _config()
+    epoch = open_epoch(config, opened_at=datetime(2026, 1, 1, tzinfo=UTC))
+    config_id = epoch.ensemble_config_id
+
+    votes = [
+        _unanimous_votes("rel-1", config_id, 1),
+        _unanimous_votes("rel-2", config_id, 1),
+        _unanimous_votes("exc-1", config_id, -1),
+    ]
+    decisions = {
+        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau) for vv in votes
+    }
+    truths = {r.id: r.gold_label for r in records if r.has_gold and r.gold_label is not None}
+
+    store = RunStore(tmp_path / "run")
+    store.write_config(config)
+    store.write_epoch(epoch)
+    store.write_votes(votes)
+    store.write_decisions(config_id, decisions)
+    store.write_audit_rows(config_id, [AuditRow(record_id="exc-1", stratum="all", human_label=-1)])
+    # Deliberately no write_inclusion_audit_rows call.
+
+    record = assemble_validation_record(
+        store,
+        prefilter_prisma=outcome.prisma,
+        truths=truths,
+        population_sizes={"all": 1},
+        inclusion_population_sizes={"all": 2},
+    )
+
+    assert record.recall.tp_estimation_method == "full_review"
+    assert record.recall.estimated_true_positives is None
+    assert record.confusion["tp"] == 2
+
+
+def test_tp_audited_estimate_used_with_inclusion_audit_rows(
+    tmp_path: Path,
+) -> None:
+    records = [
+        Record(id="rel-1", title="t", abstract="a", track=1, gold_label=1),
+        Record(id="rel-2", title="t", abstract="a", track=1, gold_label=1),
+        Record(id="exc-1", title="t", abstract="a", track=1, gold_label=-1),
+    ]
+    outcome = Prefilter(rules=[require_nonempty("abstract")]).run(records)
+
+    config = _config()
+    epoch = open_epoch(config, opened_at=datetime(2026, 1, 1, tzinfo=UTC))
+    config_id = epoch.ensemble_config_id
+
+    votes = [
+        _unanimous_votes("rel-1", config_id, 1),
+        _unanimous_votes("rel-2", config_id, 1),
+        _unanimous_votes("exc-1", config_id, -1),
+    ]
+    decisions = {
+        vv.record_id: g(vv, aggregation=config.aggregation, tau=config.tau) for vv in votes
+    }
+    truths = {r.id: r.gold_label for r in records if r.has_gold and r.gold_label is not None}
+
+    store = RunStore(tmp_path / "run")
+    store.write_config(config)
+    store.write_epoch(epoch)
+    store.write_votes(votes)
+    store.write_decisions(config_id, decisions)
+    store.write_audit_rows(config_id, [AuditRow(record_id="exc-1", stratum="all", human_label=-1)])
+    # A (trivially exhaustive, n == population) inclusion audit over both
+    # included records, both truly relevant -- exercises the audited-TP
+    # branch without needing a partial-coverage scaling scenario.
+    store.write_inclusion_audit_rows(
+        config_id,
+        [
+            InclusionAuditRow(record_id="rel-1", stratum="all", human_label=1),
+            InclusionAuditRow(record_id="rel-2", stratum="all", human_label=1),
+        ],
+    )
+
+    record = assemble_validation_record(
+        store,
+        prefilter_prisma=outcome.prisma,
+        truths=truths,
+        population_sizes={"all": 1},
+        inclusion_population_sizes={"all": 2},
+    )
+
+    assert record.recall.tp_estimation_method == "inclusion_audit"
+    assert record.recall.estimated_true_positives == pytest.approx(2.0)
+    # confusion["tp"] is still computed from truths as always (it is not
+    # recall's TP source here, but remains available/unaffected).
+    assert record.confusion["tp"] == 2
+    assert record.recall.exact_floor is not None
+    assert record.recall.exact_floor <= record.recall.point
 
 
 def test_assemble_validation_record_fails_closed_on_unresolved_escalation(tmp_path: Path) -> None:
@@ -665,6 +799,39 @@ def test_audit_draw_repeated_calls_with_the_same_hash_are_fine(tmp_path: Path) -
 
     assert store.read_audit_sampling_frame_hash() == "same"
     assert store.read_audit_draw() == {"r1": "all", "r2": "all"}
+
+
+def test_inclusion_audit_draw_persists_sampling_frame_hash(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    rows = [InclusionAuditRow(record_id="r1", stratum="all")]
+
+    store.write_inclusion_audit_draw("cfg-1", rows, sampling_frame_hash="deadbeef")
+
+    assert store.read_inclusion_audit_sampling_frame_hash() == "deadbeef"
+
+
+def test_inclusion_audit_draw_sampling_frame_hash_defaults_to_none(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+
+    assert store.read_inclusion_audit_sampling_frame_hash() is None
+
+    store.write_inclusion_audit_draw("cfg-1", [InclusionAuditRow(record_id="r1", stratum="all")])
+
+    assert store.read_inclusion_audit_sampling_frame_hash() is None
+
+
+def test_inclusion_audit_draw_rejects_a_conflicting_sampling_frame_hash(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run")
+    store.write_inclusion_audit_draw(
+        "cfg-1", [InclusionAuditRow(record_id="r1", stratum="all")], sampling_frame_hash="first"
+    )
+
+    with pytest.raises(StoreError, match="sampling_frame_hash"):
+        store.write_inclusion_audit_draw(
+            "cfg-1",
+            [InclusionAuditRow(record_id="r2", stratum="all")],
+            sampling_frame_hash="second",
+        )
 
 
 def test_audit_rows_round_trip_reviewer_and_blinded(tmp_path: Path) -> None:

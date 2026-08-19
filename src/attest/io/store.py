@@ -40,6 +40,7 @@ from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
 from attest.planes.active_learning import ActiveLearningReview, ActiveLearningSelection
 from attest.planes.adjudication import AdjudicationError, AdjudicationItem, final_label
+from attest.planes.inclusion_audit import InclusionAuditRow, build_inclusion_strata
 from attest.planes.recall_audit import AuditRow, build_strata
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 from attest.provenance.changelog import ChangeLog, ConfigChangeEvent
@@ -55,13 +56,19 @@ from attest.stats.agreement import agreement_report, pairwise_alpha
 from attest.stats.confusion import RELEVANT_LABEL
 from attest.stats.confusion import confusion_matrix as _confusion_matrix
 from attest.stats.correlation import build_predictions_by_vendor, pairwise_fn_correlation
-from attest.stats.recall import stratified_recall
+from attest.stats.recall import (
+    estimated_true_positives,
+    stratified_recall,
+    stratified_recall_with_audited_tp,
+)
 
 CONFIG_FILENAME = "config.json"
 EPOCH_FILENAME = "epoch.json"
 VOTES_FILENAME = "votes.json"
 DECISIONS_FILENAME = "decisions.json"
 AUDIT_FILENAME = "audit.json"
+INCLUSION_AUDIT_FILENAME = "inclusion_audit.json"
+INCLUSION_AUDIT_DRAW_FILENAME = "inclusion_audit_draw.json"
 RUNS_FILENAME = "runs.json"
 BATCH_HANDLES_FILENAME = "batch_handles.json"
 RAW_RESPONSES_FILENAME = "raw_responses.json"
@@ -87,6 +94,11 @@ ACTIVE_LEARNING_REVIEWS_FILENAME = "active_learning_reviews.json"
 # names: config, protocol descriptor, input (hashed separately, see
 # RunManifest.input_hash), votes, raw responses, decisions, epoch,
 # changelog, audit draw, audit labels, and the validation record.
+# INCLUSION_AUDIT_DRAW_FILENAME is the TP-side analog of AUDIT_DRAW_FILENAME
+# (see write_inclusion_audit_draw); there is no inclusion-audit analog of
+# AUDIT_LABELS_FILENAME yet -- write_inclusion_audit_rows still upserts
+# labels directly into inclusion_audit.json rather than a separate
+# pre-/post-label snapshot pair, unlike the exclusion side.
 MANIFEST_ARTIFACTS = (
     CONFIG_FILENAME,
     PROTOCOL_FILENAME,
@@ -97,6 +109,7 @@ MANIFEST_ARTIFACTS = (
     CHANGELOG_FILENAME,
     AUDIT_DRAW_FILENAME,
     AUDIT_LABELS_FILENAME,
+    INCLUSION_AUDIT_DRAW_FILENAME,
     VALIDATION_RECORD_FILENAME,
 )
 
@@ -442,6 +455,109 @@ class RunStore:
             )
             for record_id, row in sorted(items.items())
         ]
+
+    def write_inclusion_audit_rows(
+        self, ensemble_config_id: str, rows: Sequence[InclusionAuditRow]
+    ) -> None:
+        """Upsert random inclusion-audit rows into `inclusion_audit.json`, keyed by record id.
+
+        Mirrors `write_audit_rows` for the TP-side audit (see
+        `attest.planes.inclusion_audit`). The pre-label "drawn" snapshot
+        `write_audit_draw` gives the exclusion side has a TP-side mirror
+        too -- `write_inclusion_audit_draw` -- so the inclusion audit's
+        sampling frame is independently verifiable the same way. There is
+        no inclusion-audit analog of `write_audit_labels`'s separate
+        "applied labels" snapshot yet: this method still upserts labels
+        directly into `inclusion_audit.json`. Left as a follow-up should
+        the inclusion audit need that same draw/label provenance
+        splitting.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn
+                under; must match this file's existing stamp, if any.
+            rows: The inclusion-audit rows to persist, labeled or not.
+        """
+        items = {
+            row.record_id: {
+                "stratum": row.stratum,
+                "human_label": row.human_label,
+                "reviewer": row.reviewer,
+                "blinded": row.blinded,
+            }
+            for row in rows
+        }
+        self._write_stamped(INCLUSION_AUDIT_FILENAME, "audit_rows", ensemble_config_id, items)
+
+    def read_inclusion_audit_rows(self) -> list[InclusionAuditRow]:
+        """Read all stored inclusion-audit rows, ordered by record id."""
+        _ensemble_config_id, items = self._read_stamped(INCLUSION_AUDIT_FILENAME, "audit_rows")
+        return [
+            InclusionAuditRow(
+                record_id=record_id,
+                stratum=row["stratum"],
+                human_label=row["human_label"],
+                reviewer=row.get("reviewer"),
+                blinded=row.get("blinded"),
+            )
+            for record_id, row in sorted(items.items())
+        ]
+
+    def write_inclusion_audit_draw(
+        self,
+        ensemble_config_id: str,
+        rows: Sequence[InclusionAuditRow],
+        *,
+        sampling_frame_hash: str | None = None,
+    ) -> None:
+        """Upsert the drawn (pre-label) inclusion-audit rows into `inclusion_audit_draw.json`.
+
+        Mirrors `write_audit_draw` for the TP-side audit: a snapshot
+        distinct from `inclusion_audit.json` (which `assemble_validation_record`
+        reads and which `inclusion-audit-apply` later upserts labels into),
+        so the sampling frame this draw ran against is independently
+        verifiable later -- the same protection `write_audit_draw` gives
+        the exclusion-side audit, which this side lacked until now.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn under.
+            rows: The freshly drawn (unlabeled) rows.
+            sampling_frame_hash: This draw's
+                `attest.planes.recall_audit.population_frame_hash` (which
+                `IncludedRecord` satisfies the same `_HasRecordId` shape
+                for), if available. Once written for a given
+                `ensemble_config_id`, later draws under the same id must
+                supply the identical hash; a mismatch raises `StoreError`.
+
+        Raises:
+            StoreError: If `sampling_frame_hash` conflicts with a hash
+                already stored for this run directory.
+        """
+        items = {row.record_id: row.stratum for row in rows}
+        existing_hash = self.read_inclusion_audit_sampling_frame_hash()
+        if (
+            sampling_frame_hash is not None
+            and existing_hash is not None
+            and sampling_frame_hash != existing_hash
+        ):
+            raise StoreError(
+                f"run directory '{self.root}' already recorded sampling_frame_hash "
+                f"'{existing_hash}' for a prior inclusion-audit draw; refusing to record a "
+                f"different hash '{sampling_frame_hash}' for the same ensemble_config_id -- "
+                "the include-and-escalate population must not change within an epoch's "
+                "inclusion-audit draws"
+            )
+        extra = {"sampling_frame_hash": sampling_frame_hash or existing_hash}
+        self._write_stamped(
+            INCLUSION_AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items, extra=extra
+        )
+
+    def read_inclusion_audit_sampling_frame_hash(self) -> str | None:
+        """Read the stored inclusion-audit draw's sampling-frame hash, or None if never recorded."""
+        payload = _read_json(self.root / INCLUSION_AUDIT_DRAW_FILENAME)
+        if payload is None:
+            return None
+        frame_hash: str | None = payload.get("sampling_frame_hash")
+        return frame_hash
 
     def write_run_record(self, run: RunRecord) -> None:
         """Upsert a run's provenance record into `runs.json`, keyed by run id."""
@@ -953,6 +1069,7 @@ def assemble_validation_record(
     human_labels: Mapping[str, int] | None = None,
     confidence: float = 0.95,
     allow_unresolved_escalations: bool = False,
+    inclusion_population_sizes: Mapping[str, int] | None = None,
 ) -> ValidationRecord:
     """Assemble a full `ValidationRecord` for an epoch from a completed run directory.
 
@@ -962,7 +1079,13 @@ def assemble_validation_record(
     conditional false-negative correlation, escalation rate, the confusion
     matrix against gold labels, and -- when the run's audit rows include at
     least one gold-checked record -- stratified recall with its
-    rule-of-three worst-case floor.
+    rule-of-three worst-case floor. When the run also has at least one
+    gold-checked inclusion-audit row (see `attest.planes.inclusion_audit`)
+    and `inclusion_population_sizes` is supplied, TP is instead estimated
+    from that audit and `exact_floor` becomes the joint TP/FN bound from
+    `attest.stats.recall.stratified_recall_with_audited_tp` -- otherwise TP
+    is taken as exact from the confusion matrix, unchanged from prior
+    versions.
 
     Args:
         store: A `RunStore` that already holds a written config, epoch, and
@@ -971,7 +1094,8 @@ def assemble_validation_record(
             seeding `identified`, `duplicates_removed`, `after_dedup`,
             `prefilter_excluded`, and `screened`.
         truths: Mapping of record id to gold ordinal label, used for error
-            correlation, the confusion matrix, and recall's true-positive count.
+            correlation, the confusion matrix, and (absent an inclusion
+            audit) recall's true-positive count.
         population_sizes: Mapping of audit stratum name to the total
             screen-excluded population size for that stratum, passed
             through to `attest.planes.recall_audit.build_strata`.
@@ -991,6 +1115,14 @@ def assemble_validation_record(
             counts as before. The omitted count is still reported in the
             returned record's `unresolved_escalations` field so this choice
             is never silent in the output. Default False: fail closed.
+        inclusion_population_sizes: Mapping of inclusion-audit stratum name
+            to the total include-and-escalate population size for that
+            stratum, passed through to
+            `attest.planes.inclusion_audit.build_inclusion_strata`. `None`
+            (the default) means TP is always taken as exact -- pass this
+            whenever the run's include-and-escalate set might be too large
+            to review in full, so a stored inclusion-audit draw (if any)
+            is honored.
 
     Returns:
         A `ValidationRecord` with every field the stored run supports filled in.
@@ -1007,6 +1139,7 @@ def assemble_validation_record(
     votes = store.read_votes()
     decisions = store.read_decisions()
     audit_rows = store.read_audit_rows()
+    inclusion_audit_rows = store.read_inclusion_audit_rows()
 
     if not votes:
         raise StoreError(f"run directory '{store.root}' has no stored votes to assemble from")
@@ -1070,10 +1203,35 @@ def assemble_validation_record(
     labeled_audit_rows = [row for row in audit_rows if row.human_label is not None]
     if labeled_audit_rows:
         strata = build_strata(labeled_audit_rows, population_sizes)
-        true_positives = record.confusion["tp"]
-        estimate = stratified_recall(strata, true_positives, confidence=confidence)
         audit_n = sum(s.n for s in strata)
         audited_population = sum(population_sizes.get(s.name, 0) for s in strata)
+
+        labeled_inclusion_rows = [
+            row for row in inclusion_audit_rows if row.human_label is not None
+        ]
+        if labeled_inclusion_rows and inclusion_population_sizes is not None:
+            inclusion_strata = build_inclusion_strata(
+                labeled_inclusion_rows, inclusion_population_sizes
+            )
+            # Passed through unrounded: rounding this would make `point`'s
+            # implied TP silently disagree with the `estimated_true_positives`
+            # reported below it in the same record (see
+            # attest.stats.recall.stratified_recall_with_audited_tp, which
+            # accepts a fractional true_positives for exactly this reason).
+            estimated_tp = sum(estimated_true_positives(s) for s in inclusion_strata)
+            estimate = stratified_recall_with_audited_tp(
+                strata,
+                estimated_tp,
+                inclusion_strata=inclusion_strata,
+                confidence=confidence,
+            )
+            tp_estimation_method = "inclusion_audit"
+            estimated_true_positives_reported: float | None = estimated_tp
+        else:
+            estimate = stratified_recall(strata, record.confusion["tp"], confidence=confidence)
+            tp_estimation_method = "full_review"
+            estimated_true_positives_reported = None
+
         record.recall = Recall(
             point=estimate.point,
             floor=estimate.floor,
@@ -1081,6 +1239,8 @@ def assemble_validation_record(
             ci=estimate.ci,
             audit_n=audit_n,
             audit_budget_note=f"{audit_n} of {audited_population} screen-excluded records audited",
+            tp_estimation_method=tp_estimation_method,
+            estimated_true_positives=estimated_true_positives_reported,
         )
 
     return record
@@ -1099,6 +1259,8 @@ __all__ = [
     "CONFIG_FILENAME",
     "DECISIONS_FILENAME",
     "EPOCH_FILENAME",
+    "INCLUSION_AUDIT_DRAW_FILENAME",
+    "INCLUSION_AUDIT_FILENAME",
     "MANIFEST_ARTIFACTS",
     "MANIFEST_FILENAME",
     "PROTOCOL_FILENAME",
