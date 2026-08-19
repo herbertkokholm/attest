@@ -185,6 +185,7 @@ def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
         vendors=vendors,
         aggregation=payload["aggregation"],
         tau=payload["tau"],
+        batch_size=payload.get("batch_size", 0),
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
@@ -215,6 +216,7 @@ def _to_record_config(config: EnsembleConfig) -> RecordConfig:
         prompts={name: spec.prompt_version for name, spec in config.vendors.items()},
         aggregation=config.aggregation,
         tau=config.tau,
+        batch_size=config.batch_size,
         x=config.x,
         zero_policy=config.zero_policy,
     )

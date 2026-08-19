@@ -34,6 +34,7 @@ def _write_config(path: Path) -> None:
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
             }
         )
     )
@@ -132,7 +133,7 @@ def test_end_to_end_screen_audit_validate(
     assert validate_rc == 0
     record = json.loads(capsys.readouterr().out)
 
-    assert record["schema_version"] == "1.4"
+    assert record["schema_version"] == "1.5"
     assert record["config"]["zero_policy"] == "escalate"
     assert record["prisma"]["identified"] == 6
     assert record["prisma"]["duplicates_removed"] == 1
@@ -269,6 +270,7 @@ def _write_confidence_config(path: Path, *, confidence_threshold: float | None =
         },
         "aggregation": "boundary_dispersion",
         "tau": 1.0,
+        "batch_size": 4,
     }
     if confidence_threshold is not None:
         payload["confidence_threshold"] = confidence_threshold
@@ -588,6 +590,96 @@ def test_screen_warns_for_a_dispersion_inert_tau(
     capsys.readouterr()
 
 
+def test_screen_rejects_a_batch_size_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # _GOLD_SET's prefilter keeps 4 records (see _DETERMINISTIC_SEED's
+    # comment); a declared batch_size of anything else must be rejected
+    # rather than silently hashed as an unverified provenance claim.
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+                "batch_size": 5,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "batch_size" in err
+    assert "5" in err
+    assert "4" in err
+    assert not (run_dir / "votes.json").exists()
+
+
+def test_screen_rejects_a_config_missing_batch_size(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # batch_size is required in the config file, on par with vendors/
+    # aggregation/tau -- an omitted key is a malformed config, not an
+    # implicit default.
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 1
+    assert "batch_size" in capsys.readouterr().err
+    assert not (run_dir / "votes.json").exists()
+
+
 def test_screen_rejects_a_nonsensical_tau(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -605,6 +697,7 @@ def test_screen_rejects_a_nonsensical_tau(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 0.0,
+                "batch_size": 4,
             }
         )
     )
@@ -671,9 +764,9 @@ def test_validate_surfaces_the_tau_report_as_provenance(
     assert record["tau_report"] == describe_tau(1.0, 2).to_dict()
     assert record["unresolved_escalations"] == 1
     # The tau_report addition is CLI-output-only, not a validation-record
-    # schema change; schema_version here reflects workstream C's
-    # zero_policy field on Config instead.
-    assert record["schema_version"] == "1.4"
+    # schema change; schema_version here just tracks the current
+    # SCHEMA_VERSION (see attest.contracts.validation_record).
+    assert record["schema_version"] == "1.5"
 
 
 def test_screen_batch_mode_then_batch_fetch_matches_sync(
@@ -844,6 +937,7 @@ def test_screen_rejects_an_unrecognized_zero_policy(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
                 "zero_policy": "exclude",
             }
         )
@@ -891,6 +985,7 @@ def test_screen_rejects_an_unresolved_todo_placeholder_in_config(
                 "vendors": {"v1": vendor_spec, "v2": unresolved_vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
             }
         )
     )
@@ -931,6 +1026,7 @@ def test_screen_with_zero_policy_include_auto_labels_the_tie(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
                 "zero_policy": "include",
             }
         )
@@ -974,6 +1070,7 @@ def test_ablate_over_gold_labeled_votes(tmp_path: Path, capsys: pytest.CaptureFi
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 0.5,
+                "batch_size": 4,
             }
         )
     )
@@ -1166,6 +1263,7 @@ def test_screen_with_previous_run_dir_logs_explicit_change_with_field_diff(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
             }
         )
     )
@@ -1503,6 +1601,7 @@ def test_manifest_includes_sdk_versions_for_real_vendor_names(
                 "vendors": {"openai": vendor_spec, "anthropic": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 4,
             }
         )
     )

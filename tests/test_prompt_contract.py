@@ -200,6 +200,9 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
     # the hash was previously blind to it. Retired and recomputed a second
     # time when `VendorSpec.temperature` was added, unconditionally included
     # in `VendorSpec.to_dict()` alongside `model_version`/`prompt_version`.
+    # Retired and recomputed a third time when `Config.batch_size` was
+    # added: unconditionally included, on par with
+    # `vendors`/`aggregation`/`tau`/`x` (see `Config.batch_size`).
     config = _base_config()
     payload = config.to_dict()
     expected_payload = {
@@ -213,10 +216,11 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
         },
         "aggregation": "boundary_dispersion",
         "tau": 0.5,
+        "batch_size": 0,
         "x": 1,
         "output_contract_version": OUTPUT_CONTRACT_VERSION,
     }
-    pinned_hash = "8ecfaf3773b34232283df03ea60a4cc30cf9fc2fff637e80eded8858a2463602"
+    pinned_hash = "a5b61b55f0045d360f4ed7c5bda8c5aa5f1247026ddf11ffcbe0e5df13180cbe"
 
     assert payload == expected_payload
     assert compute_ensemble_config_id(config) == pinned_hash

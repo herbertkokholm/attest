@@ -1,4 +1,4 @@
-"""Validation-record contract v1.4: one self-validation record per stable ensemble epoch.
+"""Validation-record contract v1.5: one self-validation record per stable ensemble epoch.
 
 This is a stable, versioned interface. Changing the shape produced here
 requires a version bump to ``SCHEMA_VERSION``, not an in-place edit. v1.1
@@ -19,6 +19,11 @@ now reported, with `n`/joint counts standing in when `correlation` is
 recall floor (see `attest.stats.recall.hypergeometric_upper_bound`),
 reported alongside `recall.floor`'s asymptotic rule-of-three/Wilson
 approximation as a genuine design-based alternative, `None` until audited.
+v1.5 added ``config.batch_size`` (additive): the request batch size `b_e`
+this epoch's configuration declares (see manuscript Eq. 1 and
+`attest.provenance.config.Config.batch_size`), hashed unconditionally into
+``ensemble_config_id`` and now reported alongside the rest of the
+configuration for the same reason `zero_policy` is.
 
 A validation record captures, for a given immutable ensemble configuration
 (``ensemble_config_id``) and epoch: the configuration itself, inter-rater
@@ -37,7 +42,7 @@ from typing import Any
 from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE
 from attest.prefilter.framework import Prisma as PrefilterPrisma
 
-SCHEMA_VERSION = "1.4"
+SCHEMA_VERSION = "1.5"
 
 
 @dataclass
@@ -50,6 +55,8 @@ class Config:
         prompts: Mapping of prompt role (e.g. "screening") to prompt text or id.
         aggregation: Name of the aggregation strategy across ensemble votes.
         tau: Decision threshold used by the aggregation strategy.
+        batch_size: The request batch size `b_e` this epoch's configuration
+            declares (see `attest.provenance.config.Config.batch_size`).
         x: Ensemble size (number of voting members) at this epoch.
         zero_policy: Disposition of a would-be `auto_label == 0` decision
             (see `attest.ensemble.aggregate.g`) that produced this record's
@@ -62,6 +69,7 @@ class Config:
     prompts: dict[str, str] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
+    batch_size: int = 0
     x: int = 0
     zero_policy: str = ZERO_POLICY_ESCALATE
 
@@ -73,6 +81,7 @@ class Config:
             "prompts": dict(self.prompts),
             "aggregation": self.aggregation,
             "tau": self.tau,
+            "batch_size": self.batch_size,
             "x": self.x,
             "zero_policy": self.zero_policy,
         }

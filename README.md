@@ -414,7 +414,7 @@ Three provenance levels are kept deliberately separate (see
 `attest.provenance.protocol`'s module docstring):
 
 - **Screening config** (`attest.provenance.config.Config`) -- vendors,
-  models, prompts, aggregation, tau, zero policy. The only thing
+  models, prompts, aggregation, tau, batch size, zero policy. The only thing
   `ensemble_config_id` hashes.
 - **Validation protocol** (`attest.provenance.protocol.ValidationProtocol`)
   -- audit-strata/design, the adjudication protocol, the sentinel-drift

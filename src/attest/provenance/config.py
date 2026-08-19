@@ -105,6 +105,18 @@ class Config:
             default) routes it to a human via escalation; `ZERO_POLICY_INCLUDE`
             folds it into `+1`. Validated at construction; only these two
             values are accepted -- there is deliberately no "exclude" option.
+        batch_size: The request batch size `b_e` this configuration was run
+            with -- the number of records submitted together in one screening
+            request (see manuscript Eq. 1 and Section 2.6). Hashed
+            unconditionally, on par with `vendors`/`aggregation`/`tau`/`x`,
+            because measured screening performance is sensitive to it even
+            under an unchanged model name: a run's batch size is declared
+            here and the caller (see `attest.cli._cmd_screen`) verifies it
+            against the actual number of records submitted, so a mismatch
+            is rejected rather than silently hashed as an unverified claim.
+            attest itself never uses this value to chunk or otherwise split
+            requests -- it is a declared, checked provenance value, not a
+            control knob.
         confidence_threshold: Default `low_threshold` (see
             `attest.ensemble.confidence.confidence_tier`) a confidence-
             stratified `audit-draw` uses when no `--confidence-threshold`
@@ -123,6 +135,7 @@ class Config:
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
+    batch_size: int = 0
     default_prompt: str | None = None
     track_prompts: dict[str, str] = field(default_factory=dict)
     zero_policy: str = ZERO_POLICY_ESCALATE
@@ -179,11 +192,18 @@ class Config:
         contract at all (see its attribute docstring above), so it is
         persisted separately by `attest.io.store._config_to_dict` instead
         of through this method.
+        `batch_size` is always included, unconditionally, on par with
+        `vendors`/`aggregation`/`tau`/`x`: it is `b_e` in the manuscript's
+        `C_e` tuple (Eq. 1), not an optional add-on like `zero_policy`, so
+        every change to it -- including a config built before this field
+        existed picking up its `0` default -- is hash-sensitive and opens a
+        new epoch.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
             "aggregation": self.aggregation,
             "tau": self.tau,
+            "batch_size": self.batch_size,
             "x": self.x,
         }
         if self.default_prompt is not None:

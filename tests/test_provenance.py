@@ -203,7 +203,13 @@ def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> No
     # added: every vendor now carries a `temperature`, always included in
     # `VendorSpec.to_dict()` (unconditionally, like `model_version` and
     # `prompt_version`), so it is unconditionally hash-sensitive too.
-    pinned_hash = "42b98574e686a64465726f31c3f84f893658fbd4d5085f4bcba354261a84edbc"
+    #
+    # Retired and recomputed a third time when `Config.batch_size` was
+    # added: it is unconditionally included in `to_dict()`, on par with
+    # `vendors`/`aggregation`/`tau`/`x` (see `Config.batch_size`), so even a
+    # config built before the field existed -- picking up its `0` default --
+    # now hashes differently.
+    pinned_hash = "918d142800120142e5916a468b6723d4d1c425d40a7543b999b82dc0d393ef6c"
 
     assert compute_ensemble_config_id(_config()) == pinned_hash
 
@@ -230,6 +236,32 @@ def test_zero_policy_include_changes_the_ensemble_config_id() -> None:
     )
 
     assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_include)
+
+
+def test_batch_size_is_included_in_config_to_dict() -> None:
+    # Unlike zero_policy/track_prompts/default_prompt, batch_size is never
+    # omitted -- it is `b_e` in the manuscript's C_e tuple (Eq. 1), on par
+    # with vendors/aggregation/tau/x (see Config.batch_size).
+    config = Config(
+        vendors=_config().vendors,
+        aggregation="majority",
+        tau=0.5,
+        batch_size=250,
+    )
+
+    assert config.to_dict()["batch_size"] == 250
+
+
+def test_batch_size_change_opens_a_new_epoch() -> None:
+    base = _config()
+    different_batch_size = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        batch_size=100,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(different_batch_size)
 
 
 def test_prompt_for_track_prefers_track_specific_over_default() -> None:
