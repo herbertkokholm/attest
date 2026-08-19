@@ -273,6 +273,13 @@ def test_end_to_end_inclusion_audit_draw_apply_validate(
     # to agree with the audited estimate here -- both are 0.
     assert record["confusion"]["tp"] == 0
     assert record["recall"]["exact_floor"] is not None
+    # floor/ci are FN-only bounds that would silently understate point's
+    # uncertainty once TP itself carries sampling error (see
+    # attest.stats.recall.stratified_recall_with_audited_tp) -- confirmed
+    # here at the actual CLI/JSON boundary, not just at the stats-unit
+    # level (test_audited_tp_leaves_point_untouched_but_nulls_fn_only_floor_and_ci).
+    assert record["recall"]["floor"] is None
+    assert record["recall"]["ci"] is None
 
 
 def test_validate_fails_closed_on_unresolved_escalation_by_default(
