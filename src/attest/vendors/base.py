@@ -268,9 +268,7 @@ def parse_batch_response(text: str, record_ids: Sequence[str]) -> dict[str, int]
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise VendorResponseError(
-            f"could not parse batch response as JSON: {text!r}"
-        ) from exc
+        raise VendorResponseError(f"could not parse batch response as JSON: {text!r}") from exc
     if not isinstance(payload, dict):
         raise VendorResponseError(f"batch response JSON must be an object, got: {text!r}")
 
@@ -611,9 +609,7 @@ def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Con
 
     votes_by_id: dict[str, list[Vote]] = {record.id: [] for record in records}
     raw_by_id: dict[str, dict[str, Any]] = {record.id: {} for record in records}
-    chunks = chunk_records(
-        records, lambda r: config.prompt_for_track(r.track), config.batch_size
-    )
+    chunks = chunk_records(records, lambda r: config.prompt_for_track(r.track), config.batch_size)
     for chunk in chunks:
         prompt = config.prompt_for_track(chunk[0].track)
         for rater in raters:
