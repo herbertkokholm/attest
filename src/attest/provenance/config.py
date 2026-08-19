@@ -25,6 +25,15 @@ from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 # back the other way would be circular. `attest.vendors.base` re-exports it.
 OUTPUT_CONTRACT_VERSION = "1"
 
+# Version of the kernel-owned multi-record output-format contract used when
+# `batch_size > 1` packs more than one record into a single screening request
+# (see `attest.vendors.base.BATCH_OUTPUT_CONTRACT`). Defined here for the same
+# circularity reason as `OUTPUT_CONTRACT_VERSION`, and re-exported from
+# `attest.vendors.base`. Included in `Config.to_dict` only when `batch_size >
+# 1` -- see `Config.to_dict` -- so a `batch_size == 1` configuration hashes
+# identically whether or not this constant exists, preserving its bytes.
+BATCH_OUTPUT_CONTRACT_VERSION = "1"
+
 # Convention (not enforced elsewhere) for a config field whose real value is
 # not yet known -- e.g. a served model snapshot string that must be captured
 # from a live vendor before a run is frozen. `VendorSpec.__post_init__`
@@ -105,18 +114,22 @@ class Config:
             default) routes it to a human via escalation; `ZERO_POLICY_INCLUDE`
             folds it into `+1`. Validated at construction; only these two
             values are accepted -- there is deliberately no "exclude" option.
-        batch_size: The request batch size `b_e` this configuration was run
-            with -- the number of records submitted together in one screening
-            request (see manuscript Eq. 1 and Section 2.6). Hashed
-            unconditionally, on par with `vendors`/`aggregation`/`tau`/`x`,
-            because measured screening performance is sensitive to it even
-            under an unchanged model name: a run's batch size is declared
-            here and the caller (see `attest.cli._cmd_screen`) verifies it
-            against the actual number of records submitted, so a mismatch
-            is rejected rather than silently hashed as an unverified claim.
-            attest itself never uses this value to chunk or otherwise split
-            requests -- it is a declared, checked provenance value, not a
-            control knob.
+        batch_size: `b_e` -- the maximum number of records packed into a
+            single vendor screening request (see manuscript Eq. 1 and
+            Section 2.6). A control knob set from the runbook, not a
+            provenance-only claim: `attest.vendors.base.run_ensemble` and
+            `attest.vendors.batch.submit_batch` actually chunk records into
+            requests of at most this size (grouped by resolved prompt first,
+            so records on different tracks/criteria are never packed
+            together; a final undersized chunk is valid). Defaults to `1`
+            -- one record per request, this kernel's original behavior.
+            Hashed unconditionally, on par with `vendors`/`aggregation`/
+            `tau`/`x`, because per-request packing changes measured
+            screening performance even under an unchanged model name: a
+            `batch_size` change opens a new epoch the same as a model or
+            prompt change would. Never checked against `len(kept)` or any
+            other record count -- it is a packing width, not a corpus-size
+            assertion.
         confidence_threshold: Default `low_threshold` (see
             `attest.ensemble.confidence.confidence_tier`) a confidence-
             stratified `audit-draw` uses when no `--confidence-threshold`
@@ -135,7 +148,7 @@ class Config:
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
-    batch_size: int = 0
+    batch_size: int = 1
     default_prompt: str | None = None
     track_prompts: dict[str, str] = field(default_factory=dict)
     zero_policy: str = ZERO_POLICY_ESCALATE
@@ -150,6 +163,8 @@ class Config:
             raise ValueError(
                 f"unknown zero_policy '{self.zero_policy}': expected one of {KNOWN_ZERO_POLICIES}"
             )
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
 
     @property
     def x(self) -> int:
@@ -195,9 +210,14 @@ class Config:
         `batch_size` is always included, unconditionally, on par with
         `vendors`/`aggregation`/`tau`/`x`: it is `b_e` in the manuscript's
         `C_e` tuple (Eq. 1), not an optional add-on like `zero_policy`, so
-        every change to it -- including a config built before this field
-        existed picking up its `0` default -- is hash-sensitive and opens a
-        new epoch.
+        every change to it is hash-sensitive and opens a new epoch.
+        `batch_output_contract_version` is included only when `batch_size >
+        1`: the multi-record output contract it versions (see
+        `attest.vendors.base.BATCH_OUTPUT_CONTRACT`) is only ever composed
+        onto a request when more than one record is packed into it, so a
+        `batch_size == 1` configuration -- which never touches that contract
+        -- hashes identically whether or not this constant exists, keeping
+        its `ensemble_config_id` byte-for-byte stable.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
@@ -211,6 +231,8 @@ class Config:
         if self.track_prompts:
             payload["track_prompts"] = dict(self.track_prompts)
         payload["output_contract_version"] = OUTPUT_CONTRACT_VERSION
+        if self.batch_size > 1:
+            payload["batch_output_contract_version"] = BATCH_OUTPUT_CONTRACT_VERSION
         if self.zero_policy != ZERO_POLICY_ESCALATE:
             payload["zero_policy"] = self.zero_policy
         return payload

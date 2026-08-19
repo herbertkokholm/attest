@@ -27,6 +27,6 @@
   },
   "aggregation": "boundary_dispersion",
   "tau": 1.0,
-  "batch_size": 4,
+  "batch_size": 1,
   "confidence_threshold": 0.5
 }

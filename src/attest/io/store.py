@@ -185,7 +185,7 @@ def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
         vendors=vendors,
         aggregation=payload["aggregation"],
         tau=payload["tau"],
-        batch_size=payload.get("batch_size", 0),
+        batch_size=payload.get("batch_size", 1),
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),

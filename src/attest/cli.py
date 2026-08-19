@@ -125,30 +125,30 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
     Args:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
             an object with "model", "model_version", "prompt_version",
-            "temperature"), "aggregation", "tau", "batch_size" (int -- the
-            request batch size `b_e` this configuration declares itself run
-            with; `_cmd_screen` verifies it against the actual number of
-            records submitted, see that function), and optionally
-            "default_prompt" (string), "track_prompts" (mapping of track to
-            prompt text), "zero_policy" (one of "escalate"/"include",
-            default "escalate"), and/or "confidence_threshold" (float in
-            [0, 1], default `attest.ensemble.confidence.DEFAULT_LOW_THRESHOLD`
-            -- the default `--confidence-threshold` a confidence-stratified
-            `audit-draw` uses for this review, sourced from this same file
-            for the same reason `tau` is, though unlike `tau` it never
-            affects `ensemble_config_id`; see `EnsembleConfig.confidence_threshold`)
+            "temperature"), "aggregation", "tau", and optionally "batch_size"
+            (int -- the maximum number of records `attest screen` packs into
+            one vendor request, see `EnsembleConfig.batch_size`; default 1,
+            one record per request), "default_prompt" (string),
+            "track_prompts" (mapping of track to prompt text), "zero_policy"
+            (one of "escalate"/"include", default "escalate"), and/or
+            "confidence_threshold" (float in [0, 1], default
+            `attest.ensemble.confidence.DEFAULT_LOW_THRESHOLD` -- the default
+            `--confidence-threshold` a confidence-stratified `audit-draw`
+            uses for this review, sourced from this same file for the same
+            reason `tau` is, though unlike `tau` it never affects
+            `ensemble_config_id`; see `EnsembleConfig.confidence_threshold`)
             fields.
 
     Returns:
         The parsed `EnsembleConfig`.
 
     Raises:
-        ValueError: If "zero_policy" names an unrecognized policy, or
-            "confidence_threshold" is outside `[0, 1]` (both propagated
-            from `EnsembleConfig.__post_init__`); or if any vendor's
-            "model"/"model_version"/"prompt_version" is still an unresolved
-            `TODO:`-prefixed placeholder (propagated from
-            `VendorSpec.__post_init__`).
+        ValueError: If "batch_size" is less than 1, "zero_policy" names an
+            unrecognized policy, or "confidence_threshold" is outside
+            `[0, 1]` (all propagated from `EnsembleConfig.__post_init__`);
+            or if any vendor's "model"/"model_version"/"prompt_version" is
+            still an unresolved `TODO:`-prefixed placeholder (propagated
+            from `VendorSpec.__post_init__`).
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     vendors = {
@@ -164,7 +164,7 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
         vendors=vendors,
         aggregation=payload["aggregation"],
         tau=float(payload["tau"]),
-        batch_size=int(payload["batch_size"]),
+        batch_size=int(payload.get("batch_size", 1)),
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
@@ -501,35 +501,6 @@ def _record_screen_config_change(
     )
 
 
-def _check_batch_size(config: EnsembleConfig, outcome: PrefilterOutcome) -> None:
-    """Verify the configured `batch_size` matches the records actually being screened.
-
-    `config.batch_size` is the request batch size `b_e` the caller (e.g. the
-    runbook) declares this run was assembled for -- part of the hashed,
-    versioned configuration (see `EnsembleConfig.batch_size`). attest never
-    uses it to chunk or otherwise control what is sent to a vendor; it only
-    confirms the declared value against `len(outcome.kept)`, the records
-    that actually survive the prefilter and are submitted to the ensemble
-    (records dropped for a missing abstract are never sent, so they are
-    correctly excluded from the count `batch_size` is checked against).
-
-    Args:
-        config: The ensemble configuration in force for this run.
-        outcome: The prefilter outcome for this run's input.
-
-    Raises:
-        CliError: If `config.batch_size` does not equal `len(outcome.kept)`.
-    """
-    actual = len(outcome.kept)
-    if config.batch_size != actual:
-        raise CliError(
-            f"configured batch_size ({config.batch_size}) does not match the number of "
-            f"records actually submitted to the ensemble ({actual}); the caller (e.g. the "
-            "runbook) must declare a batch_size equal to the prefiltered record count for "
-            "this run"
-        )
-
-
 def _cmd_screen(args: argparse.Namespace) -> int:
     """Run the deterministic prefilter, then the ensemble, over an input file.
 
@@ -562,7 +533,6 @@ def _cmd_screen(args: argparse.Namespace) -> int:
     store.write_tau_report(tau_report)
 
     outcome = _DEFAULT_PREFILTER.run(normalized.records)
-    _check_batch_size(config, outcome)
 
     if args.mode == "sync":
         raters = _build_raters(

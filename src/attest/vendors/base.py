@@ -12,14 +12,16 @@ this module itself never makes a network call.
 from __future__ import annotations
 
 import hashlib
+import json
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from attest.contracts.input import Record
 from attest.ensemble.votes import VALID_RATINGS, Vote, VoteVector
 from attest.provenance.config import (
+    BATCH_OUTPUT_CONTRACT_VERSION,
     OUTPUT_CONTRACT_VERSION,
     Config,
     compute_ensemble_config_id,
@@ -54,6 +56,21 @@ OUTPUT_CONTRACT = (
 # the upper-cased letter only.
 _ORDINAL_TOKENS: dict[str, int] = {"E": -1, "U": 0, "I": 1}
 _ORDINAL_TOKEN_TEXT: dict[int, str] = {ordinal: token for token, ordinal in _ORDINAL_TOKENS.items()}
+
+# The kernel-owned output-format contract used in place of `OUTPUT_CONTRACT`
+# whenever more than one record is packed into a single request (see
+# `Config.batch_size`). Composed onto a batch prompt in exactly one place --
+# `compose_batch_system_prompt` -- the same way `OUTPUT_CONTRACT` is for the
+# single-record path. Never used when a chunk holds exactly one record: that
+# case always routes through `compose_system_prompt`/`OUTPUT_CONTRACT`
+# instead, so a `batch_size == 1` configuration never composes this text.
+BATCH_OUTPUT_CONTRACT = (
+    "You will be screening multiple records in this request, each given a unique id. For "
+    "every record, decide whether it should be included using the rule above. Respond with "
+    "exactly one JSON object and nothing else, mapping each record's id (as a string) to its "
+    "decision letter: E to exclude, U if related but uncertain, or I to include. Include every "
+    'given id exactly once. Example, for records with ids "1" and "2": {"1": "I", "2": "E"}'
+)
 
 
 class VendorResponseError(ValueError):
@@ -186,6 +203,131 @@ def parse_ordinal_response(text: str) -> int:
     return found_ratings[0]
 
 
+def compose_batch_system_prompt(criteria: str | None) -> str:
+    """Build the final system message for a multi-record (`batch_size > 1`) request.
+
+    The multi-record counterpart of `compose_system_prompt`: same criteria
+    fallback, but appends `BATCH_OUTPUT_CONTRACT` (a per-id JSON mapping)
+    instead of `OUTPUT_CONTRACT` (a single letter), since a multi-record
+    request must return one decision per packed record, not one for the
+    whole request. Never used for a chunk of exactly one record -- that case
+    always uses `compose_system_prompt`, so a `batch_size == 1`
+    configuration never composes this text.
+
+    Args:
+        criteria: The task-specific screening criteria text, or None to fall
+            back to the generic `SCREENING_TASK_PREAMBLE`.
+
+    Returns:
+        `(criteria or SCREENING_TASK_PREAMBLE) + "\\n\\n" + BATCH_OUTPUT_CONTRACT`.
+    """
+    text = criteria if criteria is not None else SCREENING_TASK_PREAMBLE
+    return f"{text}\n\n{BATCH_OUTPUT_CONTRACT}"
+
+
+def compose_batch_user_message(records: Sequence[Record]) -> str:
+    """Build the user message listing every record in a multi-record request, by id.
+
+    Args:
+        records: The records packed into this request, in the order their
+            ids should appear.
+
+    Returns:
+        One "Record <id>: Title: ... Abstract: ..." block per record,
+        blank-line separated.
+    """
+    return "\n\n".join(
+        f"Record {record.id}:\nTitle: {record.title}\nAbstract: {record.abstract}"
+        for record in records
+    )
+
+
+def parse_batch_response(text: str, record_ids: Sequence[str]) -> dict[str, int]:
+    """Parse a multi-record reply into a mapping of record id to ordinal rating.
+
+    Mirrors `parse_ordinal_response`'s failure posture for the multi-record
+    case: a record in `record_ids` with no parseable rating in `text` is
+    never silently dropped or defaulted -- this raises instead, the same
+    disposition an unparseable single-record reply already gets today (see
+    `parse_ordinal_response`). An id present in `text` but not in
+    `record_ids` -- extra, duplicate, or hallucinated -- is simply ignored.
+
+    Args:
+        text: The rater's raw text response, expected to be a JSON object
+            mapping record id (string) to a decision letter or ordinal.
+        record_ids: The ids every returned rating must cover.
+
+    Returns:
+        Mapping of record id to ordinal rating (-1, 0, or 1), one entry per
+        id in `record_ids`.
+
+    Raises:
+        VendorResponseError: If `text` is not valid JSON, is not a JSON
+            object, or has no parseable rating for some id in `record_ids`.
+    """
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise VendorResponseError(
+            f"could not parse batch response as JSON: {text!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise VendorResponseError(f"batch response JSON must be an object, got: {text!r}")
+
+    results: dict[str, int] = {}
+    for record_id in record_ids:
+        value = payload.get(record_id)
+        if isinstance(value, str):
+            results[record_id] = parse_ordinal_response(value)
+        elif isinstance(value, int) and not isinstance(value, bool) and value in VALID_RATINGS:
+            results[record_id] = value
+        else:
+            raise VendorResponseError(
+                f"batch response has no parseable rating for record id {record_id!r}: {text!r}"
+            )
+    return results
+
+
+def chunk_records(
+    records: Sequence[Record], group_key: Callable[[Record], Any], batch_size: int
+) -> list[list[Record]]:
+    """Split `records` into request-sized chunks, grouped first by `group_key`.
+
+    Records are grouped by `group_key(record)` -- preserving each group's
+    relative order and the order groups first appear in `records` -- and
+    every group is then split into consecutive pieces of at most
+    `batch_size` records; a final undersized piece is valid, not an error.
+    Two records with different `group_key` values are never placed in the
+    same chunk, so callers pass a key that captures whatever must not be
+    mixed within one request (e.g. a record's resolved screening prompt).
+
+    Args:
+        records: The records to chunk.
+        group_key: Function computing the grouping key for one record.
+        batch_size: Maximum number of records per chunk.
+
+    Returns:
+        The chunks, in group-then-position order.
+    """
+    groups: dict[Any, list[Record]] = {}
+    order: list[Any] = []
+    for record in records:
+        key = group_key(record)
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = []
+            groups[key] = bucket
+            order.append(key)
+        bucket.append(record)
+
+    chunks: list[list[Record]] = []
+    for key in order:
+        group = groups[key]
+        for i in range(0, len(group), batch_size):
+            chunks.append(group[i : i + batch_size])
+    return chunks
+
+
 @runtime_checkable
 class Rater(Protocol):
     """A single ensemble member capable of rating one record on the ordinal scale.
@@ -223,6 +365,66 @@ class Rater(Protocol):
         """
         ...
 
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, Any]]:
+        """Rate every record in `records` together, in one request.
+
+        Called by `run_ensemble` once per chunk of more than one record (see
+        `Config.batch_size`); a chunk of exactly one record always routes
+        through `rate` instead, so a `batch_size == 1` configuration never
+        calls this method and stays byte-identical to before it existed.
+
+        Args:
+            records: The records to rate together, all sharing the same
+                resolved screening prompt (see `Config.prompt_for_track`).
+            prompt: Screening criteria text to use for this call, overriding
+                this rater's own configured criteria -- identical in meaning
+                to `rate`'s `prompt` parameter.
+
+        Returns:
+            One `(ordinal, raw_response)` pair per record in `records`, in
+            the same order.
+
+        Raises:
+            NotImplementedError: If this rater does not support packing more
+                than one record into a request. Never a silent per-record
+                loop: that would send one request per record while the
+                configuration's hashed `batch_size` claims more, misrepresenting
+                the instrument that actually ran.
+            VendorResponseError: If some record in `records` has no
+                parseable rating in the response -- the multi-record
+                counterpart of `rate`'s own unparseable-response failure;
+                never silently dropped or defaulted.
+        """
+        ...
+
+
+class SingleRecordOnlyRateMany:
+    """Mixin `rate_many` for a `Rater` that has not yet been converted to true
+    multi-record packing (see `Config.batch_size`).
+
+    Supports a chunk of exactly one record -- routed through the class's own
+    `rate` -- and raises for anything larger, rather than silently issuing
+    one request per record while the configuration's hashed `batch_size`
+    claims more. `run_ensemble` itself never calls `rate_many` for a
+    singleton chunk (it calls `rate` directly), so in practice this mixin's
+    `rate_many` is only ever invoked with `len(records) > 1`, and always
+    raises; the `len(records) == 1` branch exists for direct callers (e.g.
+    tests) and to keep the contract honest on its own terms.
+    """
+
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, Any]]:
+        if len(records) > 1:
+            raise NotImplementedError(
+                f"{type(self).__name__}.rate_many does not support packing more than one "
+                f"record into a request (got {len(records)} records); this provider has not "
+                "yet been converted to true multi-record packing -- see Config.batch_size"
+            )
+        return [self.rate(records[0], prompt=prompt)]  # type: ignore[attr-defined]
+
 
 @dataclass
 class DeterministicRater:
@@ -256,23 +458,25 @@ class DeterministicRater:
     seed: int = 0
     request_logprobs: bool = False
 
-    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
-        """Deterministically derive an ordinal rating from `record.id`, this rater's
-        seed, and (if given) the composed system prompt built from `prompt` criteria.
+    def _rate_one(
+        self, record: Record, *, prompt: str | None, peers: tuple[str, ...]
+    ) -> tuple[int, dict[str, Any]]:
+        """Shared digest/rating computation behind `rate` and `rate_many`.
 
-        `prompt` only enters the digest when explicitly passed, so every
-        pre-existing caller that never passed one (i.e. always called with
-        `prompt=None`) gets the exact same ratings as before this parameter
-        existed -- calibrated seeds in existing tests stay valid. When
-        `prompt` is passed, it is routed through `compose_system_prompt`
-        before entering the digest, exactly as a live provider would route
-        it before sending, so sync and batch execution -- and this rater's
-        sensitivity to `OUTPUT_CONTRACT` changes -- stay in step with the
-        live raters it stands in for.
+        `peers` is the sorted tuple of the *other* record ids sharing this
+        record's request chunk (empty for `rate`'s single-record calls and
+        for a `rate_many` chunk of one). It only enters the digest when
+        non-empty, so a singleton chunk's digest -- and thus rating and raw
+        response -- reduces exactly to what `rate` alone would produce,
+        preserving `batch_size == 1` reproducibility while making
+        `rate_many` genuinely sensitive to a record's chunk peers (see
+        `Config.batch_size`).
         """
         digest_input = f"{self.seed}:{self.vendor}:{self.model}:{record.id}"
         if prompt is not None:
             digest_input = f"{digest_input}:{compose_system_prompt(prompt)}"
+        if peers:
+            digest_input = f"{digest_input}:{','.join(peers)}"
         digest = hashlib.sha256(digest_input.encode()).digest()
         ordinal = VALID_RATINGS[digest[0] % len(VALID_RATINGS)]
         raw_response: dict[str, Any] = {
@@ -289,6 +493,44 @@ class DeterministicRater:
                 "content": [{"token": _ORDINAL_TOKEN_TEXT[ordinal], "logprob": fake_logprob}]
             }
         return ordinal, raw_response
+
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
+        """Deterministically derive an ordinal rating from `record.id`, this rater's
+        seed, and (if given) the composed system prompt built from `prompt` criteria.
+
+        `prompt` only enters the digest when explicitly passed, so every
+        pre-existing caller that never passed one (i.e. always called with
+        `prompt=None`) gets the exact same ratings as before this parameter
+        existed -- calibrated seeds in existing tests stay valid. When
+        `prompt` is passed, it is routed through `compose_system_prompt`
+        before entering the digest, exactly as a live provider would route
+        it before sending, so sync and batch execution -- and this rater's
+        sensitivity to `OUTPUT_CONTRACT` changes -- stay in step with the
+        live raters it stands in for.
+        """
+        return self._rate_one(record, prompt=prompt, peers=())
+
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Deterministically derive one ordinal rating per record, each sensitive to
+        its chunk peers (see `Config.batch_size`).
+
+        Every record's digest includes the sorted tuple of the *other*
+        record ids in `records` -- its chunk peers -- alongside the same
+        seed/vendor/model/id/prompt inputs `rate` uses, so this rater's
+        output genuinely depends on how records are packed together, not
+        just on batch_size counted but ignored. For a singleton `records`
+        (one record, no peers), this reduces exactly to `rate`'s own output
+        (see `_rate_one`), so `batch_size == 1` reproducibility is
+        unaffected by this method's existence.
+        """
+        ids = [record.id for record in records]
+        results: list[tuple[int, dict[str, Any]]] = []
+        for record in records:
+            peers = tuple(sorted(rid for rid in ids if rid != record.id))
+            results.append(self._rate_one(record, prompt=prompt, peers=peers))
+        return results
 
 
 @dataclass(frozen=True)
@@ -310,11 +552,24 @@ class EnsembleRun:
 def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Config) -> EnsembleRun:
     """Run every rater over every record and collect the raw vote vectors.
 
-    Each record is rated once by each rater in `raters`, in order; the
-    resulting per-vendor votes are retained as a `VoteVector` stamped with
-    the `ensemble_config_id` derived from `config`. No aggregation happens
-    here -- that is `attest.ensemble.aggregate.g`'s job, applied later to the
-    retained vote vectors.
+    Each record is rated once by each rater in `raters`; the resulting
+    per-vendor votes are retained as a `VoteVector`, in `records` order,
+    stamped with the `ensemble_config_id` derived from `config`. No
+    aggregation happens here -- that is `attest.ensemble.aggregate.g`'s job,
+    applied later to the retained vote vectors.
+
+    At `config.batch_size == 1` (the default), each rater is called once per
+    record via `Rater.rate`, in `records` order -- the exact code path this
+    function has always used, so results stay byte-identical regardless of
+    `batch_size`'s existence. At `batch_size > 1`, records are grouped by
+    resolved prompt (`config.prompt_for_track`, preserving each group's
+    input order; two records with different resolved prompts are never
+    packed together) and split into chunks of at most `batch_size` records
+    (a final undersized chunk is valid); each rater is called once per chunk
+    via `Rater.rate_many`. Chunking is internal to this function -- nothing
+    downstream (planes, stats, ablation, `attest.io.store`, the validation
+    record) is aware of it; every record still gets exactly one `VoteVector`,
+    in its original `records` position.
 
     Args:
         records: The records to rate.
@@ -322,38 +577,69 @@ def run_ensemble(records: Iterable[Record], raters: Sequence[Rater], config: Con
             recorded into each record's vote vector.
         config: The ensemble configuration in force for this run, used to
             compute the `ensemble_config_id` every resulting vote vector is
-            stamped with, and -- via `config.prompt_for_track` -- to resolve
-            each record's screening prompt from its `track`.
+            stamped with, to resolve each record's screening prompt and
+            chunk-grouping key (`config.prompt_for_track`), and to size
+            chunks (`config.batch_size`).
 
     Returns:
-        An `EnsembleRun` holding one `VoteVector` per record and the raw,
-        per-vendor responses that produced them.
+        An `EnsembleRun` holding one `VoteVector` per record, in `records`
+        order, and the raw, per-vendor responses that produced them.
     """
+    records = list(records)
     ensemble_config_id = compute_ensemble_config_id(config)
-    votes: list[VoteVector] = []
-    raw_responses: dict[str, dict[str, Any]] = {}
 
-    for record in records:
-        prompt = config.prompt_for_track(record.track)
-        record_votes: list[Vote] = []
-        record_raw: dict[str, Any] = {}
-        for rater in raters:
-            ordinal, raw = rater.rate(record, prompt=prompt)
-            record_votes.append(Vote(vendor=rater.vendor, rating=ordinal))
-            record_raw[rater.vendor] = raw
-        votes.append(
-            VoteVector(
-                record_id=record.id,
-                ensemble_config_id=ensemble_config_id,
-                votes=tuple(record_votes),
+    if config.batch_size == 1:
+        votes: list[VoteVector] = []
+        raw_responses: dict[str, dict[str, Any]] = {}
+        for record in records:
+            prompt = config.prompt_for_track(record.track)
+            record_votes: list[Vote] = []
+            record_raw: dict[str, Any] = {}
+            for rater in raters:
+                ordinal, raw = rater.rate(record, prompt=prompt)
+                record_votes.append(Vote(vendor=rater.vendor, rating=ordinal))
+                record_raw[rater.vendor] = raw
+            votes.append(
+                VoteVector(
+                    record_id=record.id,
+                    ensemble_config_id=ensemble_config_id,
+                    votes=tuple(record_votes),
+                )
             )
-        )
-        raw_responses[record.id] = record_raw
+            raw_responses[record.id] = record_raw
+        return EnsembleRun(votes=votes, raw_responses=raw_responses)
 
+    votes_by_id: dict[str, list[Vote]] = {record.id: [] for record in records}
+    raw_by_id: dict[str, dict[str, Any]] = {record.id: {} for record in records}
+    chunks = chunk_records(
+        records, lambda r: config.prompt_for_track(r.track), config.batch_size
+    )
+    for chunk in chunks:
+        prompt = config.prompt_for_track(chunk[0].track)
+        for rater in raters:
+            if len(chunk) == 1:
+                results = [rater.rate(chunk[0], prompt=prompt)]
+            else:
+                results = rater.rate_many(chunk, prompt=prompt)
+            for record, (ordinal, raw) in zip(chunk, results, strict=True):
+                votes_by_id[record.id].append(Vote(vendor=rater.vendor, rating=ordinal))
+                raw_by_id[record.id][rater.vendor] = raw
+
+    votes = [
+        VoteVector(
+            record_id=record.id,
+            ensemble_config_id=ensemble_config_id,
+            votes=tuple(votes_by_id[record.id]),
+        )
+        for record in records
+    ]
+    raw_responses = {record.id: raw_by_id[record.id] for record in records}
     return EnsembleRun(votes=votes, raw_responses=raw_responses)
 
 
 __all__ = [
+    "BATCH_OUTPUT_CONTRACT",
+    "BATCH_OUTPUT_CONTRACT_VERSION",
     "OUTPUT_CONTRACT",
     "OUTPUT_CONTRACT_VERSION",
     "SCREENING_TASK_PREAMBLE",
@@ -361,9 +647,14 @@ __all__ = [
     "EnsembleRun",
     "ModelVersionDriftError",
     "Rater",
+    "SingleRecordOnlyRateMany",
     "VendorResponseError",
     "check_model_version",
+    "chunk_records",
+    "compose_batch_system_prompt",
+    "compose_batch_user_message",
     "compose_system_prompt",
+    "parse_batch_response",
     "parse_ordinal_response",
     "run_ensemble",
 ]

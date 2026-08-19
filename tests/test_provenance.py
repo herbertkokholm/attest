@@ -209,7 +209,11 @@ def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> No
     # `vendors`/`aggregation`/`tau`/`x` (see `Config.batch_size`), so even a
     # config built before the field existed -- picking up its `0` default --
     # now hashes differently.
-    pinned_hash = "918d142800120142e5916a468b6723d4d1c425d40a7543b999b82dc0d393ef6c"
+    # Retired and recomputed a fourth time when `Config.batch_size`'s default
+    # changed from `0` (a placeholder, always checked against the corpus size
+    # rather than applied) to `1` (a real one-record-per-request packing
+    # width, applied whether or not a config sets it).
+    pinned_hash = "8b47c9b35df524fb1772e65d7549fb0347412594f6805a859c83d8840158a97b"
 
     assert compute_ensemble_config_id(_config()) == pinned_hash
 
@@ -262,6 +266,39 @@ def test_batch_size_change_opens_a_new_epoch() -> None:
     )
 
     assert compute_ensemble_config_id(base) != compute_ensemble_config_id(different_batch_size)
+
+
+def test_batch_size_defaults_to_one() -> None:
+    # One record per request, this kernel's original behavior -- not the old
+    # placeholder default of 0, which was never actually applied to
+    # anything (see Config.batch_size).
+    config = Config(vendors=_config().vendors, aggregation="majority", tau=0.5)
+
+    assert config.batch_size == 1
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, -100])
+def test_batch_size_below_one_is_rejected_at_construction(batch_size: int) -> None:
+    try:
+        Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=batch_size)
+    except ValueError as exc:
+        assert "batch_size" in str(exc)
+    else:
+        raise AssertionError(f"expected ValueError for batch_size={batch_size}")
+
+
+def test_batch_output_contract_version_included_only_when_batch_size_above_one() -> None:
+    # A batch_size == 1 configuration never composes the multi-record output
+    # contract (see attest.vendors.base.BATCH_OUTPUT_CONTRACT), so its
+    # version must stay out of to_dict()/ensemble_config_id at batch_size ==
+    # 1 -- otherwise every existing batch_size == 1 config's hash would
+    # change out from under it the moment this constant existed.
+    single = Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=1)
+    batched = Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=2)
+
+    assert "batch_output_contract_version" not in single.to_dict()
+    assert "batch_output_contract_version" in batched.to_dict()
+    assert compute_ensemble_config_id(single) != compute_ensemble_config_id(batched)
 
 
 def test_prompt_for_track_prefers_track_specific_over_default() -> None:

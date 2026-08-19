@@ -13,13 +13,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from attest.contracts.input import Record
-from attest.vendors.base import check_model_version, compose_system_prompt, parse_ordinal_response
+from attest.vendors.base import (
+    SingleRecordOnlyRateMany,
+    check_model_version,
+    compose_system_prompt,
+    parse_ordinal_response,
+)
 
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
 
 @dataclass
-class OpenModelRater:
+class OpenModelRater(SingleRecordOnlyRateMany):
     """Rates records via an OpenAI-compatible `/chat/completions` endpoint.
 
     Attributes:

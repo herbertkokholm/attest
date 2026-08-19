@@ -16,6 +16,7 @@ from typing import Any
 
 from attest.contracts.input import Record
 from attest.vendors.base import (
+    SingleRecordOnlyRateMany,
     VendorResponseError,
     check_model_version,
     compose_system_prompt,
@@ -25,7 +26,7 @@ from attest.vendors.batch import BatchHandle, BatchStatus
 
 
 @dataclass
-class MistralRater:
+class MistralRater(SingleRecordOnlyRateMany):
     """Rates records with a Mistral model via the (la Plateforme) chat API.
 
     Attributes:
@@ -216,6 +217,8 @@ class MistralBatchRater:
         records: Sequence[Record],
         ensemble_config_id: str,
         prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
         """Upload a JSONL request file and submit it as one Mistral batch job.
 
@@ -225,10 +228,23 @@ class MistralBatchRater:
                 eventual votes will be stamped with.
             prompts: Mapping of record id to the screening prompt to use for
                 it, overriding `self.prompt`.
+            batch_size: Maximum number of records packed into one request.
+                This provider has not yet been converted to true
+                multi-record packing (see `Config.batch_size`).
 
-        Returns:
-            A `BatchHandle` identifying the submitted batch.
+        Raises:
+            NotImplementedError: If `batch_size > 1`. Never falls back to a
+                silent one-request-per-record loop: that would send one
+                record per request while the configuration's hashed
+                `batch_size` claims more, misrepresenting the instrument
+                that actually ran.
         """
+        if batch_size > 1:
+            raise NotImplementedError(
+                f"{type(self).__name__}.submit does not support packing more than one record "
+                f"into a request (batch_size={batch_size}); this provider has not yet been "
+                "converted to true multi-record packing -- see Config.batch_size"
+            )
         prompts = prompts or {}
         id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
         lines = "\n".join(

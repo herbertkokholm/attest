@@ -69,7 +69,7 @@ class Config:
     prompts: dict[str, str] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
-    batch_size: int = 0
+    batch_size: int = 1
     x: int = 0
     zero_policy: str = ZERO_POLICY_ESCALATE
 
