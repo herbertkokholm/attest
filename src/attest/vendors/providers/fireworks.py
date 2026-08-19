@@ -39,6 +39,15 @@ Fireworks documentation) before relying on `FireworksBatchRater` in
 production; see the request/response inspection this module was built from
 in the branch history for how far the confirmed part of this contract goes.
 
+At `Config.batch_size > 1`, a third assumption stacks on top of the above:
+that a multi-record chunk's trailing assistant turn is a single JSON object
+(`attest.vendors.base.BATCH_OUTPUT_CONTRACT`) rather than the single-letter
+reply the confirmed single-record shape uses. This is a natural extension of
+assumption 1, not a separately-confirmed fact -- verify it too before relying
+on `batch_size > 1` against a real Fireworks batch run. `batch_size == 1`
+stays on the batch-size-1 request/response shape this module's confirmed
+parts already describe, unaffected by this.
+
 Fireworks' system prompt could alternatively be set once, job-level, via the
 job's own `systemPrompt` field (injected into every row lacking its own
 leading system message) -- but this adapter instead puts the composed system
@@ -61,10 +70,13 @@ from typing import Any
 
 from attest.contracts.input import Record
 from attest.vendors.base import (
-    SingleRecordOnlyRateMany,
     VendorResponseError,
     check_model_version,
+    chunk_records,
+    compose_batch_system_prompt,
+    compose_batch_user_message,
     compose_system_prompt,
+    parse_batch_response,
     parse_ordinal_response,
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
@@ -85,7 +97,7 @@ def _dataset_id(ensemble_config_id: str, suffix: str) -> str:
 
 
 @dataclass
-class FireworksRater(SingleRecordOnlyRateMany):
+class FireworksRater:
     """Rates records with a Fireworks AI model via its Chat Completions API.
 
     Attributes:
@@ -192,6 +204,64 @@ class FireworksRater(SingleRecordOnlyRateMany):
             raw_response["logprobs"] = dump() if callable(dump) else response_logprobs
         return ordinal, raw_response
 
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Rate every record in `records` together, in one Chat Completions call.
+
+        Packs all of `records` into a single request: the system message
+        uses `compose_batch_system_prompt` (a per-id JSON output contract)
+        instead of `compose_system_prompt`'s single letter, and the user
+        message lists every record by id (`compose_batch_user_message`).
+        Parsed by id via `parse_batch_response`, order-independent.
+
+        Args:
+            records: The records to rate together.
+            prompt: Screening prompt to use, overriding `self.prompt`.
+
+        Returns:
+            One `(ordinal, raw_response)` pair per record in `records`, in order.
+
+        Raises:
+            ModelVersionDriftError: If the response's `model` differs from
+                `self.model_version`.
+            VendorResponseError: If some record has no parseable rating in
+                the response.
+        """
+        record_ids = [record.id for record in records]
+        response = self._client().chat.completions.create(
+            model=self.model,
+            max_tokens=max(self.max_tokens, 16 * len(records)),
+            temperature=self.temperature,
+            messages=[
+                {
+                    "role": "system",
+                    "content": compose_batch_system_prompt(
+                        prompt if prompt is not None else self.prompt
+                    ),
+                },
+                {"role": "user", "content": compose_batch_user_message(records)},
+            ],
+        )
+        reported_version = getattr(response, "model", None)
+        check_model_version(
+            vendor=self.vendor,
+            model=self.model,
+            expected_version=self.model_version,
+            reported_version=reported_version,
+        )
+        text = response.choices[0].message.content or ""
+        ratings = parse_batch_response(text, record_ids)
+        raw_response: dict[str, Any] = {
+            "text": text,
+            "id": getattr(response, "id", None),
+            "model": reported_version,
+        }
+        return [
+            (ratings[record_id], {**raw_response, "record_id": record_id})
+            for record_id in record_ids
+        ]
+
 
 @dataclass
 class FireworksBatchRater:
@@ -264,6 +334,14 @@ class FireworksBatchRater:
             ]
         }
 
+    def _batch_input_row(self, records: Sequence[Record], prompt: str | None) -> dict[str, Any]:
+        return {
+            "messages": [
+                {"role": "system", "content": compose_batch_system_prompt(prompt)},
+                {"role": "user", "content": compose_batch_user_message(records)},
+            ]
+        }
+
     def submit(
         self,
         records: Sequence[Record],
@@ -274,6 +352,19 @@ class FireworksBatchRater:
     ) -> BatchHandle:
         """Create an input dataset, upload it, and submit one Fireworks batch inference job.
 
+        At `batch_size == 1`, one input row per record -- unchanged from
+        before `batch_size` packing existed. At `batch_size > 1`, `records`
+        is grouped by resolved prompt (via `prompts`, preserving order) and
+        split into chunks of at most `batch_size` records; one input row is
+        submitted per chunk (a singleton chunk still uses the single-record
+        row, byte-identical to the `batch_size == 1` case). Fireworks' batch
+        API has no `custom_id` concept (see module docstring) -- row identity
+        is purely positional -- so `id_map` maps every record id in a chunk
+        to that chunk's row position (`"item-{i}"`, `i` the chunk's index
+        among the submitted rows), the same positional convention `fetch`
+        already relies on, now generalized from one record per position to
+        one chunk per position.
+
         Args:
             records: The records to rate in this batch.
             ensemble_config_id: The ensemble configuration id this batch's
@@ -281,8 +372,6 @@ class FireworksBatchRater:
             prompts: Mapping of record id to the screening prompt to use for
                 it, overriding `self.prompt`.
             batch_size: Maximum number of records packed into one request.
-                This provider has not yet been converted to true
-                multi-record packing (see `Config.batch_size`).
 
         Returns:
             A `BatchHandle` identifying the submitted job.
@@ -291,30 +380,34 @@ class FireworksBatchRater:
             VendorResponseError: If the create-job response has no `name`,
                 which would leave the returned handle unable to poll or
                 fetch this job.
-            NotImplementedError: If `batch_size > 1`. Never falls back to a
-                silent one-request-per-record loop: that would send one
-                record per request while the configuration's hashed
-                `batch_size` claims more, misrepresenting the instrument
-                that actually ran.
         """
-        if batch_size > 1:
-            raise NotImplementedError(
-                f"{type(self).__name__}.submit does not support packing more than one record "
-                f"into a request (batch_size={batch_size}); this provider has not yet been "
-                "converted to true multi-record packing -- see Config.batch_size"
-            )
         prompts = prompts or {}
-        id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
-        lines = "\n".join(
-            json.dumps(self._input_row(record, prompts.get(record.id, self.prompt)))
-            for record in records
-        )
+        if batch_size <= 1:
+            id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
+            rows = [
+                json.dumps(self._input_row(record, prompts.get(record.id, self.prompt)))
+                for record in records
+            ]
+        else:
+            chunks = chunk_records(records, lambda r: prompts.get(r.id), batch_size)
+            id_map = {}
+            rows = []
+            for i, chunk in enumerate(chunks):
+                custom_id = f"item-{i}"
+                for record in chunk:
+                    id_map[record.id] = custom_id
+                chunk_prompt = prompts.get(chunk[0].id, self.prompt)
+                if len(chunk) == 1:
+                    rows.append(json.dumps(self._input_row(chunk[0], chunk_prompt)))
+                else:
+                    rows.append(json.dumps(self._batch_input_row(chunk, chunk_prompt)))
+        lines = "\n".join(rows)
         client = self._client()
         input_dataset_id = _dataset_id(ensemble_config_id, "in")
         output_dataset_id = _dataset_id(ensemble_config_id, "out")
         client.datasets.create(
             dataset_id=input_dataset_id,
-            dataset={"exampleCount": str(len(records)), "format": "CHAT"},
+            dataset={"exampleCount": str(len(rows)), "format": "CHAT"},
         )
         client.datasets.upload(dataset_id=input_dataset_id, file=lines.encode("utf-8"))
         client.datasets.create(dataset_id=output_dataset_id, dataset={"format": "CHAT"})
@@ -352,8 +445,13 @@ class FireworksBatchRater:
         """Download and parse the output dataset's JSONL content.
 
         Assumes output rows are in the same order as the submitted input
-        rows (see module docstring); a row whose content does not parse as
-        an ordinal rating is simply absent from the returned mapping.
+        rows (see module docstring); a row whose content does not parse is
+        simply absent from the returned mapping -- for a singleton chunk
+        that is one record's unparseable single-letter reply (mirroring the
+        pre-`batch_size` per-record behavior); for a multi-record chunk,
+        `parse_batch_response` requires a rating for every record the row
+        covers, so if any of them is unparseable the whole chunk's records
+        are omitted together.
 
         Raises:
             ModelVersionDriftError: If the completed job's own `model` field
@@ -373,7 +471,9 @@ class FireworksBatchRater:
         if output_dataset_id is None:
             return {}
         download = client.datasets.get_download_endpoint(dataset_id=output_dataset_id)
-        reverse = {custom_id: record_id for record_id, custom_id in handle.id_map.items()}
+        chunks: dict[str, list[str]] = {}
+        for record_id, custom_id in handle.id_map.items():
+            chunks.setdefault(custom_id, []).append(record_id)
         results: dict[str, tuple[int, Any]] = {}
         index = 0
         for filename in sorted(download.filename_to_signed_urls):
@@ -384,9 +484,9 @@ class FireworksBatchRater:
             for line in content.splitlines():
                 if not line.strip():
                     continue
-                record_id = reverse.get(f"item-{index}")
+                record_ids = chunks.get(f"item-{index}")
                 index += 1
-                if record_id is None:
+                if not record_ids:
                     continue
                 entry = json.loads(line)
                 messages = entry.get("messages") or []
@@ -395,9 +495,21 @@ class FireworksBatchRater:
                 ]
                 if not assistant_texts or not assistant_texts[-1]:
                     continue
-                try:
-                    ordinal = parse_ordinal_response(assistant_texts[-1])
-                except VendorResponseError:
-                    continue
-                results[record_id] = (ordinal, entry)
+                text = assistant_texts[-1]
+                if len(record_ids) == 1:
+                    try:
+                        ordinal = parse_ordinal_response(text)
+                    except VendorResponseError:
+                        continue
+                    results[record_ids[0]] = (ordinal, entry)
+                else:
+                    try:
+                        ratings = parse_batch_response(text, record_ids)
+                    except VendorResponseError:
+                        continue
+                    for record_id in record_ids:
+                        results[record_id] = (
+                            ratings[record_id],
+                            {**entry, "record_id": record_id},
+                        )
         return results

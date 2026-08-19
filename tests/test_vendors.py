@@ -13,6 +13,7 @@ from attest.provenance.config import Config, VendorSpec, compute_ensemble_config
 from attest.vendors.base import (
     DeterministicRater,
     Rater,
+    SingleRecordOnlyRateMany,
     VendorResponseError,
     chunk_records,
     parse_batch_response,
@@ -796,12 +797,10 @@ def test_deterministic_rater_rate_regression_fixture_pins_batch_size_one_bytes()
     }
 
 
-# --- non-converted providers: rate_many raises rather than silently looping ------
+# --- SingleRecordOnlyRateMany mixin: reserved for a future not-yet-converted provider ---
 
 
 def test_single_record_only_rate_many_supports_a_singleton_chunk() -> None:
-    from attest.vendors.base import SingleRecordOnlyRateMany
-
     class _StubRater(SingleRecordOnlyRateMany):
         vendor = "stub"
         model = "stub-model"
@@ -818,37 +817,52 @@ def test_single_record_only_rate_many_supports_a_singleton_chunk() -> None:
 
 
 @pytest.mark.parametrize(
-    "provider_module,class_name,kwargs",
+    "provider_module,class_name",
     [
-        ("attest.vendors.providers.mistral", "MistralRater", {"model": "mistral-small-latest"}),
-        ("attest.vendors.providers.google", "GoogleRater", {"model": "gemini-1.5-pro"}),
-        (
-            "attest.vendors.providers.fireworks",
-            "FireworksRater",
-            {"model": "accounts/fireworks/models/llama-v3p1-70b-instruct"},
-        ),
-        (
-            "attest.vendors.providers.together",
-            "TogetherRater",
-            {"model": "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
-        ),
-        ("attest.vendors.providers.openmodel", "OpenModelRater", {"model": "local-model"}),
+        ("attest.vendors.providers.mistral", "MistralRater"),
+        ("attest.vendors.providers.google", "GoogleRater"),
+        ("attest.vendors.providers.fireworks", "FireworksRater"),
+        ("attest.vendors.providers.together", "TogetherRater"),
+        ("attest.vendors.providers.openmodel", "OpenModelRater"),
+        ("attest.vendors.providers.openai", "OpenAIRater"),
+        ("attest.vendors.providers.anthropic", "AnthropicRater"),
     ],
 )
-def test_non_converted_providers_raise_on_multi_record_rate_many(
-    provider_module: str, class_name: str, kwargs: dict[str, str]
+def test_every_rater_provides_a_real_rate_many_not_the_single_record_mixin(
+    provider_module: str, class_name: str
 ) -> None:
+    # Every sync Rater provider has been converted to true multi-record
+    # packing (see Config.batch_size) -- none of them should still be using
+    # SingleRecordOnlyRateMany, which exists only for a future not-yet-
+    # converted provider.
     module = importlib.import_module(provider_module)
     rater_cls = getattr(module, class_name)
-    rater = rater_cls(model_version="v1", temperature=0.0, **kwargs)
-    records = [_record("rec-1"), _record("rec-2")]
 
-    try:
-        rater.rate_many(records)
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError(f"expected {class_name}.rate_many to raise for len(records) > 1")
+    assert not issubclass(rater_cls, SingleRecordOnlyRateMany)
+    assert "rate_many" in rater_cls.__dict__
+
+
+@pytest.mark.parametrize(
+    "provider_module,class_name",
+    [
+        ("attest.vendors.providers.mistral", "MistralBatchRater"),
+        ("attest.vendors.providers.google", "GoogleBatchRater"),
+        ("attest.vendors.providers.fireworks", "FireworksBatchRater"),
+        ("attest.vendors.providers.together", "TogetherBatchRater"),
+        ("attest.vendors.providers.openai", "OpenAIBatchRater"),
+        ("attest.vendors.providers.anthropic", "AnthropicBatchRater"),
+    ],
+)
+def test_every_batch_rater_submit_accepts_a_batch_size_keyword(
+    provider_module: str, class_name: str
+) -> None:
+    import inspect
+
+    module = importlib.import_module(provider_module)
+    rater_cls = getattr(module, class_name)
+    signature = inspect.signature(rater_cls.submit)
+    assert "batch_size" in signature.parameters
+    assert signature.parameters["batch_size"].default == 1
 
 
 # --- parse_batch_response: id-keyed parsing, failure policy, robustness ---------
