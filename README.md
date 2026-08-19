@@ -6,10 +6,12 @@ method used in systematic-review title and abstract screening.
 
 An ensemble of LLMs from different vendors rates each record on an ordinal
 scale (exclude / uncertain / include); disagreement escalates to a human;
-three statistically separated planes route human labels so that only one of
-them is ever used to estimate recall; and every run produces a versioned
-self-validation record reporting inter-rater agreement, error correlation,
-escalation rate, and recall with its worst-case floor.
+four statistically separated planes route human labels so that only the two
+random-audit planes -- never adjudication or active-learning -- are ever used
+to estimate recall (and, when TP is not fully reviewed, its true-positive
+count); and every run produces a versioned self-validation record reporting
+inter-rater agreement, error correlation, escalation rate, and recall with
+its worst-case floor.
 
 `attest` is the kernel only. A separate proprietary shell (e.g. ResearchWhat)
 is expected to import it, fetch candidate records, schedule work, persist
@@ -121,7 +123,7 @@ matrix), so an ensemble that includes Anthropic needs at least four vendors
 total before three can ever support the confidence signal -- `attest`'s own
 bundled `data/example_config.json` is deliberately four vendors
 (anthropic, openai, mistral, together) for exactly this reason, not two.
-This confidence signal feeds two of the three planes:
+This confidence signal feeds two of the four planes:
 `audit-draw --stratify-by-confidence` stratifies the recall audit by tier
 instead of track (see [Confidence-stratified
 auditing](#confidence-stratified-auditing-logprobs) below), and
@@ -150,12 +152,17 @@ interfaces: change them only via an explicit version bump, never in place.
 - **`attest.contracts.input`** (`SCHEMA_VERSION = "1.0"`) — the shape of
   records submitted to attest for screening: id, title, abstract, track,
   external ids, and an optional gold label.
-- **`attest.contracts.validation_record`** (`SCHEMA_VERSION = "1.1"`) — one
+- **`attest.contracts.validation_record`** (`SCHEMA_VERSION = "1.6"`) — one
   self-validation record per stable ensemble-configuration epoch: the
   ensemble config (including `zero_policy`), inter-rater agreement, error
   correlation, escalation rate, recall (point estimate *and* rule-of-three
   worst-case floor, reported together, never the point estimate alone),
-  confusion matrix, and PRISMA flow counts.
+  confusion matrix, and PRISMA flow counts. `recall.tp_estimation_method`
+  records whether TP came from a full review (`"full_review"`) or a sampled
+  inclusion audit (`"inclusion_audit"`, see below) -- in the latter case
+  `recall.floor`/`recall.ci` are `None` rather than a bound that would
+  silently ignore TP's own sampling error, and `recall.exact_floor` is the
+  joint TP/FN bound instead.
 
 ## The boundary rule
 
@@ -204,17 +211,24 @@ inter-vendor independence argument behind the ensemble.
   escalation (`attest.ensemble.aggregate.g`); `attest.ensemble.tau` proves
   and exploits `tau`'s step-function structure to validate, describe, and
   derive it instead of leaving it a hand-picked decimal.
-- **Three statistically separated planes** (`attest.planes`) — form a
-  firewall so that recall is never estimated from a biased sample:
+- **Four statistically separated planes** (`attest.planes`) — form a
+  firewall so that recall (and, when audited, its TP numerator) is never
+  estimated from a biased sample:
   - `adjudication` — resolves escalated (disagreement) records with an
     authoritative human label.
   - `active_learning` — routes high-disagreement records, or unanimous
     records with low within-vendor confidence (see
     `attest.ensemble.confidence`), to human review to improve the ensemble;
     never a probability sample.
-  - `recall_audit` — the *only* plane recall may be estimated from: a random
-    probability sample of the screen-excluded population, gold-checked by a
-    human auditor.
+  - `recall_audit` — the *only* plane FN (missed-relevant records) may be
+    estimated from: a random probability sample of the screen-excluded
+    population, gold-checked by a human auditor.
+  - `inclusion_audit` — the mirror-image plane for the *other* side: the
+    only plane TP may be statistically estimated from, when the
+    include-and-escalate set is too large to review in full. A random
+    probability sample of that set, gold-checked the same way (see
+    "Inclusion audit" under [Implemented, planned, and out of
+    scope](#implemented-planned-and-out-of-scope)).
 - **Provenance** (`attest.provenance`) — three separately versioned
   descriptors and the machinery around them:
   - `config` — the screening ensemble configuration and its immutable,
@@ -264,8 +278,9 @@ inter-vendor independence argument behind the ensemble.
   than assuming it.
 - **CLI** (`attest.cli`) — file-based subcommands over a run directory:
   `screen`, `batch-fetch`, `adjudicate`, `audit-draw`, `audit-apply`,
-  `validate`, `ablate`, `protocol`, `manifest`, `verify`, `sentinel-init`,
-  `sentinel-check`, `active-learning-select`, `active-learning-review`.
+  `inclusion-audit-draw`, `inclusion-audit-apply`, `validate`, `ablate`,
+  `protocol`, `manifest`, `verify`, `sentinel-init`, `sentinel-check`,
+  `active-learning-select`, `active-learning-review`.
 
 ## Running the CLI on the example data
 
@@ -306,6 +321,25 @@ attest audit-apply --run-dir /tmp/attest-demo --labels /tmp/labels.json
 `--size all` draws the entire screen-excluded population instead of a
 sample, for exact (not floored) recall when human-labeling the draw is
 free -- e.g. scoring against an already-published gold set.
+
+When the include-and-escalate set is too large to review in full, draw and
+apply a random inclusion-audit sample from it instead -- the mirror-image
+audit that estimates TP the same way `audit-draw`/`audit-apply` estimate FN:
+
+```bash
+attest inclusion-audit-draw --run-dir /tmp/attest-demo \
+  --input data/example_gold_set.json --size 2 --seed 7
+
+echo '{"<drawn-id-1>": 1, "<drawn-id-2>": -1}' > /tmp/inclusion_labels.json
+attest inclusion-audit-apply --run-dir /tmp/attest-demo --labels /tmp/inclusion_labels.json
+```
+
+`validate` picks this up automatically: if the run has at least one labeled
+inclusion-audit row, TP switches from the exact confusion-matrix count to
+the audit-scaled estimate, and `recall.exact_floor` becomes the joint TP/FN
+bound. Skip this pair of commands entirely (as the example above does) when
+the include-and-escalate set is fully reviewable -- TP then stays exact,
+unchanged from every version before this audit existed.
 
 Assemble the self-validation record for the epoch:
 
@@ -488,8 +522,9 @@ attest verify --run-dir /tmp/attest-demo
 
 `verify` recomputes the SHA-256 of every artifact the manifest recorded --
 config, protocol descriptor, votes, raw responses, decisions, epoch,
-changelog, the audit-draw snapshot, the audit-labels snapshot, and the
-validation-record snapshot (`RunStore.MANIFEST_ARTIFACTS`) -- and reports
+changelog, the audit-draw snapshot, the audit-labels snapshot, the
+inclusion-audit-draw snapshot, and the validation-record snapshot
+(`RunStore.MANIFEST_ARTIFACTS`) -- and reports
 exactly which one is missing or has changed; it exits `1` (without printing
 a Python traceback) when anything fails, so a CI step can gate on it
 directly. The input file itself is hashed, not copied into the run
@@ -546,7 +581,7 @@ can look a record's selection reason back up without recomputing it.
 
 **Implemented:**
 
-- The three statistically separated planes, the boundary+dispersion
+- The four statistically separated planes, the boundary+dispersion
   aggregation rule, tau/confidence provenance, versioned config/protocol/
   manifest, the append-only changelog, the latent-vendor-drift sentinel
   (hard trigger + advisory alpha), offline manifest-based artifact
@@ -558,6 +593,20 @@ can look a record's selection reason back up without recomputing it.
   and active-learning selections remain statistically firewalled out of the
   recall estimator (`attest.planes.recall_audit.build_strata` refuses any
   row not tagged `PLANE_RECALL_AUDIT`).
+- **Inclusion audit** (`attest.planes.inclusion_audit`, manuscript §2.9): a
+  separate random/track-or-status-stratified sample of the include-and-
+  escalate set, mirroring the exclusion-side recall audit -- for when that
+  set is too large to review in full. `inclusion-audit-draw`/
+  `inclusion-audit-apply` draw and gold-check the sample;
+  `build_inclusion_strata` enforces the same firewall as
+  `recall_audit.build_strata`, refusing any row not tagged
+  `PLANE_INCLUSION_AUDIT`. When the run has at least one labeled
+  inclusion-audit row, `attest validate` estimates TP from it instead of
+  the confusion matrix, and `attest.stats.recall.stratified_recall_with_audited_tp`
+  reports a joint TP/FN `exact_floor` -- Bonferroni-adjusted across every
+  contributing stratum on both sides at once. Falls back exactly to full
+  review (TP taken as exact) when no inclusion-audit rows are present, so
+  every prior workflow is unchanged.
 
 **Aggregation rules:** `attest.ensemble.aggregate.AGGREGATION_BOUNDARY_DISPERSION`
 is the only aggregation rule with an implementation. `AGGREGATION_MAJORITY`
@@ -568,15 +617,6 @@ screening run with them expecting a working aggregation rule.
 
 **Planned (not implemented):**
 
-- **Inclusion audit.** `attest.contracts.validation_record.Recall`'s `TPc`
-  (true positives) is currently taken directly from the confusion matrix
-  against gold labels, which requires every included/escalated record to
-  already carry ground truth -- true for the planned SYNERGY-based empirical
-  evaluation, but not for a live deployment without full gold coverage. The
-  manuscript's inclusion-audit design (§2.9: a separate random/track-stratified
-  sample of the include-and-escalate set, its own confidence interval,
-  mirroring the exclusion audit) is a future live-deployment module, not
-  implemented here.
 - Automated prompt tuning or retraining from active-learning or adjudication
   output. Both planes are provenance-recording only (see above); a config
   change motivated by a review is always a separate, explicit,
