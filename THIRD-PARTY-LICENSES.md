@@ -39,19 +39,11 @@ license terms.
 | filelock                           | 3.32.4          | MIT                                                | https://github.com/tox-dev/py-filelock                                                              |
 | fireworks-ai                       | 1.2.9           | Apache Software License                            | https://github.com/fw-ai-external/python-sdk                                                        |
 | frozenlist                         | 1.8.0           | UNKNOWN                                            | https://github.com/aio-libs/frozenlist                                                              |
-| google-ai-generativelanguage       | 0.6.15          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/google-ai-generativelanguage   |
-| google-api-core                    | 2.33.0          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/google-api-core                |
-| google-api-python-client           | 2.199.0         | Apache Software License                            | https://github.com/googleapis/google-api-python-client/                                             |
 | google-auth                        | 2.56.3          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/google-auth                    |
-| google-auth-httplib2               | 0.4.1           | Apache Software License                            | https://github.com/googleapis/google-cloud-python/packages/google-auth-httplib2                     |
-| google-generativeai                | 0.8.6           | Apache Software License                            | https://github.com/google/generative-ai-python                                                      |
-| googleapis-common-protos           | 1.75.0          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/googleapis-common-protos       |
-| grpcio                             | 1.83.0          | Apache-2.0                                         | https://grpc.io                                                                                     |
-| grpcio-status                      | 1.71.2          | Apache Software License                            | https://grpc.io                                                                                     |
+| google-genai                       | 2.19.0          | Apache-2.0                                         | https://github.com/googleapis/python-genai                                                          |
 | h11                                | 0.16.0          | MIT License                                        | https://github.com/python-hyper/h11                                                                 |
 | httpcore                           | 1.0.9           | BSD-3-Clause                                       | https://www.encode.io/httpcore/                                                                     |
 | httpcore2                          | 2.12.0          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
-| httplib2                           | 0.32.0          | MIT License                                        | https://github.com/httplib2/httplib2                                                                |
 | httpx                              | 0.28.1          | BSD License                                        | https://github.com/encode/httpx                                                                     |
 | httpx-aiohttp                      | 0.2.0           | UNKNOWN                                            | https://karpetrosyan.github.io/httpx-aiohttp/                                                       |
 | httpx2                             | 2.12.0          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
@@ -68,14 +60,11 @@ license terms.
 | opentelemetry-api                  | 1.44.0          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api                  |
 | opentelemetry-semantic-conventions | 0.65b0          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-semantic-conventions |
 | propcache                          | 0.5.2           | Apache Software License                            | https://github.com/aio-libs/propcache                                                               |
-| proto-plus                         | 1.28.2          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/proto-plus                     |
-| protobuf                           | 5.29.6          | UNKNOWN                                            | https://developers.google.com/protocol-buffers/                                                     |
 | pyasn1                             | 0.6.4           | UNKNOWN                                            | https://github.com/pyasn1/pyasn1                                                                    |
 | pyasn1_modules                     | 0.4.2           | BSD License                                        | https://github.com/pyasn1/pyasn1-modules                                                            |
 | pycparser                          | 3.0             | BSD-3-Clause                                       | https://github.com/eliben/pycparser                                                                 |
 | pydantic                           | 2.12.5          | MIT                                                | https://github.com/pydantic/pydantic                                                                |
 | pydantic_core                      | 2.41.5          | MIT                                                | https://github.com/pydantic/pydantic-core                                                           |
-| pyparsing                          | 3.3.2           | MIT                                                | https://github.com/pyparsing/pyparsing/                                                             |
 | python-dateutil                    | 2.9.0.post0     | Apache Software License; BSD License               | https://github.com/dateutil/dateutil                                                                |
 | requests                           | 2.34.2          | Apache Software License                            | https://github.com/psf/requests                                                                     |
 | rich                               | 15.0.0          | MIT License                                        | https://github.com/Textualize/rich                                                                  |
@@ -83,6 +72,7 @@ license terms.
 | scipy                              | 1.17.1          | BSD License                                        | https://scipy.org/                                                                                  |
 | six                                | 1.17.0          | MIT License                                        | https://github.com/benjaminp/six                                                                    |
 | sniffio                            | 1.3.1           | Apache Software License; MIT License               | https://github.com/python-trio/sniffio                                                              |
+| tenacity                           | 9.1.4           | Apache Software License                            | https://github.com/jd/tenacity                                                                      |
 | together                           | 2.31.0          | Apache Software License                            | https://github.com/togethercomputer/together-py                                                     |
 | tqdm                               | 4.70.0          | UNKNOWN                                            | https://tqdm.github.io                                                                              |
 | truststore                         | 0.10.4          | MIT                                                | https://github.com/sethmlarson/truststore                                                           |
@@ -90,8 +80,8 @@ license terms.
 | types-tqdm                         | 4.70.0.20260805 | Apache-2.0                                         | https://github.com/python/typeshed                                                                  |
 | typing-inspection                  | 0.4.4           | MIT                                                | https://github.com/pydantic/typing-inspection                                                       |
 | typing_extensions                  | 4.16.0          | PSF-2.0                                            | https://github.com/python/typing_extensions                                                         |
-| uritemplate                        | 4.2.0           | UNKNOWN                                            | https://uritemplate.readthedocs.org                                                                 |
 | urllib3                            | 2.7.0           | MIT                                                | https://github.com/urllib3/urllib3/blob/main/CHANGES.rst                                            |
+| websockets                         | 16.1.1          | BSD-3-Clause                                       | https://github.com/python-websockets/websockets                                                     |
 | yarl                               | 1.24.5          | UNKNOWN                                            | https://github.com/aio-libs/yarl                                                                    |
 <!-- END GENERATED TABLE -->
 
