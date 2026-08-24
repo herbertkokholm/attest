@@ -28,7 +28,7 @@ from importlib import metadata
 _DISTRIBUTION_BY_VENDOR: dict[str, str] = {
     "anthropic": "anthropic",
     "openai": "openai",
-    "google": "google-generativeai",
+    "google": "google-genai",
     "mistral": "mistralai",
     "fireworks": "fireworks-ai",
     "together": "together",

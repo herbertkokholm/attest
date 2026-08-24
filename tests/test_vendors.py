@@ -676,10 +676,11 @@ def test_four_vendor_ensemble_including_mistral_has_stable_config_id() -> None:
 
 # --- google provider: _serialize_logprobs's best-effort shape handling ---------
 #
-# The `google-generativeai` SDK's response objects are protobuf-backed, not
-# uniformly pydantic, so `_serialize_logprobs` (attest.vendors.providers.google)
-# probes for `to_dict`/`model_dump` and falls back to `str()`. It is a pure,
-# duck-typed function, exercisable offline with plain stub objects, without
+# `_serialize_logprobs` (attest.vendors.providers.google) probes for
+# `to_dict`/`model_dump` and falls back to `str()`. `google-genai`'s response
+# objects are uniformly pydantic (`model_dump` always applies), but the probe
+# stays duck-typed and defensive rather than assuming that shape outright. It
+# is a pure function, exercisable offline with plain stub objects, without
 # either the `google` extra or a live API call -- unlike the rest of the
 # provider's `rate`/`fetch` methods, which do require the SDK and are covered
 # only by `tools/vendor_logprob_probe.py`'s manual, live verification (see
@@ -724,9 +725,9 @@ def test_serialize_logprobs_falls_back_to_str_when_neither_method_exists() -> No
 
     class _Bare:
         def __str__(self) -> str:
-            return "protobuf-repr"
+            return "bare-repr"
 
-    assert _serialize_logprobs(_Bare()) == "protobuf-repr"
+    assert _serialize_logprobs(_Bare()) == "bare-repr"
 
 
 def test_serialize_logprobs_ignores_a_non_callable_to_dict_attribute() -> None:

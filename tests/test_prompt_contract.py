@@ -395,18 +395,18 @@ def test_openai_rater_raises_on_model_version_drift() -> None:
 def test_google_rater_composes_system_prompt() -> None:
     from attest.vendors.providers.google import GoogleRater
 
-    captured: list[str] = []
+    captured: list[Any] = []
 
-    class _FakeModel:
+    class _FakeModels:
         def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+            captured.append(kwargs["config"]["system_instruction"])
             return SimpleNamespace(text="I")
 
-    def _fake_client(prompt: str) -> Any:
-        captured.append(prompt)
-        return _FakeModel()
+    class _FakeClient:
+        models = _FakeModels()
 
     rater = GoogleRater(model="gemini-1.5-pro", model_version="v1", temperature=0.2)
-    rater._client = _fake_client  # type: ignore[method-assign]
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
 
     rater.rate(_record())
     rater.rate(_record(), prompt="custom criteria")
@@ -419,17 +419,20 @@ def test_google_rater_passes_temperature_to_generation_config() -> None:
 
     captured: dict[str, Any] = {}
 
-    class _FakeModel:
+    class _FakeModels:
         def generate_content(self, *args: Any, **kwargs: Any) -> Any:
             captured.update(kwargs)
             return SimpleNamespace(text="I")
 
+    class _FakeClient:
+        models = _FakeModels()
+
     rater = GoogleRater(model="gemini-1.5-pro", model_version="v1", temperature=0.7)
-    rater._client = lambda prompt: _FakeModel()  # type: ignore[method-assign]
+    rater._client = lambda: _FakeClient()  # type: ignore[method-assign]
 
     rater.rate(_record())
 
-    assert captured["generation_config"]["temperature"] == 0.7
+    assert captured["config"]["temperature"] == 0.7
 
 
 def test_mistral_rater_composes_system_prompt() -> None:
@@ -676,16 +679,14 @@ def test_google_batch_request_composes_system_prompt() -> None:
 
     rater = GoogleBatchRater(model="gemini-1.5-pro", model_version="v1", temperature=0.3)
 
-    default_request = rater._request(_record(), "item-0", None)
-    custom_request = rater._request(_record(), "item-0", "custom criteria")
+    default_request = rater._request(_record(), None)
+    custom_request = rater._request(_record(), "custom criteria")
 
-    assert default_request["request"]["system_instruction"]["parts"][0]["text"] == (
-        compose_system_prompt(None)
+    assert default_request["config"]["system_instruction"] == compose_system_prompt(None)
+    assert custom_request["config"]["system_instruction"] == compose_system_prompt(
+        "custom criteria"
     )
-    assert custom_request["request"]["system_instruction"]["parts"][0]["text"] == (
-        compose_system_prompt("custom criteria")
-    )
-    assert default_request["request"]["generation_config"]["temperature"] == 0.3
+    assert default_request["config"]["temperature"] == 0.3
 
 
 def test_mistral_batch_request_line_composes_system_prompt() -> None:
