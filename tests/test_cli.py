@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from attest.cli import _build_parser, main
+from attest.cli import _build_parser, _load_ensemble_config, main
 
 _GOLD_SET = str(Path(__file__).resolve().parent.parent / "data" / "example_gold_set.json")
 
@@ -38,6 +38,51 @@ def _write_config(path: Path) -> None:
             }
         )
     )
+
+
+def test_load_ensemble_config_parses_reasoning_effort_and_send_temperature(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {
+                    "openai": {
+                        "model": "gpt-5.6-terra",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                        "reasoning_effort": "none",
+                    },
+                    "anthropic": {
+                        "model": "claude-sonnet-5",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                        "send_temperature": False,
+                    },
+                    "mistral": {
+                        "model": "mistral-large-2512",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                    },
+                },
+                "aggregation": "boundary_dispersion",
+                "tau": 0.5,
+                "batch_size": 1,
+            }
+        )
+    )
+
+    config = _load_ensemble_config(config_path)
+
+    assert config.vendors["openai"].reasoning_effort == "none"
+    assert config.vendors["anthropic"].send_temperature is False
+    # Unset in the JSON -- must resolve to the no-op defaults, not crash.
+    assert config.vendors["mistral"].reasoning_effort is None
+    assert config.vendors["mistral"].send_temperature is True
 
 
 def test_end_to_end_screen_audit_validate(

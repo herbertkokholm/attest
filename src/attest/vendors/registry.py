@@ -43,7 +43,10 @@ def _build_anthropic(spec: VendorSpec, *, request_logprobs: bool = False) -> Rat
     # AnthropicRater's docstring). Adding an unused kwarg here would be
     # exactly the decorative-field pattern this codebase avoids elsewhere.
     return AnthropicRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        send_temperature=spec.send_temperature,
     )
 
 
@@ -54,6 +57,7 @@ def _build_openai(spec: VendorSpec, *, request_logprobs: bool = False) -> Rater:
         model=spec.model,
         model_version=spec.model_version,
         temperature=spec.temperature,
+        reasoning_effort=spec.reasoning_effort,
         request_logprobs=request_logprobs,
     )
 
@@ -133,7 +137,10 @@ def _build_anthropic_batch(spec: VendorSpec, *, request_logprobs: bool = False) 
     # parity but never forwarded, since AnthropicBatchRater has no such
     # field.
     return AnthropicBatchRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        send_temperature=spec.send_temperature,
     )
 
 
@@ -144,6 +151,7 @@ def _build_openai_batch(spec: VendorSpec, *, request_logprobs: bool = False) -> 
         model=spec.model,
         model_version=spec.model_version,
         temperature=spec.temperature,
+        reasoning_effort=spec.reasoning_effort,
         request_logprobs=request_logprobs,
     )
 

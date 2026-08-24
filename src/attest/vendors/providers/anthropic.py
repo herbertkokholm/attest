@@ -39,7 +39,17 @@ class AnthropicRater:
             alias silently resolving to a snapshot other than the one this
             configuration was hashed under (see
             `attest.vendors.base.check_model_version`).
-        temperature: Sampling temperature passed to the Messages API.
+        temperature: Sampling temperature passed to the Messages API, unless
+            `send_temperature` is `False`.
+        send_temperature: When `False`, `temperature` is omitted from the
+            Messages API request entirely instead of being sent. Claude
+            Sonnet 5 (and the rest of the Claude 4.6+ generation) rejects
+            any explicit `temperature`/`top_p`/`top_k` value with HTTP 400 --
+            confirmed against Anthropic's own current model documentation,
+            2026-08-24 -- with no parameter analogous to OpenAI's
+            `reasoning_effort="none"` that re-enables it, so omission is the
+            only way to avoid the error. See
+            `attest.provenance.config.VendorSpec.send_temperature`.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -63,6 +73,7 @@ class AnthropicRater:
     model: str
     model_version: str
     temperature: float
+    send_temperature: bool = True
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -77,6 +88,9 @@ class AnthropicRater:
                 "install it with: pip install 'attest[anthropic]'"
             ) from exc
         return anthropic.Anthropic(api_key=self.api_key)
+
+    def _temperature_kwargs(self) -> dict[str, Any]:
+        return {"temperature": self.temperature} if self.send_temperature else {}
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the Anthropic Messages API.
@@ -95,7 +109,6 @@ class AnthropicRater:
         response = self._client().messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             system=compose_system_prompt(prompt if prompt is not None else self.prompt),
             messages=[
                 {
@@ -103,6 +116,7 @@ class AnthropicRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 }
             ],
+            **self._temperature_kwargs(),
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -119,6 +133,7 @@ class AnthropicRater:
             "text": text,
             "id": getattr(response, "id", None),
             "model": reported_version,
+            "temperature_applied": self.send_temperature,
         }
         return ordinal, raw_response
 
@@ -150,9 +165,9 @@ class AnthropicRater:
         response = self._client().messages.create(
             model=self.model,
             max_tokens=max(self.max_tokens, 16 * len(records)),
-            temperature=self.temperature,
             system=compose_batch_system_prompt(prompt if prompt is not None else self.prompt),
             messages=[{"role": "user", "content": compose_batch_user_message(records)}],
+            **self._temperature_kwargs(),
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -169,6 +184,7 @@ class AnthropicRater:
             "text": text,
             "id": getattr(response, "id", None),
             "model": reported_version,
+            "temperature_applied": self.send_temperature,
         }
         return [
             (ratings[record_id], {**raw_response, "record_id": record_id})
@@ -190,7 +206,11 @@ class AnthropicBatchRater:
             batch result's own `message.model` in `fetch` (see
             `AnthropicRater.model_version` and
             `attest.vendors.base.check_model_version`).
-        temperature: Sampling temperature passed to the Message Batches API.
+        temperature: Sampling temperature passed to the Message Batches API,
+            unless `send_temperature` is `False`.
+        send_temperature: When `False`, `temperature` is omitted from every
+            submitted request's params instead of being sent -- see
+            `AnthropicRater.send_temperature` for why.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -206,6 +226,7 @@ class AnthropicBatchRater:
     model: str
     model_version: str
     temperature: float
+    send_temperature: bool = True
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -222,35 +243,33 @@ class AnthropicBatchRater:
         return anthropic.Anthropic(api_key=self.api_key)
 
     def _request(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
-        return {
-            "custom_id": custom_id,
-            "params": {
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "system": compose_system_prompt(prompt),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"Title: {record.title}\nAbstract: {record.abstract}",
-                    }
-                ],
-            },
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": compose_system_prompt(prompt),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Title: {record.title}\nAbstract: {record.abstract}",
+                }
+            ],
         }
+        if self.send_temperature:
+            params["temperature"] = self.temperature
+        return {"custom_id": custom_id, "params": params}
 
     def _batch_request(
         self, records: Sequence[Record], custom_id: str, prompt: str | None
     ) -> dict[str, Any]:
-        return {
-            "custom_id": custom_id,
-            "params": {
-                "model": self.model,
-                "max_tokens": max(self.max_tokens, 16 * len(records)),
-                "temperature": self.temperature,
-                "system": compose_batch_system_prompt(prompt),
-                "messages": [{"role": "user", "content": compose_batch_user_message(records)}],
-            },
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max(self.max_tokens, 16 * len(records)),
+            "system": compose_batch_system_prompt(prompt),
+            "messages": [{"role": "user", "content": compose_batch_user_message(records)}],
         }
+        if self.send_temperature:
+            params["temperature"] = self.temperature
+        return {"custom_id": custom_id, "params": params}
 
     def submit(
         self,
@@ -367,7 +386,12 @@ class AnthropicBatchRater:
                     continue
                 results[record_ids[0]] = (
                     ordinal,
-                    {"text": text, "custom_id": entry.custom_id, "model": reported_version},
+                    {
+                        "text": text,
+                        "custom_id": entry.custom_id,
+                        "model": reported_version,
+                        "temperature_applied": self.send_temperature,
+                    },
                 )
             else:
                 try:
@@ -382,6 +406,7 @@ class AnthropicBatchRater:
                             "custom_id": entry.custom_id,
                             "model": reported_version,
                             "record_id": record_id,
+                            "temperature_applied": self.send_temperature,
                         },
                     )
         return results

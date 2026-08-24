@@ -57,12 +57,45 @@ class VendorSpec:
             hash-sensitive, so changing it yields a different
             `ensemble_config_id` and opens a new epoch, the same as a model
             or prompt change would.
+        reasoning_effort: Forwarded to `attest.vendors.providers.openai`'s
+            raters as the Chat Completions API's `reasoning_effort`
+            parameter when not `None`; ignored by every other provider.
+            Exists because some current-generation OpenAI models reject an
+            explicit non-default `temperature` outright (HTTP 400) unless
+            paired with `reasoning_effort="none"` -- confirmed empirically
+            against `gpt-5.6-terra` on 2026-08-24, not assumed from
+            documentation (OpenAI's docs describe the coupling but not which
+            models it applies to). `None` (the default) omits the parameter
+            from the request entirely, reproducing every prior model's
+            behavior exactly. Hash-versioned like `temperature` -- it changes
+            what the vendor actually samples -- but omitted from `to_dict()`
+            when `None`, so a config that never sets it hashes identically
+            to before this field existed.
+        send_temperature: When `False`, `attest.vendors.providers.anthropic`'s
+            raters omit `temperature` from the Messages API request entirely
+            instead of sending `self.temperature` and letting the vendor
+            reject it. Exists because Claude Sonnet 5 (and the rest of the
+            Claude 4.6+ generation) returns HTTP 400 on any explicit
+            `temperature`/`top_p`/`top_k` value -- confirmed against
+            Anthropic's own current model documentation, 2026-08-24 -- with
+            no parameter analogous to OpenAI's `reasoning_effort="none"` that
+            re-enables it; omission is the only way to avoid the error.
+            Ignored by every other provider. Defaults to `True` (send
+            `temperature` as before this field existed) and is omitted from
+            `to_dict()` at that default, so an existing config hashes
+            unchanged. `temperature` itself stays required on `VendorSpec`
+            even when this is `False`, since it remains meaningful
+            provenance (the value that was requested, for a model that
+            silently cannot honor it) and other providers still consume it
+            directly.
     """
 
     model: str
     model_version: str
     prompt_version: str
     temperature: float
+    reasoning_effort: str | None = None
+    send_temperature: bool = True
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -78,13 +111,24 @@ class VendorSpec:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return this vendor spec as a plain dict."""
-        return {
+        """Return this vendor spec as a plain dict.
+
+        `reasoning_effort` and `send_temperature` are included only when set
+        to something other than their no-op default (`None` and `True`
+        respectively), so a `VendorSpec` that never touches either hashes
+        identically to one constructed before these fields existed.
+        """
+        payload: dict[str, Any] = {
             "model": self.model,
             "model_version": self.model_version,
             "prompt_version": self.prompt_version,
             "temperature": self.temperature,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.send_temperature is not True:
+            payload["send_temperature"] = self.send_temperature
+        return payload
 
 
 @dataclass

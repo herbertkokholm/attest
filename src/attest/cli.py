@@ -134,7 +134,11 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
     Args:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
             an object with "model", "model_version", "prompt_version",
-            "temperature"), "aggregation", "tau", and optionally "batch_size"
+            "temperature", and optionally "reasoning_effort" (string,
+            forwarded to OpenAI raters only -- see `VendorSpec.reasoning_effort`)
+            and "send_temperature" (bool, default true, consumed by Anthropic
+            raters only -- see `VendorSpec.send_temperature`)), "aggregation",
+            "tau", and optionally "batch_size"
             (int -- the maximum number of records `attest screen` packs into
             one vendor request, see `EnsembleConfig.batch_size`; default 1,
             one record per request), "default_prompt" (string),
@@ -166,6 +170,8 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
             model_version=spec["model_version"],
             prompt_version=spec["prompt_version"],
             temperature=float(spec["temperature"]),
+            reasoning_effort=spec.get("reasoning_effort"),
+            send_temperature=bool(spec.get("send_temperature", True)),
         )
         for name, spec in payload["vendors"].items()
     }

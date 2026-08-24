@@ -49,6 +49,13 @@ class OpenAIRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in the reply.
+        reasoning_effort: Forwarded as the Chat Completions API's
+            `reasoning_effort` parameter when not `None`; omitted from the
+            request entirely otherwise, reproducing prior behavior exactly.
+            Some current-generation OpenAI models (confirmed against
+            `gpt-5.6-terra`, 2026-08-24) reject an explicit non-default
+            `temperature` with HTTP 400 unless this is set to `"none"` --
+            see `attest.provenance.config.VendorSpec.reasoning_effort`.
         request_logprobs: If True, request per-token log probabilities
             (`logprobs=True, top_logprobs=top_logprobs`) and retain the
             vendor's own, un-normalized logprob structure in the raw
@@ -69,9 +76,13 @@ class OpenAIRater:
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
+    reasoning_effort: str | None = None
     request_logprobs: bool = False
     top_logprobs: int = 5
     vendor: str = field(default="openai", init=False)
+
+    def _reasoning_effort_kwargs(self) -> dict[str, Any]:
+        return {} if self.reasoning_effort is None else {"reasoning_effort": self.reasoning_effort}
 
     def _client(self) -> Any:
         try:
@@ -114,6 +125,7 @@ class OpenAIRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 },
             ],
+            **self._reasoning_effort_kwargs(),
             **logprobs_kwargs,
         )
         reported_version = getattr(response, "model", None)
@@ -173,6 +185,7 @@ class OpenAIRater:
                 },
                 {"role": "user", "content": compose_batch_user_message(records)},
             ],
+            **self._reasoning_effort_kwargs(),
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -216,6 +229,9 @@ class OpenAIBatchRater:
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_tokens: Maximum tokens to request in each reply.
+        reasoning_effort: Forwarded as each submitted request's
+            `reasoning_effort` field when not `None`; see
+            `OpenAIRater.reasoning_effort` for why.
         completion_window: Vendor-side completion SLA for the batch job.
         request_logprobs: If True, request per-token log probabilities on
             every submitted request, mirroring `OpenAIRater.request_logprobs`
@@ -232,6 +248,7 @@ class OpenAIBatchRater:
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
+    reasoning_effort: str | None = None
     completion_window: str = "24h"
     request_logprobs: bool = False
     top_logprobs: int = 5
@@ -260,6 +277,8 @@ class OpenAIBatchRater:
                 },
             ],
         }
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
         if self.request_logprobs:
             body["logprobs"] = True
             body["top_logprobs"] = self.top_logprobs
@@ -273,19 +292,22 @@ class OpenAIBatchRater:
     def _batch_request_line(
         self, records: Sequence[Record], custom_id: str, prompt: str | None
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_completion_tokens": max(self.max_tokens, 16 * len(records)),
+            "temperature": self.temperature,
+            "messages": [
+                {"role": "system", "content": compose_batch_system_prompt(prompt)},
+                {"role": "user", "content": compose_batch_user_message(records)},
+            ],
+        }
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
         return {
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {
-                "model": self.model,
-                "max_completion_tokens": max(self.max_tokens, 16 * len(records)),
-                "temperature": self.temperature,
-                "messages": [
-                    {"role": "system", "content": compose_batch_system_prompt(prompt)},
-                    {"role": "user", "content": compose_batch_user_message(records)},
-                ],
-            },
+            "body": body,
         }
 
     def submit(

@@ -414,6 +414,123 @@ def test_build_raters_accepts_request_logprobs_for_anthropic_without_adding_a_fi
     assert not hasattr(batch_rater, "request_logprobs")
 
 
+def test_build_raters_forwards_reasoning_effort_to_openai() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5.6-terra",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                reasoning_effort="none",
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert rater.reasoning_effort == "none"  # type: ignore[attr-defined]
+    assert batch_rater.reasoning_effort == "none"  # type: ignore[attr-defined]
+
+
+def test_build_raters_reasoning_effort_defaults_to_none() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.reasoning_effort is None  # type: ignore[attr-defined]
+
+
+def test_build_raters_forwards_send_temperature_to_anthropic() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                send_temperature=False,
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert rater.send_temperature is False  # type: ignore[attr-defined]
+    assert batch_rater.send_temperature is False  # type: ignore[attr-defined]
+
+
+def test_build_raters_send_temperature_defaults_to_true() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-4-6", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.send_temperature is True  # type: ignore[attr-defined]
+
+
+def test_openai_batch_rater_request_line_omits_reasoning_effort_by_default() -> None:
+    from attest.vendors.providers.openai import OpenAIBatchRater
+
+    rater = OpenAIBatchRater(model="gpt-4o", model_version="v1", temperature=0.0)
+
+    line = rater._request_line(_record("r1"), "item-0", "criteria")
+
+    assert "reasoning_effort" not in line["body"]
+
+
+def test_openai_batch_rater_request_line_includes_reasoning_effort_when_set() -> None:
+    from attest.vendors.providers.openai import OpenAIBatchRater
+
+    rater = OpenAIBatchRater(
+        model="gpt-5.6-terra", model_version="v1", temperature=0.0, reasoning_effort="none"
+    )
+
+    line = rater._request_line(_record("r1"), "item-0", "criteria")
+    batch_line = rater._batch_request_line([_record("r1"), _record("r2")], "item-0", "criteria")
+
+    assert line["body"]["reasoning_effort"] == "none"
+    assert line["body"]["temperature"] == 0.0
+    assert batch_line["body"]["reasoning_effort"] == "none"
+
+
+def test_anthropic_batch_rater_request_omits_temperature_when_disabled() -> None:
+    from attest.vendors.providers.anthropic import AnthropicBatchRater
+
+    rater = AnthropicBatchRater(
+        model="claude-sonnet-5", model_version="v1", temperature=0.0, send_temperature=False
+    )
+
+    request = rater._request(_record("r1"), "item-0", "criteria")
+    batch_request = rater._batch_request([_record("r1"), _record("r2")], "item-0", "criteria")
+
+    assert "temperature" not in request["params"]
+    assert "temperature" not in batch_request["params"]
+
+
+def test_anthropic_batch_rater_request_includes_temperature_by_default() -> None:
+    from attest.vendors.providers.anthropic import AnthropicBatchRater
+
+    rater = AnthropicBatchRater(model="claude-sonnet-4-6", model_version="v1", temperature=0.0)
+
+    request = rater._request(_record("r1"), "item-0", "criteria")
+
+    assert request["params"]["temperature"] == 0.0
+
+
 def test_build_raters_forwards_request_logprobs_to_fireworks_and_together() -> None:
     # Both are OpenAI-compatible on the sync path, and Together's batch API
     # mirrors OpenAI's, so both get the same request_logprobs treatment as

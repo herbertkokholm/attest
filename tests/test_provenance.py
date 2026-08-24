@@ -61,6 +61,81 @@ def test_vendor_spec_accepts_a_value_merely_containing_todo() -> None:
     VendorSpec(model="not-a-TODO:-value", model_version="1", prompt_version="v1", temperature=0.0)
 
 
+def test_vendor_spec_to_dict_omits_reasoning_effort_and_send_temperature_at_default() -> None:
+    payload = VendorSpec(
+        model="gpt-5.6-terra", model_version="v1", prompt_version="p1", temperature=0.0
+    ).to_dict()
+
+    assert "reasoning_effort" not in payload
+    assert "send_temperature" not in payload
+
+
+def test_vendor_spec_to_dict_includes_reasoning_effort_when_set() -> None:
+    payload = VendorSpec(
+        model="gpt-5.6-terra",
+        model_version="v1",
+        prompt_version="p1",
+        temperature=0.0,
+        reasoning_effort="none",
+    ).to_dict()
+
+    assert payload["reasoning_effort"] == "none"
+
+
+def test_vendor_spec_to_dict_includes_send_temperature_when_false() -> None:
+    payload = VendorSpec(
+        model="claude-sonnet-5",
+        model_version="v1",
+        prompt_version="p1",
+        temperature=0.0,
+        send_temperature=False,
+    ).to_dict()
+
+    assert payload["send_temperature"] is False
+
+
+def test_reasoning_effort_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_reasoning_effort = Config(
+        vendors={
+            **base.vendors,
+            "openai": VendorSpec(
+                model=base.vendors["openai"].model,
+                model_version=base.vendors["openai"].model_version,
+                prompt_version=base.vendors["openai"].prompt_version,
+                temperature=base.vendors["openai"].temperature,
+                reasoning_effort="none",
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_reasoning_effort)
+
+
+def test_send_temperature_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_send_temperature_false = Config(
+        vendors={
+            **base.vendors,
+            "anthropic": VendorSpec(
+                model=base.vendors["anthropic"].model,
+                model_version=base.vendors["anthropic"].model_version,
+                prompt_version=base.vendors["anthropic"].prompt_version,
+                temperature=base.vendors["anthropic"].temperature,
+                send_temperature=False,
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(
+        with_send_temperature_false
+    )
+
+
 def test_same_descriptor_yields_same_ensemble_config_id() -> None:
     id_a = compute_ensemble_config_id(_config())
     id_b = compute_ensemble_config_id(_config())
