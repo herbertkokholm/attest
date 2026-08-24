@@ -25,6 +25,23 @@ from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 # back the other way would be circular. `attest.vendors.base` re-exports it.
 OUTPUT_CONTRACT_VERSION = "1"
 
+# Version of the kernel-owned multi-record output-format contract used when
+# `batch_size > 1` packs more than one record into a single screening request
+# (see `attest.vendors.base.BATCH_OUTPUT_CONTRACT`). Defined here for the same
+# circularity reason as `OUTPUT_CONTRACT_VERSION`, and re-exported from
+# `attest.vendors.base`. Included in `Config.to_dict` only when `batch_size >
+# 1` -- see `Config.to_dict` -- so a `batch_size == 1` configuration hashes
+# identically whether or not this constant exists, preserving its bytes.
+BATCH_OUTPUT_CONTRACT_VERSION = "1"
+
+# Convention (not enforced elsewhere) for a config field whose real value is
+# not yet known -- e.g. a served model snapshot string that must be captured
+# from a live vendor before a run is frozen. `VendorSpec.__post_init__`
+# refuses to construct with one of these left in place, so a placeholder can
+# never silently reach a live screening run: a content hash of "TODO:..." is
+# provenance for a plan, not for the instrument that actually ran.
+TODO_PLACEHOLDER_PREFIX = "TODO:"
+
 
 @dataclass(frozen=True)
 class VendorSpec:
@@ -40,21 +57,78 @@ class VendorSpec:
             hash-sensitive, so changing it yields a different
             `ensemble_config_id` and opens a new epoch, the same as a model
             or prompt change would.
+        reasoning_effort: Forwarded to `attest.vendors.providers.openai`'s
+            raters as the Chat Completions API's `reasoning_effort`
+            parameter when not `None`; ignored by every other provider.
+            Exists because some current-generation OpenAI models reject an
+            explicit non-default `temperature` outright (HTTP 400) unless
+            paired with `reasoning_effort="none"` -- confirmed empirically
+            against `gpt-5.6-terra` on 2026-08-24, not assumed from
+            documentation (OpenAI's docs describe the coupling but not which
+            models it applies to). `None` (the default) omits the parameter
+            from the request entirely, reproducing every prior model's
+            behavior exactly. Hash-versioned like `temperature` -- it changes
+            what the vendor actually samples -- but omitted from `to_dict()`
+            when `None`, so a config that never sets it hashes identically
+            to before this field existed.
+        send_temperature: When `False`, `attest.vendors.providers.anthropic`'s
+            raters omit `temperature` from the Messages API request entirely
+            instead of sending `self.temperature` and letting the vendor
+            reject it. Exists because Claude Sonnet 5 (and the rest of the
+            Claude 4.6+ generation) returns HTTP 400 on any explicit
+            `temperature`/`top_p`/`top_k` value -- confirmed against
+            Anthropic's own current model documentation, 2026-08-24 -- with
+            no parameter analogous to OpenAI's `reasoning_effort="none"` that
+            re-enables it; omission is the only way to avoid the error.
+            Ignored by every other provider. Defaults to `True` (send
+            `temperature` as before this field existed) and is omitted from
+            `to_dict()` at that default, so an existing config hashes
+            unchanged. `temperature` itself stays required on `VendorSpec`
+            even when this is `False`, since it remains meaningful
+            provenance (the value that was requested, for a model that
+            silently cannot honor it) and other providers still consume it
+            directly.
     """
 
     model: str
     model_version: str
     prompt_version: str
     temperature: float
+    reasoning_effort: str | None = None
+    send_temperature: bool = True
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("model", self.model),
+            ("model_version", self.model_version),
+            ("prompt_version", self.prompt_version),
+        ):
+            if value.startswith(TODO_PLACEHOLDER_PREFIX):
+                raise ValueError(
+                    f"VendorSpec.{field_name} is an unresolved placeholder ('{value}'): "
+                    "resolve it to the real value before this configuration can be used -- "
+                    "a TODO-prefixed field must never reach a live screening run"
+                )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return this vendor spec as a plain dict."""
-        return {
+        """Return this vendor spec as a plain dict.
+
+        `reasoning_effort` and `send_temperature` are included only when set
+        to something other than their no-op default (`None` and `True`
+        respectively), so a `VendorSpec` that never touches either hashes
+        identically to one constructed before these fields existed.
+        """
+        payload: dict[str, Any] = {
             "model": self.model,
             "model_version": self.model_version,
             "prompt_version": self.prompt_version,
             "temperature": self.temperature,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.send_temperature is not True:
+            payload["send_temperature"] = self.send_temperature
+        return payload
 
 
 @dataclass
@@ -84,6 +158,22 @@ class Config:
             default) routes it to a human via escalation; `ZERO_POLICY_INCLUDE`
             folds it into `+1`. Validated at construction; only these two
             values are accepted -- there is deliberately no "exclude" option.
+        batch_size: `b_e` -- the maximum number of records packed into a
+            single vendor screening request (see manuscript Eq. 1 and
+            Section 2.6). A control knob set from the runbook, not a
+            provenance-only claim: `attest.vendors.base.run_ensemble` and
+            `attest.vendors.batch.submit_batch` actually chunk records into
+            requests of at most this size (grouped by resolved prompt first,
+            so records on different tracks/criteria are never packed
+            together; a final undersized chunk is valid). Defaults to `1`
+            -- one record per request, this kernel's original behavior.
+            Hashed unconditionally, on par with `vendors`/`aggregation`/
+            `tau`/`x`, because per-request packing changes measured
+            screening performance even under an unchanged model name: a
+            `batch_size` change opens a new epoch the same as a model or
+            prompt change would. Never checked against `len(kept)` or any
+            other record count -- it is a packing width, not a corpus-size
+            assertion.
         confidence_threshold: Default `low_threshold` (see
             `attest.ensemble.confidence.confidence_tier`) a confidence-
             stratified `audit-draw` uses when no `--confidence-threshold`
@@ -102,6 +192,7 @@ class Config:
     vendors: dict[str, VendorSpec] = field(default_factory=dict)
     aggregation: str = ""
     tau: float = 0.0
+    batch_size: int = 1
     default_prompt: str | None = None
     track_prompts: dict[str, str] = field(default_factory=dict)
     zero_policy: str = ZERO_POLICY_ESCALATE
@@ -116,6 +207,8 @@ class Config:
             raise ValueError(
                 f"unknown zero_policy '{self.zero_policy}': expected one of {KNOWN_ZERO_POLICIES}"
             )
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
 
     @property
     def x(self) -> int:
@@ -158,11 +251,23 @@ class Config:
         contract at all (see its attribute docstring above), so it is
         persisted separately by `attest.io.store._config_to_dict` instead
         of through this method.
+        `batch_size` is always included, unconditionally, on par with
+        `vendors`/`aggregation`/`tau`/`x`: it is `b_e` in the manuscript's
+        `C_e` tuple (Eq. 1), not an optional add-on like `zero_policy`, so
+        every change to it is hash-sensitive and opens a new epoch.
+        `batch_output_contract_version` is included only when `batch_size >
+        1`: the multi-record output contract it versions (see
+        `attest.vendors.base.BATCH_OUTPUT_CONTRACT`) is only ever composed
+        onto a request when more than one record is packed into it, so a
+        `batch_size == 1` configuration -- which never touches that contract
+        -- hashes identically whether or not this constant exists, keeping
+        its `ensemble_config_id` byte-for-byte stable.
         """
         payload: dict[str, Any] = {
             "vendors": {name: spec.to_dict() for name, spec in self.vendors.items()},
             "aggregation": self.aggregation,
             "tau": self.tau,
+            "batch_size": self.batch_size,
             "x": self.x,
         }
         if self.default_prompt is not None:
@@ -170,6 +275,8 @@ class Config:
         if self.track_prompts:
             payload["track_prompts"] = dict(self.track_prompts)
         payload["output_contract_version"] = OUTPUT_CONTRACT_VERSION
+        if self.batch_size > 1:
+            payload["batch_output_contract_version"] = BATCH_OUTPUT_CONTRACT_VERSION
         if self.zero_policy != ZERO_POLICY_ESCALATE:
             payload["zero_policy"] = self.zero_policy
         return payload

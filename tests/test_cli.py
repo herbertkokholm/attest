@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from attest.cli import _build_parser, main
+from attest.cli import _build_parser, _load_ensemble_config, main
 
 _GOLD_SET = str(Path(__file__).resolve().parent.parent / "data" / "example_gold_set.json")
 
@@ -34,9 +34,55 @@ def _write_config(path: Path) -> None:
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 1,
             }
         )
     )
+
+
+def test_load_ensemble_config_parses_reasoning_effort_and_send_temperature(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {
+                    "openai": {
+                        "model": "gpt-5.6-terra",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                        "reasoning_effort": "none",
+                    },
+                    "anthropic": {
+                        "model": "claude-sonnet-5",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                        "send_temperature": False,
+                    },
+                    "mistral": {
+                        "model": "mistral-large-2512",
+                        "model_version": "v1",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                    },
+                },
+                "aggregation": "boundary_dispersion",
+                "tau": 0.5,
+                "batch_size": 1,
+            }
+        )
+    )
+
+    config = _load_ensemble_config(config_path)
+
+    assert config.vendors["openai"].reasoning_effort == "none"
+    assert config.vendors["anthropic"].send_temperature is False
+    # Unset in the JSON -- must resolve to the no-op defaults, not crash.
+    assert config.vendors["mistral"].reasoning_effort is None
+    assert config.vendors["mistral"].send_temperature is True
 
 
 def test_end_to_end_screen_audit_validate(
@@ -95,23 +141,44 @@ def test_end_to_end_screen_audit_validate(
         ]
     )
     assert draw_rc == 0
-    drawn = json.loads(capsys.readouterr().out)["drawn"]
+    draw_output = json.loads(capsys.readouterr().out)
+    drawn = draw_output["drawn"]
     drawn_ids = {row["record_id"] for row in drawn}
     assert drawn_ids == {"rec-001", "rec-004"}
+    assert draw_output["sampling_frame_hash"]
+    assert (
+        json.loads((run_dir / "audit_draw.json").read_text())["sampling_frame_hash"]
+        == draw_output["sampling_frame_hash"]
+    )
 
     labels_path = tmp_path / "labels.json"
     labels_path.write_text(json.dumps({"rec-001": 1, "rec-004": -1}))
 
-    apply_rc = main(["audit-apply", "--run-dir", str(run_dir), "--labels", str(labels_path)])
+    apply_rc = main(
+        [
+            "audit-apply",
+            "--run-dir",
+            str(run_dir),
+            "--labels",
+            str(labels_path),
+            "--reviewer",
+            "auditor-a",
+            "--blinded",
+        ]
+    )
     assert apply_rc == 0
     labeled = json.loads(capsys.readouterr().out)["labeled"]
     assert set(labeled) == drawn_ids
+
+    audit_rows = json.loads((run_dir / "audit.json").read_text())["audit_rows"]
+    assert audit_rows["rec-001"]["reviewer"] == "auditor-a"
+    assert audit_rows["rec-001"]["blinded"] is True
 
     validate_rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
     assert validate_rc == 0
     record = json.loads(capsys.readouterr().out)
 
-    assert record["schema_version"] == "1.1"
+    assert record["schema_version"] == "1.6"
     assert record["config"]["zero_policy"] == "escalate"
     assert record["prisma"]["identified"] == 6
     assert record["prisma"]["duplicates_removed"] == 1
@@ -121,10 +188,241 @@ def test_end_to_end_screen_audit_validate(
     # rec-004's escalation was resolved before this validate ran, so the
     # decisions store no longer shows it as escalating.
     assert record["escalation_rate"] == pytest.approx(0.0)
+    assert record["unresolved_escalations"] == 0
     assert record["recall"]["point"] is not None
     assert record["recall"]["floor"] is not None
     assert record["recall"]["floor"] <= record["recall"]["point"]
+    assert record["recall"]["exact_floor"] is not None
+    assert record["recall"]["exact_floor"] <= record["recall"]["point"]
     assert record["recall"]["audit_n"] == 2
+    assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
+
+
+def test_end_to_end_inclusion_audit_draw_apply_validate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """As test_end_to_end_screen_audit_validate, but also exercises the TP-side audit.
+
+    rec-002 and rec-002-duplicate are the only two records screening
+    included (see _write_config/_DETERMINISTIC_SEED above); both are
+    actually gold-irrelevant (gold_label -1), so a full inclusion audit
+    over them should estimate TP as 0 -- matching the full-review
+    confusion["tp"] the sibling test already confirms is 0.
+    """
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    assert (
+        main(
+            [
+                "screen",
+                "--input",
+                _GOLD_SET,
+                "--config",
+                str(config_path),
+                "--run-dir",
+                str(run_dir),
+                "--deterministic-seed",
+                str(_DETERMINISTIC_SEED),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        main(["adjudicate", "--run-dir", str(run_dir), "--record-id", "rec-004", "--label", "-1"])
+        == 0
+    )
+    capsys.readouterr()
+
+    inclusion_draw_rc = main(
+        [
+            "inclusion-audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "all",
+        ]
+    )
+    assert inclusion_draw_rc == 0
+    inclusion_draw_output = json.loads(capsys.readouterr().out)
+    inclusion_drawn = inclusion_draw_output["drawn"]
+    inclusion_drawn_ids = {row["record_id"] for row in inclusion_drawn}
+    assert inclusion_drawn_ids == {"rec-002", "rec-002-duplicate"}
+    assert inclusion_draw_output["sampling_frame_hash"]
+    assert (
+        json.loads((run_dir / "inclusion_audit_draw.json").read_text())["sampling_frame_hash"]
+        == inclusion_draw_output["sampling_frame_hash"]
+    )
+
+    inclusion_labels_path = tmp_path / "inclusion_labels.json"
+    inclusion_labels_path.write_text(json.dumps({"rec-002": -1, "rec-002-duplicate": -1}))
+    inclusion_apply_rc = main(
+        [
+            "inclusion-audit-apply",
+            "--run-dir",
+            str(run_dir),
+            "--labels",
+            str(inclusion_labels_path),
+            "--reviewer",
+            "auditor-b",
+        ]
+    )
+    assert inclusion_apply_rc == 0
+    inclusion_labeled = json.loads(capsys.readouterr().out)["labeled"]
+    assert set(inclusion_labeled) == inclusion_drawn_ids
+
+    draw_rc = main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "2",
+            "--seed",
+            "1",
+        ]
+    )
+    assert draw_rc == 0
+    capsys.readouterr()
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps({"rec-001": 1, "rec-004": -1}))
+    assert (
+        main(
+            [
+                "audit-apply",
+                "--run-dir",
+                str(run_dir),
+                "--labels",
+                str(labels_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    validate_rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert validate_rc == 0
+    record = json.loads(capsys.readouterr().out)
+
+    assert record["recall"]["tp_estimation_method"] == "inclusion_audit"
+    assert record["recall"]["estimated_true_positives"] == pytest.approx(0.0)
+    # confusion["tp"] is still computed from truths as always, and happens
+    # to agree with the audited estimate here -- both are 0.
+    assert record["confusion"]["tp"] == 0
+    assert record["recall"]["exact_floor"] is not None
+    # floor/ci are FN-only bounds that would silently understate point's
+    # uncertainty once TP itself carries sampling error (see
+    # attest.stats.recall.stratified_recall_with_audited_tp) -- confirmed
+    # here at the actual CLI/JSON boundary, not just at the stats-unit
+    # level (test_audited_tp_leaves_point_untouched_but_nulls_fn_only_floor_and_ci).
+    assert record["recall"]["floor"] is None
+    assert record["recall"]["ci"] is None
+
+
+def test_validate_fails_closed_on_unresolved_escalation_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    screen_rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    assert screen_rc == 0
+    capsys.readouterr()
+
+    # rec-004 escalates and is never adjudicated here: validate must refuse
+    # to silently drop it from the confusion matrix/recall TP.
+    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "rec-004" in err
+    assert "allow_unresolved_escalations" in err or "allow-unresolved-escalations" in err
+
+    rc_allowed = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
+    assert rc_allowed == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["unresolved_escalations"] == 1
+    # rec-004 has no gold label at all (see data/example_gold_set.json), so
+    # its resolution status never affects the confusion matrix -- this is
+    # identical to test_end_to_end_screen_audit_validate's fully-resolved
+    # result. What differs is PRISMA: rec-004 is dropped from both
+    # screen_excluded and included (3 resolved records, not 4) rather than
+    # being counted as screen_excluded.
+    assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
+    assert record["prisma"]["screen_excluded"] == 1
+    assert record["prisma"]["included"] == 2
+
+
+def test_validate_resolves_escalations_via_human_labels_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    # Resolve rec-004 via an externally-supplied labels file instead of
+    # 'attest adjudicate', e.g. an inclusion audit or an external review tool.
+    human_labels_path = tmp_path / "human_labels.json"
+    human_labels_path.write_text(json.dumps({"rec-004": -1}))
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--human-labels",
+            str(human_labels_path),
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["unresolved_escalations"] == 0
     assert record["confusion"] == {"tp": 0, "fp": 2, "fn": 1, "tn": 0}
 
 
@@ -146,6 +444,7 @@ def _write_confidence_config(path: Path, *, confidence_threshold: float | None =
         },
         "aggregation": "boundary_dispersion",
         "tau": 1.0,
+        "batch_size": 1,
     }
     if confidence_threshold is not None:
         payload["confidence_threshold"] = confidence_threshold
@@ -465,6 +764,51 @@ def test_screen_warns_for_a_dispersion_inert_tau(
     capsys.readouterr()
 
 
+def test_screen_defaults_a_config_missing_batch_size_to_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # batch_size is a packing-width control knob, not a declared corpus-size
+    # assertion (see EnsembleConfig.batch_size) -- an omitted key falls back
+    # to 1 (one record per request), exactly like a config that spells
+    # "batch_size": 1 out explicitly, rather than being rejected.
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 0
+    capsys.readouterr()
+    assert (run_dir / "votes.json").exists()
+    assert json.loads((run_dir / "config.json").read_text())["batch_size"] == 1
+
+
 def test_screen_rejects_a_nonsensical_tau(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -482,6 +826,7 @@ def test_screen_rejects_a_nonsensical_tau(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 0.0,
+                "batch_size": 1,
             }
         )
     )
@@ -529,15 +874,28 @@ def test_validate_surfaces_the_tau_report_as_provenance(
     )
     capsys.readouterr()
 
-    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    # rec-004's tie escalates and is deliberately left unadjudicated here --
+    # this test is about tau_report surfacing, not escalation handling -- so
+    # it must opt in to validating over the unresolved escalation.
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
     assert rc == 0
     record = json.loads(capsys.readouterr().out)
 
     assert record["tau_report"] == describe_tau(1.0, 2).to_dict()
+    assert record["unresolved_escalations"] == 1
     # The tau_report addition is CLI-output-only, not a validation-record
-    # schema change; schema_version here reflects workstream C's
-    # zero_policy field on Config instead.
-    assert record["schema_version"] == "1.1"
+    # schema change; schema_version here just tracks the current
+    # SCHEMA_VERSION (see attest.contracts.validation_record).
+    assert record["schema_version"] == "1.6"
 
 
 def test_screen_batch_mode_then_batch_fetch_matches_sync(
@@ -708,6 +1066,7 @@ def test_screen_rejects_an_unrecognized_zero_policy(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 1,
                 "zero_policy": "exclude",
             }
         )
@@ -732,6 +1091,53 @@ def test_screen_rejects_an_unrecognized_zero_policy(
     assert not (run_dir / "votes.json").exists()
 
 
+def test_screen_rejects_an_unresolved_todo_placeholder_in_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    unresolved_vendor_spec = {
+        "model": "TODO:pin-openai-current-gen-dated-snapshot",
+        "model_version": "TODO:capture-served-snapshot-before-freeze",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": unresolved_vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+                "batch_size": 1,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+
+    assert rc == 1
+    assert "unresolved placeholder" in capsys.readouterr().err
+    assert not (run_dir / "votes.json").exists()
+
+
 def test_screen_with_zero_policy_include_auto_labels_the_tie(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -749,6 +1155,7 @@ def test_screen_with_zero_policy_include_auto_labels_the_tie(
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 1.0,
+                "batch_size": 1,
                 "zero_policy": "include",
             }
         )
@@ -792,6 +1199,7 @@ def test_ablate_over_gold_labeled_votes(tmp_path: Path, capsys: pytest.CaptureFi
                 "vendors": {"v1": vendor_spec, "v2": vendor_spec},
                 "aggregation": "boundary_dispersion",
                 "tau": 0.5,
+                "batch_size": 1,
             }
         )
     )
@@ -836,7 +1244,22 @@ def test_ablate_over_gold_labeled_votes(tmp_path: Path, capsys: pytest.CaptureFi
 
 @pytest.mark.parametrize(
     "command",
-    ["screen", "batch-fetch", "adjudicate", "audit-draw", "audit-apply", "validate", "ablate"],
+    [
+        "screen",
+        "batch-fetch",
+        "adjudicate",
+        "audit-draw",
+        "audit-apply",
+        "validate",
+        "ablate",
+        "protocol",
+        "manifest",
+        "verify",
+        "sentinel-init",
+        "sentinel-check",
+        "active-learning-select",
+        "active-learning-review",
+    ],
 )
 def test_help_works_for_every_command(command: str) -> None:
     with pytest.raises(SystemExit) as excinfo:
@@ -859,6 +1282,948 @@ def test_build_parser_registers_every_command() -> None:
         "adjudicate",
         "audit-draw",
         "audit-apply",
+        "inclusion-audit-draw",
+        "inclusion-audit-apply",
         "validate",
         "ablate",
+        "protocol",
+        "manifest",
+        "verify",
+        "sentinel-init",
+        "sentinel-check",
+        "active-learning-select",
+        "active-learning-review",
     }
+
+
+# --- changelog wiring: initial_config and explicit_config_change via screen ------
+
+
+def test_screen_logs_initial_config_changelog_event_on_first_epoch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    events = json.loads((run_dir / "changelog.json").read_text())
+    assert len(events) == 1
+    assert events[0]["change_type"] == "initial_config"
+    assert events[0]["before"] is None
+    assert events[0]["approver"] is None
+
+    # Re-running screen over the same, unchanged run directory reuses the
+    # existing epoch and must not log a second changelog event.
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+    events_again = json.loads((run_dir / "changelog.json").read_text())
+    assert len(events_again) == 1
+
+
+def _run_epoch_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
+    """Screen a first epoch into its own run directory, returning that run directory.
+
+    Standing in for a runbook's `RUN_DIR=data/run` (epoch 1) so tests of
+    `--previous-run-dir` have a real predecessor run directory -- with an
+    actually-persisted `config.json` -- to point at, exactly as the CLI
+    contract requires (a hand-passed config file path is not accepted).
+    """
+    run_dir = tmp_path / "run_epoch1"
+    config_path = tmp_path / "config_epoch1.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+    return run_dir
+
+
+def test_screen_with_previous_run_dir_logs_explicit_change_with_field_diff(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous_run_dir = _run_epoch_1(tmp_path, capsys)
+
+    new_run_dir = tmp_path / "run_epoch2"
+    new_config_path = tmp_path / "config_epoch2.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "2",  # bumped, the deliberate change
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    new_config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"v1": vendor_spec, "v2": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+                "batch_size": 1,
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(new_config_path),
+            "--run-dir",
+            str(new_run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--previous-run-dir",
+            str(previous_run_dir),
+            "--change-reason",
+            "bumped model_version to 2",
+            "--approver",
+            "reviewer-a",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    events = json.loads((new_run_dir / "changelog.json").read_text())
+    assert len(events) == 1
+    event = events[0]
+    assert event["change_type"] == "explicit_config_change"
+    assert event["before"] is not None
+    assert event["reason"] == "bumped model_version to 2"
+    assert event["approver"] == "reviewer-a"
+    assert "vendors.v1.model_version" in event["changed_fields"]
+    assert "vendors.v2.model_version" in event["changed_fields"]
+
+
+def test_screen_rejects_previous_run_dir_with_no_stored_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    empty_previous_dir = tmp_path / "not_a_real_run_dir"
+    empty_previous_dir.mkdir()
+    new_config_path = tmp_path / "config_epoch2.json"
+    _write_config(new_config_path)
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(new_config_path),
+            "--run-dir",
+            str(tmp_path / "run_epoch2"),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--previous-run-dir",
+            str(empty_previous_dir),
+            "--change-reason",
+            "bumped model_version to 2",
+        ]
+    )
+    assert rc == 1
+
+
+def test_screen_requires_change_reason_with_previous_run_dir(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous_run_dir = _run_epoch_1(tmp_path, capsys)
+    new_config_path = tmp_path / "config_epoch2.json"
+    _write_config(new_config_path)
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(new_config_path),
+            "--run-dir",
+            str(tmp_path / "run_epoch2"),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--previous-run-dir",
+            str(previous_run_dir),
+        ]
+    )
+    assert rc == 1
+
+
+def test_screen_rejects_approver_without_previous_run_dir(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+
+    rc = main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+            "--approver",
+            "reviewer-a",
+        ]
+    )
+    assert rc == 1
+
+
+# --- adjudicate: reviewer/protocol provenance -------------------------------------
+
+
+def test_adjudicate_persists_reviewer_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "adjudicate",
+            "--run-dir",
+            str(run_dir),
+            "--record-id",
+            "rec-004",
+            "--label",
+            "-1",
+            "--reviewer",
+            "reviewer-b",
+            "--protocol-id",
+            "proto-1",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    records = json.loads((run_dir / "adjudication_records.json").read_text())
+    assert records["rec-004"]["reviewer"] == "reviewer-b"
+    assert records["rec-004"]["protocol_id"] == "proto-1"
+    assert records["rec-004"]["human_label"] == -1
+    assert records["rec-004"]["selection_reason"] == "tie"
+
+
+# --- audit-draw / audit-apply: draw and label snapshots ---------------------------
+
+
+def test_audit_draw_and_apply_persist_snapshots(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+    main(["adjudicate", "--run-dir", str(run_dir), "--record-id", "rec-004", "--label", "-1"])
+    capsys.readouterr()
+
+    main(
+        [
+            "audit-draw",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--size",
+            "2",
+            "--seed",
+            "1",
+        ]
+    )
+    capsys.readouterr()
+
+    drawn_snapshot = json.loads((run_dir / "audit_draw.json").read_text())["drawn"]
+    assert set(drawn_snapshot) == {"rec-001", "rec-004"}
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps({"rec-001": 1, "rec-004": -1}))
+    main(["audit-apply", "--run-dir", str(run_dir), "--labels", str(labels_path)])
+    capsys.readouterr()
+
+    labels_snapshot = json.loads((run_dir / "audit_labels.json").read_text())["labels"]
+    assert labels_snapshot == {"rec-001": 1, "rec-004": -1}
+
+
+# --- validate: run-directory-local snapshot ----------------------------------------
+
+
+def test_validate_persists_a_run_directory_local_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+    main(["adjudicate", "--run-dir", str(run_dir), "--record-id", "rec-004", "--label", "-1"])
+    capsys.readouterr()
+
+    rc = main(["validate", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert rc == 0
+    stdout_record = json.loads(capsys.readouterr().out)
+
+    snapshot = json.loads((run_dir / "validation_record.json").read_text())
+    assert snapshot == stdout_record
+
+
+# --- protocol / manifest / verify: offline artifact integrity ---------------------
+
+
+def test_protocol_manifest_verify_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    protocol_rc = main(
+        [
+            "protocol",
+            "--run-dir",
+            str(run_dir),
+            "--stratify-by",
+            "track",
+            "--audit-size-policy",
+            "n=600",
+        ]
+    )
+    assert protocol_rc == 0
+    protocol_payload = json.loads(capsys.readouterr().out)
+    assert protocol_payload["audit_design"]["stratify_by"] == "track"
+
+    manifest_rc = main(
+        ["manifest", "--run-dir", str(run_dir), "--input", _GOLD_SET, "--seed", "screen=17"]
+    )
+    assert manifest_rc == 0
+    manifest_payload = json.loads(capsys.readouterr().out)
+    assert manifest_payload["ensemble_config_id"]
+    assert manifest_payload["protocol_id"] == protocol_payload["protocol_id"]
+    assert manifest_payload["seeds"] == {"screen": 17}
+    assert "config.json" in manifest_payload["artifact_hashes"]
+    assert "changelog.json" in manifest_payload["artifact_hashes"]
+    # "v1"/"v2" (_write_config's vendor names) aren't real provider names, so
+    # sdk_versions resolves to empty here -- see
+    # test_manifest_includes_sdk_versions_for_real_vendor_names below for the
+    # populated case.
+    assert manifest_payload["sdk_versions"] == {}
+
+    verify_rc = main(["verify", "--run-dir", str(run_dir)])
+    assert verify_rc == 0
+    verify_payload = json.loads(capsys.readouterr().out)
+    assert verify_payload["ok"] is True
+
+    # Tamper with a hashed artifact directly on disk, bypassing the store.
+    (run_dir / "config.json").write_text('{"tampered": true}', encoding="utf-8")
+
+    verify_rc_after_tamper = main(["verify", "--run-dir", str(run_dir)])
+    assert verify_rc_after_tamper == 1
+    tampered_payload = json.loads(capsys.readouterr().out)
+    assert tampered_payload["ok"] is False
+    assert any(p["artifact"] == "config.json" for p in tampered_payload["problems"])
+
+
+def test_manifest_includes_sdk_versions_for_real_vendor_names(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from importlib import metadata
+
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    vendor_spec = {
+        "model": "deterministic-v1",
+        "model_version": "1",
+        "prompt_version": "p1",
+        "temperature": 0.0,
+    }
+    config_path.write_text(
+        json.dumps(
+            {
+                "vendors": {"openai": vendor_spec, "anthropic": vendor_spec},
+                "aggregation": "boundary_dispersion",
+                "tau": 1.0,
+                "batch_size": 1,
+            }
+        )
+    )
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    def _version(dist: str) -> str:
+        if dist == "openai":
+            return "2.53.0"
+        raise metadata.PackageNotFoundError(dist)
+
+    monkeypatch.setattr(metadata, "version", _version)
+
+    manifest_rc = main(["manifest", "--run-dir", str(run_dir), "--input", _GOLD_SET])
+    assert manifest_rc == 0
+    manifest_payload = json.loads(capsys.readouterr().out)
+    # "anthropic" resolves to no version here (monkeypatch only covers
+    # "openai") and is correctly absent, not mapped to null.
+    assert manifest_payload["sdk_versions"] == {"openai": "2.53.0"}
+
+
+def test_verify_without_a_manifest_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(["verify", "--run-dir", str(run_dir)])
+    assert rc == 1
+
+
+# --- sentinel-init / sentinel-check: offline drift plumbing -----------------------
+
+
+def _write_sentinel_input(path: Path, n: int = 6) -> None:
+    records = [
+        {"id": f"s{i}", "title": f"title {i}", "abstract": f"abstract {i}", "track": "sentinel"}
+        for i in range(n)
+    ]
+    path.write_text(
+        json.dumps({"schema_version": "1.0", "project": "sentinel", "records": records})
+    )
+
+
+def test_sentinel_init_then_check_with_identical_seed_shows_no_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    sentinel_input_path = tmp_path / "sentinel.json"
+    _write_sentinel_input(sentinel_input_path)
+
+    init_rc = main(
+        [
+            "sentinel-init",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    assert init_rc == 0
+    capsys.readouterr()
+    assert (run_dir / "sentinel_baseline.json").exists()
+
+    check_rc = main(
+        [
+            "sentinel-check",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    assert check_rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["triggered"] is False
+    assert "new_epoch" not in result
+
+    evaluations = json.loads((run_dir / "sentinel_evaluations.json").read_text())
+    assert len(evaluations) == 1
+
+
+def test_validate_omits_sentinel_staleness_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert "sentinel_staleness" not in record
+
+
+def test_validate_warns_by_default_when_sentinel_never_checked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    record = json.loads(captured.out)
+    assert record["sentinel_staleness"] == {
+        "last_checked_at": None,
+        "staleness_days": None,
+        "max_staleness_days": 7.0,
+        "stale": True,
+    }
+    assert "sentinel staleness" in captured.err
+
+
+def test_validate_fails_on_stale_sentinel_when_requested(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+            "--fail-on-stale-sentinel",
+        ]
+    )
+    assert rc == 1
+    assert "sentinel staleness" in capsys.readouterr().err
+
+
+def test_validate_not_stale_after_a_fresh_sentinel_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    sentinel_input_path = tmp_path / "sentinel.json"
+    _write_sentinel_input(sentinel_input_path)
+    main(
+        [
+            "sentinel-init",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    capsys.readouterr()
+    main(
+        [
+            "sentinel-check",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "validate",
+            "--run-dir",
+            str(run_dir),
+            "--input",
+            _GOLD_SET,
+            "--allow-unresolved-escalations",
+            "--max-staleness-days",
+            "7",
+            "--fail-on-stale-sentinel",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["sentinel_staleness"]["stale"] is False
+    assert record["sentinel_staleness"]["last_checked_at"] is not None
+
+
+def test_sentinel_check_without_baseline_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    sentinel_input_path = tmp_path / "sentinel.json"
+    _write_sentinel_input(sentinel_input_path)
+
+    rc = main(
+        [
+            "sentinel-check",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    assert rc == 1
+
+
+def test_sentinel_check_rejects_a_different_sentinel_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    sentinel_input_path = tmp_path / "sentinel.json"
+    _write_sentinel_input(sentinel_input_path, n=6)
+    main(
+        [
+            "sentinel-init",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(sentinel_input_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    capsys.readouterr()
+
+    different_sentinel_path = tmp_path / "sentinel_different.json"
+    _write_sentinel_input(different_sentinel_path, n=7)  # different content -> different set id
+
+    rc = main(
+        [
+            "sentinel-check",
+            "--run-dir",
+            str(run_dir),
+            "--sentinel-input",
+            str(different_sentinel_path),
+            "--deterministic-seed",
+            "99",
+        ]
+    )
+    assert rc == 1
+
+
+# --- active-learning-select / active-learning-review -------------------------------
+
+
+def test_active_learning_select_then_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    select_rc = main(
+        ["active-learning-select", "--run-dir", str(run_dir), "--dispersion-threshold", "0.0"]
+    )
+    assert select_rc == 0
+    selected = json.loads(capsys.readouterr().out)["selected"]
+    assert selected  # rec-004's exact tie has zero dispersion but escalates via zero_policy
+
+    record_id = selected[0]["record_id"]
+    review_rc = main(
+        [
+            "active-learning-review",
+            "--run-dir",
+            str(run_dir),
+            "--record-id",
+            record_id,
+            "--reviewer",
+            "reviewer-c",
+            "--notes",
+            "worth a prompt tweak",
+        ]
+    )
+    assert review_rc == 0
+    capsys.readouterr()
+
+    reviews = json.loads((run_dir / "active_learning_reviews.json").read_text())
+    assert len(reviews) == 1
+    assert reviews[0]["reviewer"] == "reviewer-c"
+    assert reviews[0]["notes"] == "worth a prompt tweak"
+
+
+def test_active_learning_review_requires_a_prior_selection(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "config.json"
+    _write_config(config_path)
+    main(
+        [
+            "screen",
+            "--input",
+            _GOLD_SET,
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(run_dir),
+            "--deterministic-seed",
+            str(_DETERMINISTIC_SEED),
+        ]
+    )
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "active-learning-review",
+            "--run-dir",
+            str(run_dir),
+            "--record-id",
+            "rec-999",
+            "--reviewer",
+            "reviewer-c",
+        ]
+    )
+    assert rc == 1

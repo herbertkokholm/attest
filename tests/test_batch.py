@@ -73,10 +73,17 @@ class _CountingBatchRater:
         return self.inner.model
 
     def submit(
-        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+        self,
+        records: Any,
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
         self.submit_calls += 1
-        return self.inner.submit(records, ensemble_config_id, prompts=prompts)
+        return self.inner.submit(
+            records, ensemble_config_id, prompts=prompts, batch_size=batch_size
+        )
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
         return self.inner.poll(handle)
@@ -102,9 +109,16 @@ class _ScriptedPollRater:
         return self.inner.model
 
     def submit(
-        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+        self,
+        records: Any,
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
-        return self.inner.submit(records, ensemble_config_id, prompts=prompts)
+        return self.inner.submit(
+            records, ensemble_config_id, prompts=prompts, batch_size=batch_size
+        )
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
         self.poll_calls += 1
@@ -123,7 +137,12 @@ class _AlwaysFailingRater:
     model = "model-a"
 
     def submit(
-        self, records: Any, ensemble_config_id: str, prompts: Mapping[str, str] | None = None
+        self,
+        records: Any,
+        ensemble_config_id: str,
+        prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
         return BatchHandle(
             vendor=self.vendor,
@@ -174,6 +193,35 @@ def test_run_ensemble_batch_matches_run_ensemble_under_per_track_prompts(tmp_pat
         Record(id="rec-1", title="title", abstract="abstract", track="review-a"),
         Record(id="rec-2", title="title", abstract="abstract", track="review-b"),
     ]
+
+    sync_run = run_ensemble(records, _sync_raters(), config)
+    store = RunStore(tmp_path / "run")
+    batch_run = run_ensemble_batch(records, _batch_raters(), config, store)
+
+    assert batch_run.votes == sync_run.votes
+
+
+def test_run_ensemble_batch_matches_run_ensemble_at_batch_size_two(tmp_path: Path) -> None:
+    base = _config()
+    config = Config(vendors=base.vendors, aggregation=base.aggregation, tau=base.tau, batch_size=2)
+    records = _records("rec-1", "rec-2", "rec-3")
+
+    sync_run = run_ensemble(records, _sync_raters(), config)
+    store = RunStore(tmp_path / "run")
+    batch_run = run_ensemble_batch(records, _batch_raters(), config, store)
+
+    assert batch_run.votes == sync_run.votes
+    assert [v.record_id for v in batch_run.votes] == [v.record_id for v in sync_run.votes]
+
+
+def test_run_ensemble_batch_matches_run_ensemble_when_batch_size_exceeds_group_size(
+    tmp_path: Path,
+) -> None:
+    base = _config()
+    config = Config(
+        vendors=base.vendors, aggregation=base.aggregation, tau=base.tau, batch_size=100
+    )
+    records = _records("rec-1", "rec-2", "rec-3")
 
     sync_run = run_ensemble(records, _sync_raters(), config)
     store = RunStore(tmp_path / "run")

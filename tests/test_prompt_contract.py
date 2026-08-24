@@ -200,6 +200,15 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
     # the hash was previously blind to it. Retired and recomputed a second
     # time when `VendorSpec.temperature` was added, unconditionally included
     # in `VendorSpec.to_dict()` alongside `model_version`/`prompt_version`.
+    # Retired and recomputed a third time when `Config.batch_size` was
+    # added: unconditionally included, on par with
+    # `vendors`/`aggregation`/`tau`/`x` (see `Config.batch_size`).
+    # Retired and recomputed a fourth time when `Config.batch_size`'s default
+    # changed from `0` (a placeholder value that was always checked against
+    # the corpus size, never actually applied) to `1` (a real request-packing
+    # width, applied whether or not a config sets it) -- a config built
+    # before the field existed now picks up the honest one-record-per-request
+    # default instead of the old placeholder.
     config = _base_config()
     payload = config.to_dict()
     expected_payload = {
@@ -213,10 +222,11 @@ def test_config_hash_stable_for_default_contract_config_with_no_prompt_fields() 
         },
         "aggregation": "boundary_dispersion",
         "tau": 0.5,
+        "batch_size": 1,
         "x": 1,
         "output_contract_version": OUTPUT_CONTRACT_VERSION,
     }
-    pinned_hash = "8ecfaf3773b34232283df03ea60a4cc30cf9fc2fff637e80eded8858a2463602"
+    pinned_hash = "58607addf7931faa3ef147488a05c023be438d3de0e29be2edc81a2a54a3dbd2"
 
     assert payload == expected_payload
     assert compute_ensemble_config_id(config) == pinned_hash

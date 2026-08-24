@@ -36,7 +36,7 @@ class CorrelationError(ValueError):
 
 @dataclass(frozen=True)
 class CorrelationResult:
-    """Pearson correlation of two vendors' binary error indicators.
+    """Pearson correlation of two vendors' binary error indicators, with the joint counts.
 
     Attributes:
         correlation: Pearson correlation coefficient of the two 0/1 error
@@ -46,10 +46,26 @@ class CorrelationResult:
             record), in which case correlation is mathematically undefined
             rather than zero.
         n: Number of records the correlation was computed over.
+        both: Records where both vendors' indicators were True (e.g., both
+            produced a false negative, for `conditional_fn_correlation`).
+        only_a: Records where only vendor A's indicator was True.
+        only_b: Records where only vendor B's indicator was True.
+        neither: Records where neither indicator was True.
+
+    `both`, `only_a`, `only_b`, and `neither` always sum to `n` and are
+    always well-defined -- including when `correlation` is `None` -- since a
+    sparse stratum's joint counts (e.g. "both missed the same 2 of 3
+    relevant records") are exactly the evidence a reader needs to judge an
+    undefined correlation, rather than that pair silently vanishing from
+    the report.
     """
 
     correlation: float | None
     n: int
+    both: int = 0
+    only_a: int = 0
+    only_b: int = 0
+    neither: int = 0
 
 
 def error_indicators(predictions: Sequence[int], truths: Sequence[int]) -> list[bool]:
@@ -102,18 +118,24 @@ def error_correlation(errors_a: Sequence[bool], errors_b: Sequence[bool]) -> Cor
             f"errors_a and errors_b must have equal length, got {len(errors_a)} and {len(errors_b)}"
         )
     n = len(errors_a)
+    both = sum(1 for a, b in zip(errors_a, errors_b, strict=True) if a and b)
+    only_a = sum(1 for a, b in zip(errors_a, errors_b, strict=True) if a and not b)
+    only_b = sum(1 for a, b in zip(errors_a, errors_b, strict=True) if b and not a)
+    neither = n - both - only_a - only_b
+    joint_counts = {"both": both, "only_a": only_a, "only_b": only_b, "neither": neither}
+
     if n < 2:
-        return CorrelationResult(correlation=None, n=n)
+        return CorrelationResult(correlation=None, n=n, **joint_counts)
 
     x = [1.0 if e else 0.0 for e in errors_a]
     y = [1.0 if e else 0.0 for e in errors_b]
     if len(set(x)) < 2 or len(set(y)) < 2:
-        return CorrelationResult(correlation=None, n=n)
+        return CorrelationResult(correlation=None, n=n, **joint_counts)
 
     from scipy import stats as scipy_stats
 
     r, _p_value = scipy_stats.pearsonr(x, y)
-    return CorrelationResult(correlation=float(r), n=n)
+    return CorrelationResult(correlation=float(r), n=n, **joint_counts)
 
 
 def conditional_fn_correlation(

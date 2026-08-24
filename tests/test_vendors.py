@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Sequence
+from typing import Any
+
+import pytest
 
 from attest.contracts.input import Record
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
-from attest.vendors.base import DeterministicRater, Rater, run_ensemble
+from attest.vendors.base import (
+    DeterministicRater,
+    Rater,
+    SingleRecordOnlyRateMany,
+    VendorResponseError,
+    chunk_records,
+    parse_batch_response,
+    run_ensemble,
+)
 from attest.vendors.registry import build_batch_raters, build_raters
 
 
@@ -402,6 +414,123 @@ def test_build_raters_accepts_request_logprobs_for_anthropic_without_adding_a_fi
     assert not hasattr(batch_rater, "request_logprobs")
 
 
+def test_build_raters_forwards_reasoning_effort_to_openai() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5.6-terra",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                reasoning_effort="none",
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert rater.reasoning_effort == "none"  # type: ignore[attr-defined]
+    assert batch_rater.reasoning_effort == "none"  # type: ignore[attr-defined]
+
+
+def test_build_raters_reasoning_effort_defaults_to_none() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.reasoning_effort is None  # type: ignore[attr-defined]
+
+
+def test_build_raters_forwards_send_temperature_to_anthropic() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                send_temperature=False,
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+    [batch_rater] = build_batch_raters(config)
+
+    assert rater.send_temperature is False  # type: ignore[attr-defined]
+    assert batch_rater.send_temperature is False  # type: ignore[attr-defined]
+
+
+def test_build_raters_send_temperature_defaults_to_true() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-4-6", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.send_temperature is True  # type: ignore[attr-defined]
+
+
+def test_openai_batch_rater_request_line_omits_reasoning_effort_by_default() -> None:
+    from attest.vendors.providers.openai import OpenAIBatchRater
+
+    rater = OpenAIBatchRater(model="gpt-4o", model_version="v1", temperature=0.0)
+
+    line = rater._request_line(_record("r1"), "item-0", "criteria")
+
+    assert "reasoning_effort" not in line["body"]
+
+
+def test_openai_batch_rater_request_line_includes_reasoning_effort_when_set() -> None:
+    from attest.vendors.providers.openai import OpenAIBatchRater
+
+    rater = OpenAIBatchRater(
+        model="gpt-5.6-terra", model_version="v1", temperature=0.0, reasoning_effort="none"
+    )
+
+    line = rater._request_line(_record("r1"), "item-0", "criteria")
+    batch_line = rater._batch_request_line([_record("r1"), _record("r2")], "item-0", "criteria")
+
+    assert line["body"]["reasoning_effort"] == "none"
+    assert line["body"]["temperature"] == 0.0
+    assert batch_line["body"]["reasoning_effort"] == "none"
+
+
+def test_anthropic_batch_rater_request_omits_temperature_when_disabled() -> None:
+    from attest.vendors.providers.anthropic import AnthropicBatchRater
+
+    rater = AnthropicBatchRater(
+        model="claude-sonnet-5", model_version="v1", temperature=0.0, send_temperature=False
+    )
+
+    request = rater._request(_record("r1"), "item-0", "criteria")
+    batch_request = rater._batch_request([_record("r1"), _record("r2")], "item-0", "criteria")
+
+    assert "temperature" not in request["params"]
+    assert "temperature" not in batch_request["params"]
+
+
+def test_anthropic_batch_rater_request_includes_temperature_by_default() -> None:
+    from attest.vendors.providers.anthropic import AnthropicBatchRater
+
+    rater = AnthropicBatchRater(model="claude-sonnet-4-6", model_version="v1", temperature=0.0)
+
+    request = rater._request(_record("r1"), "item-0", "criteria")
+
+    assert request["params"]["temperature"] == 0.0
+
+
 def test_build_raters_forwards_request_logprobs_to_fireworks_and_together() -> None:
     # Both are OpenAI-compatible on the sync path, and Together's batch API
     # mirrors OpenAI's, so both get the same request_logprobs treatment as
@@ -610,3 +739,320 @@ def test_serialize_logprobs_ignores_a_non_callable_to_dict_attribute() -> None:
             return "fallback"
 
     assert _serialize_logprobs(_NonCallableAttr()) == "fallback"
+
+
+# --- batch_size request packing: chunking, rate_many, and failure policy ---------
+
+
+class _CountingRater:
+    """A `Rater` that records every request it was asked to make, without a network call."""
+
+    def __init__(self, vendor: str = "vendor-a", model: str = "model-a") -> None:
+        self.vendor = vendor
+        self.model = model
+        self.requests: list[list[str]] = []  # one entry per request; multi-id => rate_many
+
+    def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
+        self.requests.append([record.id])
+        return (1, {"record_id": record.id, "prompt": prompt})
+
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        self.requests.append([r.id for r in records])
+        return [(1, {"record_id": r.id, "prompt": prompt}) for r in records]
+
+
+def test_run_ensemble_issues_ceil_division_requests_per_prompt_group() -> None:
+    # One prompt group of 5 records at batch_size=2: chunks of [2, 2, 1] --
+    # ceil(5/2) == 3 requests, the last one undersized (not an error).
+    config = Config(
+        vendors={
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        },
+        aggregation="majority",
+        tau=0.5,
+        batch_size=2,
+    )
+    records = [_record(f"rec-{i}") for i in range(5)]
+    rater = _CountingRater()
+
+    result = run_ensemble(records, [rater], config)
+
+    assert [len(chunk) for chunk in rater.requests] == [2, 2, 1]
+    assert sum(len(chunk) for chunk in rater.requests) == 5
+    assert [vv.record_id for vv in result.votes] == [r.id for r in records]
+
+
+def test_run_ensemble_accepts_batch_size_larger_than_the_group() -> None:
+    # batch_size larger than the whole prompt group collapses to one request
+    # covering every record in it -- not an error.
+    config = Config(
+        vendors={
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        },
+        aggregation="majority",
+        tau=0.5,
+        batch_size=100,
+    )
+    records = [_record(f"rec-{i}") for i in range(3)]
+    rater = _CountingRater()
+
+    run_ensemble(records, [rater], config)
+
+    assert [len(chunk) for chunk in rater.requests] == [3]
+
+
+def test_run_ensemble_never_co_batches_records_on_different_resolved_prompts() -> None:
+    config = Config(
+        vendors={
+            "vendor-a": VendorSpec(
+                model="model-a", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        },
+        aggregation="majority",
+        tau=0.5,
+        batch_size=10,
+        track_prompts={"review-a": "criteria A", "review-b": "criteria B"},
+    )
+    records = [
+        Record(id="rec-1", title="t", abstract="a", track="review-a"),
+        Record(id="rec-2", title="t", abstract="a", track="review-b"),
+        Record(id="rec-3", title="t", abstract="a", track="review-a"),
+        Record(id="rec-4", title="t", abstract="a", track="review-b"),
+    ]
+    rater = _CountingRater()
+
+    run_ensemble(records, [rater], config)
+
+    ids_by_chunk = {frozenset(chunk) for chunk in rater.requests}
+    assert ids_by_chunk == {frozenset({"rec-1", "rec-3"}), frozenset({"rec-2", "rec-4"})}
+
+
+def test_chunk_records_splits_final_undersized_group() -> None:
+    records = [_record(f"rec-{i}") for i in range(5)]
+
+    chunks = chunk_records(records, lambda r: None, batch_size=2)
+
+    assert [[r.id for r in chunk] for chunk in chunks] == [
+        ["rec-0", "rec-1"],
+        ["rec-2", "rec-3"],
+        ["rec-4"],
+    ]
+
+
+# --- DeterministicRater.rate_many: chunk-peer sensitivity -----------------------
+
+
+def test_deterministic_rater_rate_many_matches_rate_for_a_singleton_chunk() -> None:
+    record = _record("rec-1")
+    rater = DeterministicRater(vendor="vendor-a", seed=42)
+
+    [alone] = rater.rate_many([record])
+    direct = rater.rate(record)
+
+    assert alone == direct
+
+
+def test_deterministic_rater_rate_many_is_sensitive_to_chunk_peers() -> None:
+    rater = DeterministicRater(vendor="vendor-a", seed=42)
+    a, b, c = _record("rec-a"), _record("rec-b"), _record("rec-c")
+
+    with_bc = rater.rate_many([a, b, c])[0]
+    alone = rater.rate(a)
+
+    assert with_bc != alone
+
+    # Peer set (not just peer count) matters: swapping one peer for another
+    # changes the digest even though the chunk size is unchanged.
+    d = _record("rec-d")
+    with_bd = rater.rate_many([a, b, d])[0]
+    assert with_bc != with_bd
+
+    # But peer order within the chunk does not: peers are sorted before
+    # entering the digest, so the two permutations below rate 'a' identically.
+    with_bc_reordered = rater.rate_many([a, c, b])[0]
+    assert with_bc == with_bc_reordered
+
+
+def test_deterministic_rater_rate_many_returns_one_result_per_record_in_order() -> None:
+    rater = DeterministicRater(vendor="vendor-a", seed=1)
+    records = [_record(f"rec-{i}") for i in range(4)]
+
+    results = rater.rate_many(records)
+
+    assert len(results) == len(records)
+    for record, (ordinal, raw) in zip(records, results, strict=True):
+        assert raw["record_id"] == record.id
+        assert ordinal in (-1, 0, 1)
+
+
+def test_deterministic_rater_rate_regression_fixture_pins_batch_size_one_bytes() -> None:
+    # Pins DeterministicRater.rate()'s exact digest/ordinal/raw_response for
+    # a fixed (seed, vendor, model, record_id) -- the batch_size == 1 path,
+    # untouched by rate_many's chunk-peer digest suffix (peers=() is a no-op
+    # -- see DeterministicRater._rate_one). A change to this value means the
+    # batch_size == 1 path stopped being byte-identical to before batch_size
+    # packing existed, which must never happen (see Config.batch_size).
+    rater = DeterministicRater(vendor="openai", model="gpt-5", seed=7)
+    record = Record(id="rec-42", title="t", abstract="a", track=1)
+
+    ordinal, raw = rater.rate(record)
+
+    assert ordinal == -1
+    assert raw == {
+        "vendor": "openai",
+        "model": "gpt-5",
+        "seed": 7,
+        "record_id": "rec-42",
+        "digest": "7591e207f971da8cd28604cbccb611cc85709e217b22b5d2211b6747d752017f",
+        "prompt": None,
+    }
+
+
+# --- SingleRecordOnlyRateMany mixin: reserved for a future not-yet-converted provider ---
+
+
+def test_single_record_only_rate_many_supports_a_singleton_chunk() -> None:
+    class _StubRater(SingleRecordOnlyRateMany):
+        vendor = "stub"
+        model = "stub-model"
+
+        def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
+            return (1, {"record_id": record.id, "prompt": prompt})
+
+    rater = _StubRater()
+    record = _record("rec-1")
+
+    [result] = rater.rate_many([record], prompt="criteria")
+
+    assert result == rater.rate(record, prompt="criteria")
+
+
+@pytest.mark.parametrize(
+    "provider_module,class_name",
+    [
+        ("attest.vendors.providers.mistral", "MistralRater"),
+        ("attest.vendors.providers.google", "GoogleRater"),
+        ("attest.vendors.providers.fireworks", "FireworksRater"),
+        ("attest.vendors.providers.together", "TogetherRater"),
+        ("attest.vendors.providers.openmodel", "OpenModelRater"),
+        ("attest.vendors.providers.openai", "OpenAIRater"),
+        ("attest.vendors.providers.anthropic", "AnthropicRater"),
+    ],
+)
+def test_every_rater_provides_a_real_rate_many_not_the_single_record_mixin(
+    provider_module: str, class_name: str
+) -> None:
+    # Every sync Rater provider has been converted to true multi-record
+    # packing (see Config.batch_size) -- none of them should still be using
+    # SingleRecordOnlyRateMany, which exists only for a future not-yet-
+    # converted provider.
+    module = importlib.import_module(provider_module)
+    rater_cls = getattr(module, class_name)
+
+    assert not issubclass(rater_cls, SingleRecordOnlyRateMany)
+    assert "rate_many" in rater_cls.__dict__
+
+
+@pytest.mark.parametrize(
+    "provider_module,class_name",
+    [
+        ("attest.vendors.providers.mistral", "MistralBatchRater"),
+        ("attest.vendors.providers.google", "GoogleBatchRater"),
+        ("attest.vendors.providers.fireworks", "FireworksBatchRater"),
+        ("attest.vendors.providers.together", "TogetherBatchRater"),
+        ("attest.vendors.providers.openai", "OpenAIBatchRater"),
+        ("attest.vendors.providers.anthropic", "AnthropicBatchRater"),
+    ],
+)
+def test_every_batch_rater_submit_accepts_a_batch_size_keyword(
+    provider_module: str, class_name: str
+) -> None:
+    import inspect
+
+    module = importlib.import_module(provider_module)
+    rater_cls = getattr(module, class_name)
+    signature = inspect.signature(rater_cls.submit)
+    assert "batch_size" in signature.parameters
+    assert signature.parameters["batch_size"].default == 1
+
+
+# --- parse_batch_response: id-keyed parsing, failure policy, robustness ---------
+
+
+def test_parse_batch_response_parses_every_requested_id() -> None:
+    text = '{"1": "I", "2": "E", "3": "U"}'
+
+    ratings = parse_batch_response(text, ["1", "2", "3"])
+
+    assert ratings == {"1": 1, "2": -1, "3": 0}
+
+
+def test_parse_batch_response_is_order_independent() -> None:
+    text = '{"3": "U", "1": "I", "2": "E"}'
+
+    ratings = parse_batch_response(text, ["1", "2", "3"])
+
+    assert ratings == {"1": 1, "2": -1, "3": 0}
+
+
+def test_parse_batch_response_ignores_extra_and_hallucinated_ids() -> None:
+    text = '{"1": "I", "2": "E", "hallucinated-id": "I"}'
+
+    ratings = parse_batch_response(text, ["1", "2"])
+
+    assert ratings == {"1": 1, "2": -1}
+    assert "hallucinated-id" not in ratings
+
+
+def test_parse_batch_response_raises_for_a_missing_id() -> None:
+    text = '{"1": "I"}'
+
+    try:
+        parse_batch_response(text, ["1", "2"])
+    except VendorResponseError as exc:
+        assert "2" in str(exc)
+    else:
+        raise AssertionError("expected VendorResponseError for missing id '2'")
+
+
+def test_parse_batch_response_raises_for_an_unparseable_value() -> None:
+    text = '{"1": "not-a-rating"}'
+
+    try:
+        parse_batch_response(text, ["1"])
+    except VendorResponseError:
+        pass
+    else:
+        raise AssertionError("expected VendorResponseError for an unparseable rating")
+
+
+def test_parse_batch_response_raises_for_invalid_json() -> None:
+    try:
+        parse_batch_response("not json", ["1"])
+    except VendorResponseError:
+        pass
+    else:
+        raise AssertionError("expected VendorResponseError for invalid JSON")
+
+
+def test_parse_batch_response_raises_for_a_non_object_json_value() -> None:
+    try:
+        parse_batch_response("[1, 2, 3]", ["1"])
+    except VendorResponseError:
+        pass
+    else:
+        raise AssertionError("expected VendorResponseError for a JSON array")
+
+
+def test_parse_batch_response_accepts_integer_ratings() -> None:
+    text = '{"1": 1, "2": -1, "3": 0}'
+
+    ratings = parse_batch_response(text, ["1", "2", "3"])
+
+    assert ratings == {"1": 1, "2": -1, "3": 0}

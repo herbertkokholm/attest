@@ -4,7 +4,7 @@ title: "attest: a screening-and-self-validation kernel for multi-vendor LLM ense
 authors:
   - family-names: "Kokholm"
     given-names: "Thomas Herbert"
-version: 0.2.0
+version: 0.4.0
 date-released: "2026-08-02"
 license: AGPL-3.0-or-later
 repository-code: "https://github.com/herbertkokholm/attest"

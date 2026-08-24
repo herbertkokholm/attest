@@ -28,6 +28,7 @@ from attest.contracts.input import NormalizedInput, validate_and_normalize
 from attest.contracts.validation_record import (
     Agreement,
     ErrorCorrelation,
+    PairwiseFnCorrelation,
     Recall,
     ValidationRecord,
 )
@@ -37,29 +38,80 @@ from attest.ensemble.aggregate import ZERO_POLICY_ESCALATE, Decision
 from attest.ensemble.confidence import DEFAULT_LOW_THRESHOLD
 from attest.ensemble.tau import TauReport
 from attest.ensemble.votes import Vote, VoteVector
-from attest.planes.adjudication import AdjudicationError, final_label
+from attest.planes.active_learning import ActiveLearningReview, ActiveLearningSelection
+from attest.planes.adjudication import AdjudicationError, AdjudicationItem, final_label
+from attest.planes.inclusion_audit import InclusionAuditRow, build_inclusion_strata
 from attest.planes.recall_audit import AuditRow, build_strata
 from attest.prefilter.framework import Prisma as PrefilterPrisma
+from attest.provenance.changelog import ChangeLog, ConfigChangeEvent
 from attest.provenance.config import Config as EnsembleConfig
 from attest.provenance.config import VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import Epoch
+from attest.provenance.manifest import IntegrityReport as ManifestIntegrityReport
+from attest.provenance.manifest import RunManifest, build_manifest, hash_file, verify_artifacts
+from attest.provenance.protocol import ValidationProtocol, compute_protocol_id
 from attest.provenance.runs import RunRecord
+from attest.provenance.sentinel import SentinelBaseline, SentinelEvaluation
 from attest.stats.agreement import agreement_report, pairwise_alpha
 from attest.stats.confusion import RELEVANT_LABEL
 from attest.stats.confusion import confusion_matrix as _confusion_matrix
 from attest.stats.correlation import build_predictions_by_vendor, pairwise_fn_correlation
-from attest.stats.recall import stratified_recall
+from attest.stats.recall import (
+    estimated_true_positives,
+    stratified_recall,
+    stratified_recall_with_audited_tp,
+)
 
 CONFIG_FILENAME = "config.json"
 EPOCH_FILENAME = "epoch.json"
 VOTES_FILENAME = "votes.json"
 DECISIONS_FILENAME = "decisions.json"
 AUDIT_FILENAME = "audit.json"
+INCLUSION_AUDIT_FILENAME = "inclusion_audit.json"
+INCLUSION_AUDIT_DRAW_FILENAME = "inclusion_audit_draw.json"
 RUNS_FILENAME = "runs.json"
 BATCH_HANDLES_FILENAME = "batch_handles.json"
 RAW_RESPONSES_FILENAME = "raw_responses.json"
 TAU_REPORT_FILENAME = "tau_report.json"
 CONFIDENCE_POLICY_FILENAME = "confidence_policy.json"
+CHANGELOG_FILENAME = "changelog.json"
+PROTOCOL_FILENAME = "protocol.json"
+MANIFEST_FILENAME = "manifest.json"
+AUDIT_DRAW_FILENAME = "audit_draw.json"
+AUDIT_LABELS_FILENAME = "audit_labels.json"
+VALIDATION_RECORD_FILENAME = "validation_record.json"
+SENTINEL_BASELINE_FILENAME = "sentinel_baseline.json"
+SENTINEL_EVALUATIONS_FILENAME = "sentinel_evaluations.json"
+ADJUDICATION_RECORDS_FILENAME = "adjudication_records.json"
+ACTIVE_LEARNING_SELECTIONS_FILENAME = "active_learning_selections.json"
+ACTIVE_LEARNING_REVIEWS_FILENAME = "active_learning_reviews.json"
+
+# The artifact set `attest manifest`/`attest verify` hash for offline
+# integrity verification (see attest.provenance.manifest). Deliberately not
+# every file `RunStore` can produce -- batch_handles.json and
+# confidence_policy.json are execution-strategy/policy plumbing, not one of
+# the manuscript's named artifact categories -- but every category task 4
+# names: config, protocol descriptor, input (hashed separately, see
+# RunManifest.input_hash), votes, raw responses, decisions, epoch,
+# changelog, audit draw, audit labels, and the validation record.
+# INCLUSION_AUDIT_DRAW_FILENAME is the TP-side analog of AUDIT_DRAW_FILENAME
+# (see write_inclusion_audit_draw); there is no inclusion-audit analog of
+# AUDIT_LABELS_FILENAME yet -- write_inclusion_audit_rows still upserts
+# labels directly into inclusion_audit.json rather than a separate
+# pre-/post-label snapshot pair, unlike the exclusion side.
+MANIFEST_ARTIFACTS = (
+    CONFIG_FILENAME,
+    PROTOCOL_FILENAME,
+    VOTES_FILENAME,
+    RAW_RESPONSES_FILENAME,
+    DECISIONS_FILENAME,
+    EPOCH_FILENAME,
+    CHANGELOG_FILENAME,
+    AUDIT_DRAW_FILENAME,
+    AUDIT_LABELS_FILENAME,
+    INCLUSION_AUDIT_DRAW_FILENAME,
+    VALIDATION_RECORD_FILENAME,
+)
 
 
 class StoreError(ValueError):
@@ -146,6 +198,7 @@ def _config_from_dict(payload: Mapping[str, Any]) -> EnsembleConfig:
         vendors=vendors,
         aggregation=payload["aggregation"],
         tau=payload["tau"],
+        batch_size=payload.get("batch_size", 1),
         default_prompt=payload.get("default_prompt"),
         track_prompts=dict(payload.get("track_prompts", {})),
         zero_policy=payload.get("zero_policy", ZERO_POLICY_ESCALATE),
@@ -176,6 +229,7 @@ def _to_record_config(config: EnsembleConfig) -> RecordConfig:
         prompts={name: spec.prompt_version for name, spec in config.vendors.items()},
         aggregation=config.aggregation,
         tau=config.tau,
+        batch_size=config.batch_size,
         x=config.x,
         zero_policy=config.zero_policy,
     )
@@ -210,7 +264,13 @@ class RunStore:
         return ensemble_config_id, dict(items)
 
     def _write_stamped(
-        self, filename: str, key: str, ensemble_config_id: str, items: Mapping[str, Any]
+        self,
+        filename: str,
+        key: str,
+        ensemble_config_id: str,
+        items: Mapping[str, Any],
+        *,
+        extra: Mapping[str, Any] | None = None,
     ) -> None:
         existing_id, existing_items = self._read_stamped(filename, key)
         if existing_id is not None and existing_id != ensemble_config_id:
@@ -220,9 +280,10 @@ class RunStore:
                 f"'{ensemble_config_id}'"
             )
         existing_items.update(items)
-        _write_json(
-            self.root / filename, {"ensemble_config_id": ensemble_config_id, key: existing_items}
-        )
+        payload: dict[str, Any] = {"ensemble_config_id": ensemble_config_id, key: existing_items}
+        if extra:
+            payload.update(extra)
+        _write_json(self.root / filename, payload)
 
     def write_config(self, config: EnsembleConfig) -> str:
         """Persist the ensemble configuration in force for this run directory.
@@ -371,7 +432,13 @@ class RunStore:
             rows: The audit rows to persist, labeled or not.
         """
         items = {
-            row.record_id: {"stratum": row.stratum, "human_label": row.human_label} for row in rows
+            row.record_id: {
+                "stratum": row.stratum,
+                "human_label": row.human_label,
+                "reviewer": row.reviewer,
+                "blinded": row.blinded,
+            }
+            for row in rows
         }
         self._write_stamped(AUDIT_FILENAME, "audit_rows", ensemble_config_id, items)
 
@@ -379,9 +446,118 @@ class RunStore:
         """Read all stored recall-audit rows, ordered by record id."""
         _ensemble_config_id, items = self._read_stamped(AUDIT_FILENAME, "audit_rows")
         return [
-            AuditRow(record_id=record_id, stratum=row["stratum"], human_label=row["human_label"])
+            AuditRow(
+                record_id=record_id,
+                stratum=row["stratum"],
+                human_label=row["human_label"],
+                reviewer=row.get("reviewer"),
+                blinded=row.get("blinded"),
+            )
             for record_id, row in sorted(items.items())
         ]
+
+    def write_inclusion_audit_rows(
+        self, ensemble_config_id: str, rows: Sequence[InclusionAuditRow]
+    ) -> None:
+        """Upsert random inclusion-audit rows into `inclusion_audit.json`, keyed by record id.
+
+        Mirrors `write_audit_rows` for the TP-side audit (see
+        `attest.planes.inclusion_audit`). The pre-label "drawn" snapshot
+        `write_audit_draw` gives the exclusion side has a TP-side mirror
+        too -- `write_inclusion_audit_draw` -- so the inclusion audit's
+        sampling frame is independently verifiable the same way. There is
+        no inclusion-audit analog of `write_audit_labels`'s separate
+        "applied labels" snapshot yet: this method still upserts labels
+        directly into `inclusion_audit.json`. Left as a follow-up should
+        the inclusion audit need that same draw/label provenance
+        splitting.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn
+                under; must match this file's existing stamp, if any.
+            rows: The inclusion-audit rows to persist, labeled or not.
+        """
+        items = {
+            row.record_id: {
+                "stratum": row.stratum,
+                "human_label": row.human_label,
+                "reviewer": row.reviewer,
+                "blinded": row.blinded,
+            }
+            for row in rows
+        }
+        self._write_stamped(INCLUSION_AUDIT_FILENAME, "audit_rows", ensemble_config_id, items)
+
+    def read_inclusion_audit_rows(self) -> list[InclusionAuditRow]:
+        """Read all stored inclusion-audit rows, ordered by record id."""
+        _ensemble_config_id, items = self._read_stamped(INCLUSION_AUDIT_FILENAME, "audit_rows")
+        return [
+            InclusionAuditRow(
+                record_id=record_id,
+                stratum=row["stratum"],
+                human_label=row["human_label"],
+                reviewer=row.get("reviewer"),
+                blinded=row.get("blinded"),
+            )
+            for record_id, row in sorted(items.items())
+        ]
+
+    def write_inclusion_audit_draw(
+        self,
+        ensemble_config_id: str,
+        rows: Sequence[InclusionAuditRow],
+        *,
+        sampling_frame_hash: str | None = None,
+    ) -> None:
+        """Upsert the drawn (pre-label) inclusion-audit rows into `inclusion_audit_draw.json`.
+
+        Mirrors `write_audit_draw` for the TP-side audit: a snapshot
+        distinct from `inclusion_audit.json` (which `assemble_validation_record`
+        reads and which `inclusion-audit-apply` later upserts labels into),
+        so the sampling frame this draw ran against is independently
+        verifiable later -- the same protection `write_audit_draw` gives
+        the exclusion-side audit, which this side lacked until now.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn under.
+            rows: The freshly drawn (unlabeled) rows.
+            sampling_frame_hash: This draw's
+                `attest.planes.recall_audit.population_frame_hash` (which
+                `IncludedRecord` satisfies the same `_HasRecordId` shape
+                for), if available. Once written for a given
+                `ensemble_config_id`, later draws under the same id must
+                supply the identical hash; a mismatch raises `StoreError`.
+
+        Raises:
+            StoreError: If `sampling_frame_hash` conflicts with a hash
+                already stored for this run directory.
+        """
+        items = {row.record_id: row.stratum for row in rows}
+        existing_hash = self.read_inclusion_audit_sampling_frame_hash()
+        if (
+            sampling_frame_hash is not None
+            and existing_hash is not None
+            and sampling_frame_hash != existing_hash
+        ):
+            raise StoreError(
+                f"run directory '{self.root}' already recorded sampling_frame_hash "
+                f"'{existing_hash}' for a prior inclusion-audit draw; refusing to record a "
+                f"different hash '{sampling_frame_hash}' for the same ensemble_config_id -- "
+                "the include-and-escalate population must not change within an epoch's "
+                "inclusion-audit draws"
+            )
+        extra = {"sampling_frame_hash": sampling_frame_hash or existing_hash}
+        self._write_stamped(
+            INCLUSION_AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items, extra=extra
+        )
+
+    def read_inclusion_audit_sampling_frame_hash(self) -> str | None:
+        """Read the stored inclusion-audit draw's sampling-frame hash, or None if never recorded."""
+        payload = _read_json(self.root / INCLUSION_AUDIT_DRAW_FILENAME)
+        if payload is None:
+            return None
+        frame_hash: str | None = payload.get("sampling_frame_hash")
+        return frame_hash
 
     def write_run_record(self, run: RunRecord) -> None:
         """Upsert a run's provenance record into `runs.json`, keyed by run id."""
@@ -470,17 +646,418 @@ class RunStore:
         payload: dict[str, Any] | None = _read_json(self.root / CONFIDENCE_POLICY_FILENAME)
         return payload
 
+    # --- changelog: append-only run artifact ------------------------------
+
+    def write_changelog(self, changelog: ChangeLog) -> None:
+        """Persist an append-only changelog, refusing to rewrite already-stored history.
+
+        A stored changelog may only be *extended*: every previously written
+        event must appear, unchanged, as a prefix of `changelog.events`.
+        This is the mechanical enforcement of "append-only" -- once an event
+        is on disk, it is permanent provenance, not an editable log line.
+
+        Args:
+            changelog: The changelog to persist; must extend (or equal) what
+                is already stored.
+
+        Raises:
+            StoreError: If `changelog` would shrink or rewrite previously
+                stored history.
+        """
+        existing_events = self.read_changelog().events
+        new_events = list(changelog.events)
+        if (
+            len(new_events) < len(existing_events)
+            or new_events[: len(existing_events)] != existing_events
+        ):
+            raise StoreError(
+                f"changelog in run directory '{self.root}' is append-only; the given "
+                "changelog does not extend the previously stored history"
+            )
+        _write_json(self.root / CHANGELOG_FILENAME, [e.to_dict() for e in new_events])
+
+    def read_changelog(self) -> ChangeLog:
+        """Read the changelog stored for this run directory, empty if never written."""
+        raw: list[dict[str, Any]] = _read_json(self.root / CHANGELOG_FILENAME) or []
+        return ChangeLog.from_list(raw)
+
+    def append_change_event(self, event: ConfigChangeEvent) -> ChangeLog:
+        """Append one change event to this run directory's persisted changelog.
+
+        Args:
+            event: The change event to append.
+
+        Returns:
+            The changelog after appending, as persisted.
+        """
+        changelog = self.read_changelog()
+        changelog.events.append(event)
+        self.write_changelog(changelog)
+        return changelog
+
+    # --- validation protocol -----------------------------------------------
+
+    def write_protocol(self, protocol: ValidationProtocol) -> str:
+        """Persist the validation protocol in force for this run directory.
+
+        Unlike `write_config`, a run directory is not locked to one protocol
+        forever: the audit design, adjudication protocol, sentinel
+        thresholds, and reporting spec are pure analysis-plan choices (see
+        `attest.provenance.protocol`'s module docstring) that may legitimately
+        be revised without opening a new epoch. Each call simply overwrites
+        the stored protocol.
+
+        Args:
+            protocol: The validation protocol to persist.
+
+        Returns:
+            The content-derived `protocol_id` of `protocol`.
+        """
+        protocol_id = compute_protocol_id(protocol)
+        payload = protocol.to_dict()
+        payload["protocol_id"] = protocol_id
+        _write_json(self.root / PROTOCOL_FILENAME, payload)
+        return protocol_id
+
+    def read_protocol(self) -> ValidationProtocol | None:
+        """Read the validation protocol stored for this run directory, or None if never written."""
+        payload = _read_json(self.root / PROTOCOL_FILENAME)
+        if payload is None:
+            return None
+        return ValidationProtocol.from_dict(payload)
+
+    def read_protocol_id(self) -> str | None:
+        """Read the stored protocol's content-derived id, or None if never written."""
+        payload = _read_json(self.root / PROTOCOL_FILENAME)
+        if payload is None:
+            return None
+        protocol_id: str | None = payload.get("protocol_id")
+        return protocol_id
+
+    # --- audit draw/labels: immutable snapshots for manifest integrity -----
+
+    def write_audit_draw(
+        self,
+        ensemble_config_id: str,
+        rows: Sequence[AuditRow],
+        *,
+        sampling_frame_hash: str | None = None,
+    ) -> None:
+        """Upsert the drawn (pre-label) recall-audit rows into `audit_draw.json`.
+
+        A snapshot distinct from `audit.json` (which `assemble_validation_record`
+        reads and which `audit-apply` later upserts labels into): this file
+        exists so the manifest can hash "what was drawn" and "what was
+        labeled" (`write_audit_labels`) as two separately verifiable
+        artifacts, matching the manuscript's own artifact list, without
+        changing `audit.json`'s existing combined read path.
+
+        Args:
+            ensemble_config_id: Configuration id these rows were drawn under.
+            rows: The freshly drawn (unlabeled) rows.
+            sampling_frame_hash: This draw's
+                `attest.planes.recall_audit.population_frame_hash`, if
+                available -- the eligible population's content hash,
+                recorded so the sampling frame this draw ran against is
+                independently verifiable later. Once written for a given
+                `ensemble_config_id`, later draws under the same id must
+                supply the identical hash (the frame is fixed per epoch);
+                a mismatch raises `StoreError`.
+
+        Raises:
+            StoreError: If `sampling_frame_hash` conflicts with a hash
+                already stored for this run directory.
+        """
+        items = {row.record_id: row.stratum for row in rows}
+        existing_hash = self.read_audit_sampling_frame_hash()
+        if (
+            sampling_frame_hash is not None
+            and existing_hash is not None
+            and sampling_frame_hash != existing_hash
+        ):
+            raise StoreError(
+                f"run directory '{self.root}' already recorded sampling_frame_hash "
+                f"'{existing_hash}' for a prior draw; refusing to record a different hash "
+                f"'{sampling_frame_hash}' for the same ensemble_config_id -- the screen-excluded "
+                "population must not change within an epoch's audit draws"
+            )
+        extra = {"sampling_frame_hash": sampling_frame_hash or existing_hash}
+        self._write_stamped(AUDIT_DRAW_FILENAME, "drawn", ensemble_config_id, items, extra=extra)
+
+    def read_audit_draw(self) -> dict[str, str]:
+        """Read the stored audit-draw snapshot, mapping record id to stratum."""
+        _ensemble_config_id, items = self._read_stamped(AUDIT_DRAW_FILENAME, "drawn")
+        return {record_id: stratum for record_id, stratum in items.items()}
+
+    def read_audit_sampling_frame_hash(self) -> str | None:
+        """Read the stored draw's sampling-frame hash, or None if never recorded."""
+        payload = _read_json(self.root / AUDIT_DRAW_FILENAME)
+        if payload is None:
+            return None
+        frame_hash: str | None = payload.get("sampling_frame_hash")
+        return frame_hash
+
+    def write_audit_labels(self, ensemble_config_id: str, labels: Mapping[str, int]) -> None:
+        """Upsert applied human gold-check labels into `audit_labels.json`.
+
+        Args:
+            ensemble_config_id: Configuration id in force when these labels
+                were applied.
+            labels: Mapping of record id to the human ordinal audit label
+                actually applied by `audit-apply`.
+        """
+        self._write_stamped(AUDIT_LABELS_FILENAME, "labels", ensemble_config_id, dict(labels))
+
+    def read_audit_labels(self) -> dict[str, int]:
+        """Read the stored audit-labels snapshot, mapping record id to human label."""
+        _ensemble_config_id, items = self._read_stamped(AUDIT_LABELS_FILENAME, "labels")
+        return {record_id: int(label) for record_id, label in items.items()}
+
+    # --- validation record snapshot -----------------------------------------
+
+    def write_validation_record_snapshot(self, payload: Mapping[str, Any]) -> None:
+        """Persist a copy of the assembled validation record inside the run directory.
+
+        `attest validate --out PATH` may write its human-facing copy
+        anywhere (e.g. a paper repo's `results/`); this snapshot is the
+        run-directory-local copy the manifest hashes as the "validation
+        record" artifact, so integrity verification does not depend on
+        wherever `--out` happened to point.
+        """
+        _write_json(self.root / VALIDATION_RECORD_FILENAME, dict(payload))
+
+    def read_validation_record_snapshot(self) -> dict[str, Any] | None:
+        """Read the stored validation-record snapshot, or None if never written."""
+        payload: dict[str, Any] | None = _read_json(self.root / VALIDATION_RECORD_FILENAME)
+        return payload
+
+    # --- sentinel drift ------------------------------------------------------
+
+    def write_sentinel_baseline(self, baseline: SentinelBaseline) -> None:
+        """Persist the frozen sentinel set's baseline ratings for this run directory.
+
+        Raises:
+            StoreError: If a baseline for a *different* sentinel set is
+                already stored -- a run directory's sentinel baseline is
+                pinned to one frozen set, like `write_config` pins one
+                ensemble configuration.
+        """
+        existing = _read_json(self.root / SENTINEL_BASELINE_FILENAME)
+        if existing is not None and existing.get("sentinel_set_id") != baseline.sentinel_set_id:
+            raise StoreError(
+                f"run directory '{self.root}' already holds a sentinel baseline for a "
+                f"different sentinel set (existing '{existing.get('sentinel_set_id')}', new "
+                f"'{baseline.sentinel_set_id}')"
+            )
+        _write_json(self.root / SENTINEL_BASELINE_FILENAME, baseline.to_dict())
+
+    def read_sentinel_baseline(self) -> SentinelBaseline | None:
+        """Read the stored sentinel baseline, or None if never written."""
+        payload = _read_json(self.root / SENTINEL_BASELINE_FILENAME)
+        if payload is None:
+            return None
+        return SentinelBaseline.from_dict(payload)
+
+    def write_sentinel_evaluation(self, evaluation: SentinelEvaluation) -> None:
+        """Append one sentinel evaluation to this run directory's evaluation history.
+
+        Every check is appended, not upserted -- the sentinel is run
+        periodically against the same baseline, and the full history of
+        readings (not just the latest) is itself provenance.
+        """
+        raw: list[dict[str, Any]] = _read_json(self.root / SENTINEL_EVALUATIONS_FILENAME) or []
+        raw.append(evaluation.to_dict())
+        _write_json(self.root / SENTINEL_EVALUATIONS_FILENAME, raw)
+
+    def read_sentinel_evaluations(self) -> list[SentinelEvaluation]:
+        """Read every stored sentinel evaluation, oldest first."""
+        raw: list[dict[str, Any]] = _read_json(self.root / SENTINEL_EVALUATIONS_FILENAME) or []
+        return [SentinelEvaluation.from_dict(e) for e in raw]
+
+    # --- adjudication and active-learning provenance --------------------------
+
+    def write_adjudication_record(self, item: AdjudicationItem) -> None:
+        """Upsert one adjudication item's reviewer/selection provenance, keyed by record id.
+
+        Distinct from `write_decisions` (the authoritative final label used
+        downstream by `assemble_validation_record`): this file exists purely
+        for the auditable reviewer trail -- who resolved this escalation,
+        when, under which protocol, and why it escalated in the first place.
+        """
+        raw: dict[str, Any] = _read_json(self.root / ADJUDICATION_RECORDS_FILENAME) or {}
+        raw[item.record_id] = {
+            "record_id": item.record_id,
+            "ensemble_config_id": item.ensemble_config_id,
+            "dispersion": item.dispersion,
+            "boundary": item.boundary,
+            "selection_reason": item.selection_reason,
+            "human_label": item.human_label,
+            "reviewer": item.reviewer,
+            "resolved_at": item.resolved_at.isoformat() if item.resolved_at is not None else None,
+            "protocol_id": item.protocol_id,
+        }
+        _write_json(self.root / ADJUDICATION_RECORDS_FILENAME, raw)
+
+    def read_adjudication_records(self) -> dict[str, dict[str, Any]]:
+        """Read every stored adjudication provenance record, keyed by record id."""
+        return _read_json(self.root / ADJUDICATION_RECORDS_FILENAME) or {}
+
+    def write_active_learning_selections(
+        self, ensemble_config_id: str, selections: Sequence[ActiveLearningSelection]
+    ) -> None:
+        """Upsert active-learning selections' provenance, keyed by record id."""
+        items = {
+            s.record_id: {
+                "dispersion": s.dispersion,
+                "boundary": s.boundary,
+                "selection_reason": list(s.selection_reason),
+                "confidence_scored": s.confidence.scored,
+                "confidence_median_probability": s.confidence.median_probability,
+            }
+            for s in selections
+        }
+        self._write_stamped(
+            ACTIVE_LEARNING_SELECTIONS_FILENAME, "selections", ensemble_config_id, items
+        )
+
+    def read_active_learning_selections(self) -> dict[str, dict[str, Any]]:
+        """Read stored active-learning selection provenance, keyed by record id."""
+        _ensemble_config_id, items = self._read_stamped(
+            ACTIVE_LEARNING_SELECTIONS_FILENAME, "selections"
+        )
+        return items
+
+    def write_active_learning_review(self, review: ActiveLearningReview) -> None:
+        """Append one human review of an active-learning selection, keyed by record id.
+
+        Appended, not upserted: the same selection may legitimately be
+        reviewed more than once over a project's lifetime (e.g. a second
+        pass after a prompt change), and each review is its own provenance
+        record.
+        """
+        raw: list[dict[str, Any]] = _read_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME) or []
+        raw.append(
+            {
+                "record_id": review.record_id,
+                "ensemble_config_id": review.ensemble_config_id,
+                "selection_reason": list(review.selection_reason),
+                "reviewer": review.reviewer,
+                "reviewed_at": review.reviewed_at.isoformat(),
+                "protocol_id": review.protocol_id,
+                "notes": review.notes,
+            }
+        )
+        _write_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME, raw)
+
+    def read_active_learning_reviews(self) -> list[dict[str, Any]]:
+        """Read every stored active-learning review, oldest first."""
+        return _read_json(self.root / ACTIVE_LEARNING_REVIEWS_FILENAME) or []
+
+    # --- run manifest and offline integrity verification -----------------------
+
+    def write_manifest(
+        self,
+        *,
+        ensemble_config_id: str,
+        protocol_id: str | None = None,
+        input_hash: str | None = None,
+        input_source: str | None = None,
+        seeds: Mapping[str, int] | None = None,
+        sdk_versions: Mapping[str, str] | None = None,
+    ) -> RunManifest:
+        """Build and persist a `RunManifest` hashing this run directory's current artifacts.
+
+        Hashes exactly the artifact set named in `MANIFEST_ARTIFACTS` (see
+        that constant's docstring for why), skipping any not yet produced.
+        Overwrites any previously stored manifest -- like `tau_report.json`,
+        there is exactly one current manifest per run directory, describing
+        the artifacts as they stand right now.
+
+        Args:
+            ensemble_config_id: The screening configuration this run executed under.
+            protocol_id: The validation protocol this run executed under, if any.
+            input_hash: SHA-256 hex digest of the input file screened.
+            input_source: Free-text/path identifying the input file.
+            seeds: Named random seeds used by this run.
+            sdk_versions: Mapping of vendor name to its provider SDK's
+                installed version (see
+                `attest.vendors.sdk_versions.sdk_versions`).
+
+        Returns:
+            The freshly built and persisted `RunManifest`.
+        """
+        manifest = build_manifest(
+            root=self.root,
+            artifact_filenames=MANIFEST_ARTIFACTS,
+            ensemble_config_id=ensemble_config_id,
+            protocol_id=protocol_id,
+            input_hash=input_hash,
+            input_source=input_source,
+            seeds=seeds,
+            sdk_versions=sdk_versions,
+        )
+        _write_json(self.root / MANIFEST_FILENAME, manifest.to_dict())
+        return manifest
+
+    def read_manifest(self) -> RunManifest | None:
+        """Read the stored manifest, or None if `write_manifest` was never called."""
+        payload = _read_json(self.root / MANIFEST_FILENAME)
+        if payload is None:
+            return None
+        return RunManifest.from_dict(payload)
+
+    def verify(self) -> ManifestIntegrityReport:
+        """Offline-verify this run directory's artifacts against its stored manifest.
+
+        Returns:
+            An `attest.provenance.manifest.IntegrityReport`: `ok=True` iff
+            every artifact the manifest recorded a hash for is present and
+            byte-identical to when the manifest was built.
+
+        Raises:
+            StoreError: If no manifest has been written for this run directory.
+        """
+        manifest = self.read_manifest()
+        if manifest is None:
+            raise StoreError(
+                f"run directory '{self.root}' has no stored manifest to verify against"
+            )
+        return verify_artifacts(self.root, manifest)
+
+
+def hash_input_file(path: str | Path) -> str | None:
+    """Return the SHA-256 hex digest of an input-contract file's raw bytes, for manifest provenance.
+
+    Hashes the file the caller loaded (e.g. via `load_input`) without
+    duplicating its (potentially large) content into the run directory --
+    only the hash is recorded (see `attest.provenance.manifest.RunManifest.input_hash`).
+
+    Returns:
+        The digest, or None if `path` does not exist.
+    """
+    return hash_file(Path(path))
+
 
 def _final_labels(
     decisions: Mapping[str, Decision], human_labels: Mapping[str, int]
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[str]]:
+    """Resolve every decision to its final label, tracking which escalations could not be resolved.
+
+    Returns:
+        A `(resolved, unresolved_ids)` pair: `resolved` maps record id to
+        final label for every decision that could be resolved; `unresolved_ids`
+        lists, in decision order, the ids of escalated decisions with no
+        entry in `human_labels` -- callers must not treat `resolved` as the
+        complete decision set without accounting for these.
+    """
     resolved: dict[str, int] = {}
+    unresolved: list[str] = []
     for record_id, decision in decisions.items():
         try:
             resolved[record_id] = final_label(record_id, decision, human_labels.get(record_id))
         except AdjudicationError:
-            continue
-    return resolved
+            unresolved.append(record_id)
+    return resolved, unresolved
 
 
 def assemble_validation_record(
@@ -491,6 +1068,8 @@ def assemble_validation_record(
     population_sizes: Mapping[str, int],
     human_labels: Mapping[str, int] | None = None,
     confidence: float = 0.95,
+    allow_unresolved_escalations: bool = False,
+    inclusion_population_sizes: Mapping[str, int] | None = None,
 ) -> ValidationRecord:
     """Assemble a full `ValidationRecord` for an epoch from a completed run directory.
 
@@ -500,7 +1079,13 @@ def assemble_validation_record(
     conditional false-negative correlation, escalation rate, the confusion
     matrix against gold labels, and -- when the run's audit rows include at
     least one gold-checked record -- stratified recall with its
-    rule-of-three worst-case floor.
+    rule-of-three worst-case floor. When the run also has at least one
+    gold-checked inclusion-audit row (see `attest.planes.inclusion_audit`)
+    and `inclusion_population_sizes` is supplied, TP is instead estimated
+    from that audit and `exact_floor` becomes the joint TP/FN bound from
+    `attest.stats.recall.stratified_recall_with_audited_tp` -- otherwise TP
+    is taken as exact from the confusion matrix, unchanged from prior
+    versions.
 
     Args:
         store: A `RunStore` that already holds a written config, epoch, and
@@ -509,30 +1094,52 @@ def assemble_validation_record(
             seeding `identified`, `duplicates_removed`, `after_dedup`,
             `prefilter_excluded`, and `screened`.
         truths: Mapping of record id to gold ordinal label, used for error
-            correlation, the confusion matrix, and recall's true-positive count.
+            correlation, the confusion matrix, and (absent an inclusion
+            audit) recall's true-positive count.
         population_sizes: Mapping of audit stratum name to the total
             screen-excluded population size for that stratum, passed
             through to `attest.planes.recall_audit.build_strata`.
         human_labels: Authoritative human labels for escalated decisions,
             keyed by record id. A stored decision that escalated and has no
-            entry here is left out of the confusion matrix and PRISMA
-            screen_excluded/included counts, since it is not yet resolved.
+            entry here is unresolved: by default this raises `StoreError`,
+            since the manuscript's true-positive definition (methods §2.9)
+            requires every include-and-escalate record to be either
+            adjudicated or covered by a separate inclusion audit -- a
+            validation record built over silently-dropped escalations does
+            not support that definition.
         confidence: Two-sided confidence level for the recall floor and
             interval.
+        allow_unresolved_escalations: If True, proceed even when some
+            escalated decisions have no entry in `human_labels`, omitting
+            them from the confusion matrix and PRISMA screen_excluded/included
+            counts as before. The omitted count is still reported in the
+            returned record's `unresolved_escalations` field so this choice
+            is never silent in the output. Default False: fail closed.
+        inclusion_population_sizes: Mapping of inclusion-audit stratum name
+            to the total include-and-escalate population size for that
+            stratum, passed through to
+            `attest.planes.inclusion_audit.build_inclusion_strata`. `None`
+            (the default) means TP is always taken as exact -- pass this
+            whenever the run's include-and-escalate set might be too large
+            to review in full, so a stored inclusion-audit draw (if any)
+            is honored.
 
     Returns:
         A `ValidationRecord` with every field the stored run supports filled in.
 
     Raises:
-        StoreError: If the run directory has no stored votes, or its stored
+        StoreError: If the run directory has no stored votes, its stored
             epoch was opened for a different ensemble configuration than
-            the one currently stored.
+            the one currently stored, or (unless `allow_unresolved_escalations`
+            is set) one or more escalated decisions have no resolved
+            human label.
     """
     config = store.read_config()
     epoch = store.read_epoch()
     votes = store.read_votes()
     decisions = store.read_decisions()
     audit_rows = store.read_audit_rows()
+    inclusion_audit_rows = store.read_inclusion_audit_rows()
 
     if not votes:
         raise StoreError(f"run directory '{store.root}' has no stored votes to assemble from")
@@ -559,16 +1166,33 @@ def assemble_validation_record(
     correlations = pairwise_fn_correlation(predictions_by_vendor, ordered_truths)
     record.error_correlation = ErrorCorrelation(
         pairwise_fn_on_relevant={
-            key: result.correlation
+            key: PairwiseFnCorrelation(
+                correlation=result.correlation,
+                n=result.n,
+                both=result.both,
+                only_a=result.only_a,
+                only_b=result.only_b,
+                neither=result.neither,
+            )
             for key, result in correlations.items()
-            if result.correlation is not None
         }
     )
 
     if decisions:
         record.escalation_rate = sum(1 for d in decisions.values() if d.escalate) / len(decisions)
 
-    resolved_labels = _final_labels(decisions, human_labels or {})
+    resolved_labels, unresolved_ids = _final_labels(decisions, human_labels or {})
+    record.unresolved_escalations = len(unresolved_ids)
+    if unresolved_ids and not allow_unresolved_escalations:
+        shown = ", ".join(sorted(unresolved_ids)[:10])
+        more = f" (+{len(unresolved_ids) - 10} more)" if len(unresolved_ids) > 10 else ""
+        raise StoreError(
+            f"{len(unresolved_ids)} escalated decision(s) have no resolved human label: "
+            f"{shown}{more} -- resolve them (e.g. via 'attest adjudicate' and "
+            "human_labels/read_adjudication_records) before validating, or pass "
+            "allow_unresolved_escalations=True to explicitly accept that they will be "
+            "excluded from the confusion matrix, PRISMA counts, and recall's TP"
+        )
     record.prisma.screen_excluded = sum(
         1 for label in resolved_labels.values() if label != RELEVANT_LABEL
     )
@@ -579,33 +1203,77 @@ def assemble_validation_record(
     labeled_audit_rows = [row for row in audit_rows if row.human_label is not None]
     if labeled_audit_rows:
         strata = build_strata(labeled_audit_rows, population_sizes)
-        true_positives = record.confusion["tp"]
-        estimate = stratified_recall(strata, true_positives, confidence=confidence)
         audit_n = sum(s.n for s in strata)
         audited_population = sum(population_sizes.get(s.name, 0) for s in strata)
+
+        labeled_inclusion_rows = [
+            row for row in inclusion_audit_rows if row.human_label is not None
+        ]
+        if labeled_inclusion_rows and inclusion_population_sizes is not None:
+            inclusion_strata = build_inclusion_strata(
+                labeled_inclusion_rows, inclusion_population_sizes
+            )
+            # Passed through unrounded: rounding this would make `point`'s
+            # implied TP silently disagree with the `estimated_true_positives`
+            # reported below it in the same record (see
+            # attest.stats.recall.stratified_recall_with_audited_tp, which
+            # accepts a fractional true_positives for exactly this reason).
+            estimated_tp = sum(estimated_true_positives(s) for s in inclusion_strata)
+            estimate = stratified_recall_with_audited_tp(
+                strata,
+                estimated_tp,
+                inclusion_strata=inclusion_strata,
+                confidence=confidence,
+            )
+            tp_estimation_method = "inclusion_audit"
+            estimated_true_positives_reported: float | None = estimated_tp
+        else:
+            estimate = stratified_recall(strata, record.confusion["tp"], confidence=confidence)
+            tp_estimation_method = "full_review"
+            estimated_true_positives_reported = None
+
         record.recall = Recall(
             point=estimate.point,
             floor=estimate.floor,
+            exact_floor=estimate.exact_floor,
             ci=estimate.ci,
             audit_n=audit_n,
             audit_budget_note=f"{audit_n} of {audited_population} screen-excluded records audited",
+            tp_estimation_method=tp_estimation_method,
+            estimated_true_positives=estimated_true_positives_reported,
         )
 
     return record
 
 
 __all__ = [
-    "CONFIG_FILENAME",
+    "ACTIVE_LEARNING_REVIEWS_FILENAME",
+    "ACTIVE_LEARNING_SELECTIONS_FILENAME",
+    "ADJUDICATION_RECORDS_FILENAME",
+    "AUDIT_DRAW_FILENAME",
     "AUDIT_FILENAME",
+    "AUDIT_LABELS_FILENAME",
     "BATCH_HANDLES_FILENAME",
+    "CHANGELOG_FILENAME",
+    "CONFIDENCE_POLICY_FILENAME",
+    "CONFIG_FILENAME",
     "DECISIONS_FILENAME",
     "EPOCH_FILENAME",
+    "INCLUSION_AUDIT_DRAW_FILENAME",
+    "INCLUSION_AUDIT_FILENAME",
+    "MANIFEST_ARTIFACTS",
+    "MANIFEST_FILENAME",
+    "PROTOCOL_FILENAME",
     "RAW_RESPONSES_FILENAME",
     "RUNS_FILENAME",
+    "SENTINEL_BASELINE_FILENAME",
+    "SENTINEL_EVALUATIONS_FILENAME",
     "TAU_REPORT_FILENAME",
+    "VALIDATION_RECORD_FILENAME",
     "VOTES_FILENAME",
     "RunStore",
     "StoreError",
     "assemble_validation_record",
+    "hash_input_file",
     "load_input",
 ]

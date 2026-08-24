@@ -16,7 +16,11 @@ from attest.contracts.input import Record
 from attest.vendors.base import (
     VendorResponseError,
     check_model_version,
+    chunk_records,
+    compose_batch_system_prompt,
+    compose_batch_user_message,
     compose_system_prompt,
+    parse_batch_response,
     parse_ordinal_response,
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
@@ -35,7 +39,17 @@ class AnthropicRater:
             alias silently resolving to a snapshot other than the one this
             configuration was hashed under (see
             `attest.vendors.base.check_model_version`).
-        temperature: Sampling temperature passed to the Messages API.
+        temperature: Sampling temperature passed to the Messages API, unless
+            `send_temperature` is `False`.
+        send_temperature: When `False`, `temperature` is omitted from the
+            Messages API request entirely instead of being sent. Claude
+            Sonnet 5 (and the rest of the Claude 4.6+ generation) rejects
+            any explicit `temperature`/`top_p`/`top_k` value with HTTP 400 --
+            confirmed against Anthropic's own current model documentation,
+            2026-08-24 -- with no parameter analogous to OpenAI's
+            `reasoning_effort="none"` that re-enables it, so omission is the
+            only way to avoid the error. See
+            `attest.provenance.config.VendorSpec.send_temperature`.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -59,6 +73,7 @@ class AnthropicRater:
     model: str
     model_version: str
     temperature: float
+    send_temperature: bool = True
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -73,6 +88,9 @@ class AnthropicRater:
                 "install it with: pip install 'attest[anthropic]'"
             ) from exc
         return anthropic.Anthropic(api_key=self.api_key)
+
+    def _temperature_kwargs(self) -> dict[str, Any]:
+        return {"temperature": self.temperature} if self.send_temperature else {}
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the Anthropic Messages API.
@@ -91,7 +109,6 @@ class AnthropicRater:
         response = self._client().messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             system=compose_system_prompt(prompt if prompt is not None else self.prompt),
             messages=[
                 {
@@ -99,6 +116,7 @@ class AnthropicRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 }
             ],
+            **self._temperature_kwargs(),
         )
         reported_version = getattr(response, "model", None)
         check_model_version(
@@ -115,8 +133,63 @@ class AnthropicRater:
             "text": text,
             "id": getattr(response, "id", None),
             "model": reported_version,
+            "temperature_applied": self.send_temperature,
         }
         return ordinal, raw_response
+
+    def rate_many(
+        self, records: Sequence[Record], *, prompt: str | None = None
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Rate every record in `records` together, in one Messages API call.
+
+        Packs all of `records` into a single request: the system message
+        uses `compose_batch_system_prompt` (a per-id JSON output contract)
+        instead of `compose_system_prompt`'s single letter, and the user
+        message lists every record by id (`compose_batch_user_message`).
+        Parsed by id via `parse_batch_response`, order-independent.
+
+        Args:
+            records: The records to rate together.
+            prompt: Screening prompt to use, overriding `self.prompt`.
+
+        Returns:
+            One `(ordinal, raw_response)` pair per record in `records`, in order.
+
+        Raises:
+            ModelVersionDriftError: If the response's `model` differs from
+                `self.model_version`.
+            VendorResponseError: If some record has no parseable rating in
+                the response.
+        """
+        record_ids = [record.id for record in records]
+        response = self._client().messages.create(
+            model=self.model,
+            max_tokens=max(self.max_tokens, 16 * len(records)),
+            system=compose_batch_system_prompt(prompt if prompt is not None else self.prompt),
+            messages=[{"role": "user", "content": compose_batch_user_message(records)}],
+            **self._temperature_kwargs(),
+        )
+        reported_version = getattr(response, "model", None)
+        check_model_version(
+            vendor=self.vendor,
+            model=self.model,
+            expected_version=self.model_version,
+            reported_version=reported_version,
+        )
+        text = "".join(
+            block.text for block in response.content if getattr(block, "type", "") == "text"
+        )
+        ratings = parse_batch_response(text, record_ids)
+        raw_response: dict[str, Any] = {
+            "text": text,
+            "id": getattr(response, "id", None),
+            "model": reported_version,
+            "temperature_applied": self.send_temperature,
+        }
+        return [
+            (ratings[record_id], {**raw_response, "record_id": record_id})
+            for record_id in record_ids
+        ]
 
 
 @dataclass
@@ -133,7 +206,11 @@ class AnthropicBatchRater:
             batch result's own `message.model` in `fetch` (see
             `AnthropicRater.model_version` and
             `attest.vendors.base.check_model_version`).
-        temperature: Sampling temperature passed to the Message Batches API.
+        temperature: Sampling temperature passed to the Message Batches API,
+            unless `send_temperature` is `False`.
+        send_temperature: When `False`, `temperature` is omitted from every
+            submitted request's params instead of being sent -- see
+            `AnthropicRater.send_temperature` for why.
         api_key: API key to use; defaults to the SDK's own environment
             lookup (``ANTHROPIC_API_KEY``) when None.
         prompt: Screening criteria text, or None to use the kernel's generic
@@ -149,6 +226,7 @@ class AnthropicBatchRater:
     model: str
     model_version: str
     temperature: float
+    send_temperature: bool = True
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
@@ -165,29 +243,53 @@ class AnthropicBatchRater:
         return anthropic.Anthropic(api_key=self.api_key)
 
     def _request(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
-        return {
-            "custom_id": custom_id,
-            "params": {
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "system": compose_system_prompt(prompt),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"Title: {record.title}\nAbstract: {record.abstract}",
-                    }
-                ],
-            },
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": compose_system_prompt(prompt),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Title: {record.title}\nAbstract: {record.abstract}",
+                }
+            ],
         }
+        if self.send_temperature:
+            params["temperature"] = self.temperature
+        return {"custom_id": custom_id, "params": params}
+
+    def _batch_request(
+        self, records: Sequence[Record], custom_id: str, prompt: str | None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max(self.max_tokens, 16 * len(records)),
+            "system": compose_batch_system_prompt(prompt),
+            "messages": [{"role": "user", "content": compose_batch_user_message(records)}],
+        }
+        if self.send_temperature:
+            params["temperature"] = self.temperature
+        return {"custom_id": custom_id, "params": params}
 
     def submit(
         self,
         records: Sequence[Record],
         ensemble_config_id: str,
         prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
         """Submit `records` as one Anthropic Message Batch.
+
+        At `batch_size == 1`, one batch request per record -- unchanged from
+        before `batch_size` packing existed. At `batch_size > 1`, `records`
+        is grouped by resolved prompt (via `prompts`, preserving order) and
+        split into chunks of at most `batch_size` records; one batch request
+        is submitted per chunk (a singleton chunk still uses the
+        single-record request, byte-identical to the `batch_size == 1`
+        case), and `id_map` maps every record id in a chunk to that chunk's
+        shared `custom_id`, so `fetch` can split the chunk's one result back
+        into per-record votes.
 
         Args:
             records: The records to rate in this batch.
@@ -195,16 +297,31 @@ class AnthropicBatchRater:
                 eventual votes will be stamped with.
             prompts: Mapping of record id to the screening prompt to use for
                 it, overriding `self.prompt`.
+            batch_size: Maximum number of records packed into one request.
 
         Returns:
             A `BatchHandle` identifying the submitted batch.
         """
         prompts = prompts or {}
-        id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
-        requests = [
-            self._request(record, id_map[record.id], prompts.get(record.id, self.prompt))
-            for record in records
-        ]
+        if batch_size <= 1:
+            id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
+            requests = [
+                self._request(record, id_map[record.id], prompts.get(record.id, self.prompt))
+                for record in records
+            ]
+        else:
+            chunks = chunk_records(records, lambda r: prompts.get(r.id), batch_size)
+            id_map = {}
+            requests = []
+            for i, chunk in enumerate(chunks):
+                custom_id = f"item-{i}"
+                for record in chunk:
+                    id_map[record.id] = custom_id
+                chunk_prompt = prompts.get(chunk[0].id, self.prompt)
+                if len(chunk) == 1:
+                    requests.append(self._request(chunk[0], custom_id, chunk_prompt))
+                else:
+                    requests.append(self._batch_request(chunk, custom_id, chunk_prompt))
         batch = self._client().messages.batches.create(requests=requests)
         return BatchHandle(
             vendor=self.vendor,
@@ -223,10 +340,18 @@ class AnthropicBatchRater:
         return "pending"
 
     def fetch(self, handle: BatchHandle) -> dict[str, tuple[int, Any]]:
-        """Retrieve and parse this batch's per-record results.
+        """Retrieve and parse this batch's per-chunk results.
 
-        A record whose result did not succeed, or whose text does not parse
-        as an ordinal rating, is simply absent from the returned mapping.
+        A record whose result did not succeed is simply absent from the
+        returned mapping, as is every record in a chunk (see `submit`)
+        whose result's text does not parse: for a singleton chunk that is
+        one record's unparseable single-letter reply (mirroring the
+        pre-`batch_size` per-record behavior); for a multi-record chunk,
+        `parse_batch_response` requires a rating for every record the
+        result covers, so if any of them is unparseable the whole chunk's
+        records are omitted together -- the vendor gave back one result for
+        the whole chunk, so a failure to make sense of it cannot be
+        attributed to a single record within it.
 
         Raises:
             ModelVersionDriftError: If a succeeded result's `message.model`
@@ -234,11 +359,13 @@ class AnthropicBatchRater:
                 like a parse failure, since it invalidates every result in
                 the batch, not just this record.
         """
-        reverse = {custom_id: record_id for record_id, custom_id in handle.id_map.items()}
+        chunks: dict[str, list[str]] = {}
+        for record_id, custom_id in handle.id_map.items():
+            chunks.setdefault(custom_id, []).append(record_id)
         results: dict[str, tuple[int, Any]] = {}
         for entry in self._client().messages.batches.results(handle.provider_batch_id):
-            record_id = reverse.get(entry.custom_id)
-            if record_id is None or entry.result.type != "succeeded":
+            record_ids = chunks.get(entry.custom_id)
+            if not record_ids or entry.result.type != "succeeded":
                 continue
             reported_version = getattr(entry.result.message, "model", None)
             check_model_version(
@@ -252,12 +379,34 @@ class AnthropicBatchRater:
                 for block in entry.result.message.content
                 if getattr(block, "type", "") == "text"
             )
-            try:
-                ordinal = parse_ordinal_response(text)
-            except VendorResponseError:
-                continue
-            results[record_id] = (
-                ordinal,
-                {"text": text, "custom_id": entry.custom_id, "model": reported_version},
-            )
+            if len(record_ids) == 1:
+                try:
+                    ordinal = parse_ordinal_response(text)
+                except VendorResponseError:
+                    continue
+                results[record_ids[0]] = (
+                    ordinal,
+                    {
+                        "text": text,
+                        "custom_id": entry.custom_id,
+                        "model": reported_version,
+                        "temperature_applied": self.send_temperature,
+                    },
+                )
+            else:
+                try:
+                    ratings = parse_batch_response(text, record_ids)
+                except VendorResponseError:
+                    continue
+                for record_id in record_ids:
+                    results[record_id] = (
+                        ratings[record_id],
+                        {
+                            "text": text,
+                            "custom_id": entry.custom_id,
+                            "model": reported_version,
+                            "record_id": record_id,
+                            "temperature_applied": self.send_temperature,
+                        },
+                    )
         return results

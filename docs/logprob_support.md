@@ -7,7 +7,7 @@ vendor was of its own answer -- complementary to the ensemble's existing
 *between*-vendor dispersion measure (`tau`, in `attest.ensemble.tau`).
 `attest.ensemble.confidence` implements this signal (extraction, the
 coverage-gated median, and tiering; see "Decision" below) and it is wired
-into two of the three planes (`attest.planes`), each reusing the exact same
+into two of the four planes (`attest.planes`), each reusing the exact same
 `record_confidence`/`confidence_tier` figure, never a signal recomputed
 per-plane:
 

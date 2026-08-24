@@ -8,7 +8,7 @@
     },
     "openai": {
       "model": "gpt-5",
-      "model_version": "2026-01",
+      "model_version": "2026-02",
       "prompt_version": "screening-prompt-v1",
       "temperature": 0.0
     },
@@ -28,5 +28,6 @@
   "aggregation": "boundary_dispersion",
   "tau": 1.0,
   "batch_size": 1,
-  "confidence_threshold": 0.5
+  "confidence_threshold": 0.5,
+  "_notes": "Identical to example_config.json except openai.model_version bumped from 2026-01 to 2026-02 -- used by the README's 'attest screen --previous-run-dir' example to demonstrate a second epoch's explicit_config_change changelog event, the same RUN_DIR=data/run_epoch2 convention the runbook uses."
 }

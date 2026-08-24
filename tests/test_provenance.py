@@ -6,7 +6,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from attest.provenance.changelog import ChangeLog
+from attest.provenance.changelog import (
+    CHANGE_TYPE_EXPLICIT,
+    CHANGE_TYPE_INITIAL,
+    CHANGE_TYPE_SENTINEL_DRIFT,
+    ChangeLog,
+    ChangelogError,
+    ConfigChangeEvent,
+    diff_config_fields,
+)
 from attest.provenance.config import Config, VendorSpec, compute_ensemble_config_id
 from attest.provenance.epochs import maybe_open_epoch, open_epoch
 from attest.provenance.runs import RunRecord, start_run
@@ -30,6 +38,101 @@ def _config(tau: float = 0.5, temperature: float = 0.0) -> Config:
         },
         aggregation="majority",
         tau=tau,
+    )
+
+
+@pytest.mark.parametrize("field_name", ["model", "model_version", "prompt_version"])
+def test_vendor_spec_rejects_a_todo_placeholder(field_name: str) -> None:
+    kwargs = {
+        "model": "gpt-4o",
+        "model_version": "2024-08-06",
+        "prompt_version": "v1",
+        "temperature": 0.0,
+    }
+    kwargs[field_name] = "TODO:pin-openai-current-gen-dated-snapshot"
+
+    with pytest.raises(ValueError, match="unresolved placeholder"):
+        VendorSpec(**kwargs)
+
+
+def test_vendor_spec_accepts_a_value_merely_containing_todo() -> None:
+    # Only a literal TODO:-prefix is rejected -- a real value that happens to
+    # contain the substring elsewhere must not false-positive.
+    VendorSpec(model="not-a-TODO:-value", model_version="1", prompt_version="v1", temperature=0.0)
+
+
+def test_vendor_spec_to_dict_omits_reasoning_effort_and_send_temperature_at_default() -> None:
+    payload = VendorSpec(
+        model="gpt-5.6-terra", model_version="v1", prompt_version="p1", temperature=0.0
+    ).to_dict()
+
+    assert "reasoning_effort" not in payload
+    assert "send_temperature" not in payload
+
+
+def test_vendor_spec_to_dict_includes_reasoning_effort_when_set() -> None:
+    payload = VendorSpec(
+        model="gpt-5.6-terra",
+        model_version="v1",
+        prompt_version="p1",
+        temperature=0.0,
+        reasoning_effort="none",
+    ).to_dict()
+
+    assert payload["reasoning_effort"] == "none"
+
+
+def test_vendor_spec_to_dict_includes_send_temperature_when_false() -> None:
+    payload = VendorSpec(
+        model="claude-sonnet-5",
+        model_version="v1",
+        prompt_version="p1",
+        temperature=0.0,
+        send_temperature=False,
+    ).to_dict()
+
+    assert payload["send_temperature"] is False
+
+
+def test_reasoning_effort_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_reasoning_effort = Config(
+        vendors={
+            **base.vendors,
+            "openai": VendorSpec(
+                model=base.vendors["openai"].model,
+                model_version=base.vendors["openai"].model_version,
+                prompt_version=base.vendors["openai"].prompt_version,
+                temperature=base.vendors["openai"].temperature,
+                reasoning_effort="none",
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_reasoning_effort)
+
+
+def test_send_temperature_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_send_temperature_false = Config(
+        vendors={
+            **base.vendors,
+            "anthropic": VendorSpec(
+                model=base.vendors["anthropic"].model,
+                model_version=base.vendors["anthropic"].model_version,
+                prompt_version=base.vendors["anthropic"].prompt_version,
+                temperature=base.vendors["anthropic"].temperature,
+                send_temperature=False,
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(
+        with_send_temperature_false
     )
 
 
@@ -175,7 +278,17 @@ def test_config_hash_pinned_for_default_config_unaffected_by_zero_policy() -> No
     # added: every vendor now carries a `temperature`, always included in
     # `VendorSpec.to_dict()` (unconditionally, like `model_version` and
     # `prompt_version`), so it is unconditionally hash-sensitive too.
-    pinned_hash = "42b98574e686a64465726f31c3f84f893658fbd4d5085f4bcba354261a84edbc"
+    #
+    # Retired and recomputed a third time when `Config.batch_size` was
+    # added: it is unconditionally included in `to_dict()`, on par with
+    # `vendors`/`aggregation`/`tau`/`x` (see `Config.batch_size`), so even a
+    # config built before the field existed -- picking up its `0` default --
+    # now hashes differently.
+    # Retired and recomputed a fourth time when `Config.batch_size`'s default
+    # changed from `0` (a placeholder, always checked against the corpus size
+    # rather than applied) to `1` (a real one-record-per-request packing
+    # width, applied whether or not a config sets it).
+    pinned_hash = "8b47c9b35df524fb1772e65d7549fb0347412594f6805a859c83d8840158a97b"
 
     assert compute_ensemble_config_id(_config()) == pinned_hash
 
@@ -202,6 +315,65 @@ def test_zero_policy_include_changes_the_ensemble_config_id() -> None:
     )
 
     assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_include)
+
+
+def test_batch_size_is_included_in_config_to_dict() -> None:
+    # Unlike zero_policy/track_prompts/default_prompt, batch_size is never
+    # omitted -- it is `b_e` in the manuscript's C_e tuple (Eq. 1), on par
+    # with vendors/aggregation/tau/x (see Config.batch_size).
+    config = Config(
+        vendors=_config().vendors,
+        aggregation="majority",
+        tau=0.5,
+        batch_size=250,
+    )
+
+    assert config.to_dict()["batch_size"] == 250
+
+
+def test_batch_size_change_opens_a_new_epoch() -> None:
+    base = _config()
+    different_batch_size = Config(
+        vendors=base.vendors,
+        aggregation=base.aggregation,
+        tau=base.tau,
+        batch_size=100,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(different_batch_size)
+
+
+def test_batch_size_defaults_to_one() -> None:
+    # One record per request, this kernel's original behavior -- not the old
+    # placeholder default of 0, which was never actually applied to
+    # anything (see Config.batch_size).
+    config = Config(vendors=_config().vendors, aggregation="majority", tau=0.5)
+
+    assert config.batch_size == 1
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, -100])
+def test_batch_size_below_one_is_rejected_at_construction(batch_size: int) -> None:
+    try:
+        Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=batch_size)
+    except ValueError as exc:
+        assert "batch_size" in str(exc)
+    else:
+        raise AssertionError(f"expected ValueError for batch_size={batch_size}")
+
+
+def test_batch_output_contract_version_included_only_when_batch_size_above_one() -> None:
+    # A batch_size == 1 configuration never composes the multi-record output
+    # contract (see attest.vendors.base.BATCH_OUTPUT_CONTRACT), so its
+    # version must stay out of to_dict()/ensemble_config_id at batch_size ==
+    # 1 -- otherwise every existing batch_size == 1 config's hash would
+    # change out from under it the moment this constant existed.
+    single = Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=1)
+    batched = Config(vendors=_config().vendors, aggregation="majority", tau=0.5, batch_size=2)
+
+    assert "batch_output_contract_version" not in single.to_dict()
+    assert "batch_output_contract_version" in batched.to_dict()
+    assert compute_ensemble_config_id(single) != compute_ensemble_config_id(batched)
 
 
 def test_prompt_for_track_prefers_track_specific_over_default() -> None:
@@ -276,3 +448,132 @@ def test_run_record_round_trips_to_and_from_dict() -> None:
     restored = RunRecord.from_dict(run.to_dict())
 
     assert restored == run
+
+
+# --- changelog: change_type inference, validation, and field diffing -----------
+
+
+def test_record_infers_initial_change_type_when_before_is_none() -> None:
+    log = ChangeLog()
+
+    event = log.record(before=None, after="cfg-1", reason="first configuration")
+
+    assert event.change_type == CHANGE_TYPE_INITIAL
+
+
+def test_record_infers_explicit_change_type_when_before_is_given() -> None:
+    log = ChangeLog()
+
+    event = log.record(before="cfg-1", after="cfg-2", reason="tau raised")
+
+    assert event.change_type == CHANGE_TYPE_EXPLICIT
+
+
+def test_record_accepts_explicit_sentinel_drift_change_type_with_equal_ids() -> None:
+    log = ChangeLog()
+
+    event = log.record(
+        before="cfg-1",
+        after="cfg-1",
+        reason="sentinel drift: vendor v1",
+        change_type=CHANGE_TYPE_SENTINEL_DRIFT,
+    )
+
+    assert event.change_type == CHANGE_TYPE_SENTINEL_DRIFT
+    assert event.before == event.after
+
+
+def test_change_event_rejects_unknown_change_type() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before="cfg-1",
+            after="cfg-2",
+            reason="x",
+            change_type="not_a_real_type",
+        )
+
+
+def test_change_event_rejects_initial_with_non_none_before() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before="cfg-1",
+            after="cfg-2",
+            reason="x",
+            change_type=CHANGE_TYPE_INITIAL,
+        )
+
+
+def test_change_event_rejects_non_initial_with_none_before() -> None:
+    with pytest.raises(ChangelogError):
+        ConfigChangeEvent(
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            before=None,
+            after="cfg-2",
+            reason="x",
+            change_type=CHANGE_TYPE_EXPLICIT,
+        )
+
+
+def test_change_event_round_trips_with_changed_fields_and_approver() -> None:
+    event = ConfigChangeEvent(
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        before="cfg-1",
+        after="cfg-2",
+        reason="model version bumped",
+        change_type=CHANGE_TYPE_EXPLICIT,
+        changed_fields=("vendors.openai.model_version",),
+        approver="reviewer-42",
+    )
+
+    restored = ConfigChangeEvent.from_dict(event.to_dict())
+
+    assert restored == event
+
+
+def test_changelog_to_list_and_from_list_round_trip() -> None:
+    log = ChangeLog()
+    log.record(before=None, after="cfg-1", reason="initial")
+    log.record(before="cfg-1", after="cfg-2", reason="tau raised")
+
+    restored = ChangeLog.from_list(log.to_list())
+
+    assert restored == log
+
+
+def test_diff_config_fields_lists_only_changed_dot_paths() -> None:
+    base = _config(tau=0.5)
+    changed = _config(tau=0.6)
+
+    diff = diff_config_fields(base, changed)
+
+    assert diff == ["tau"]
+
+
+def test_diff_config_fields_detects_nested_vendor_field_change() -> None:
+    base = _config()
+    changed = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-4o", model_version="2025-01-01", prompt_version="v1", temperature=0.0
+            ),
+            "anthropic": base.vendors["anthropic"],
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    diff = diff_config_fields(base, changed)
+
+    assert diff == ["vendors.openai.model_version"]
+
+
+def test_diff_config_fields_reports_every_field_when_before_is_none() -> None:
+    config = _config()
+
+    diff = diff_config_fields(None, config)
+
+    assert "tau" in diff
+    assert "aggregation" in diff
+    assert any(key.startswith("vendors.") for key in diff)

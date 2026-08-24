@@ -6,19 +6,46 @@ escalated record -- it replaces the absent ensemble auto-label outright,
 never blends with it. A record that did not escalate is never routed here:
 it keeps the ensemble's auto-label as-is, since resolving it would be
 adjudicating a disagreement that never occurred.
+
+Each item also carries reviewer/selection provenance -- why it escalated
+(`selection_reason`), and (once resolved) who resolved it, when, and under
+which adjudication protocol version (`attest.provenance.protocol.AdjudicationProtocol`).
+This is provenance only: no automated prompt tuning or retraining reads it.
+It exists so a human review that leads to a deliberate config change can be
+traced back to the specific reviewer/record that motivated it (see
+`attest.provenance.changelog.ConfigChangeEvent.approver`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 
 from attest.ensemble.aggregate import Decision
 from attest.ensemble.votes import VALID_RATINGS
 from attest.planes import PLANE_ADJUDICATION
 
+SELECTION_REASON_BOUNDARY = "boundary"
+SELECTION_REASON_DISPERSION = "dispersion"
+SELECTION_REASON_TIE = "tie"
+
 
 class AdjudicationError(ValueError):
     """Raised when adjudication routing or resolution violates the plane's invariants."""
+
+
+def escalation_reason(decision: Decision) -> str:
+    """Describe which condition of `attest.ensemble.aggregate.g` caused escalation.
+
+    Boundary is checked first: a vote vector can be both boundary-split and
+    high-dispersion, and the boundary split is the more specific, more
+    actionable fact for a reviewer to see first.
+    """
+    if decision.boundary:
+        return SELECTION_REASON_BOUNDARY
+    if decision.dispersion > 0:
+        return SELECTION_REASON_DISPERSION
+    return SELECTION_REASON_TIE
 
 
 @dataclass(frozen=True)
@@ -30,7 +57,17 @@ class AdjudicationItem:
         ensemble_config_id: Ensemble configuration in force when it escalated.
         dispersion: The vote vector's dispersion at the time of escalation.
         boundary: Whether the vote vector straddled the exclude/include boundary.
+        selection_reason: Why this record escalated -- one of
+            `SELECTION_REASON_BOUNDARY`, `SELECTION_REASON_DISPERSION`, or
+            `SELECTION_REASON_TIE` (a mean-zero, non-boundary vote vector
+            under `zero_policy="escalate"`; see `attest.ensemble.aggregate`).
         human_label: The authoritative human ordinal label, or None while pending.
+        reviewer: Id or pseudonym of the human who resolved this item, or
+            None while pending.
+        resolved_at: When this item was resolved, or None while pending.
+        protocol_id: Id of the `attest.provenance.protocol.AdjudicationProtocol`
+            in force when this item was resolved, or None while pending or
+            when no protocol was recorded.
         plane: Fixed to `PLANE_ADJUDICATION`.
     """
 
@@ -38,7 +75,11 @@ class AdjudicationItem:
     ensemble_config_id: str
     dispersion: float
     boundary: bool
+    selection_reason: str = SELECTION_REASON_TIE
     human_label: int | None = None
+    reviewer: str | None = None
+    resolved_at: datetime | None = None
+    protocol_id: str | None = None
     plane: str = field(default=PLANE_ADJUDICATION, init=False)
 
     @property
@@ -80,16 +121,31 @@ class AdjudicationQueue:
             ensemble_config_id=ensemble_config_id,
             dispersion=decision.dispersion,
             boundary=decision.boundary,
+            selection_reason=escalation_reason(decision),
         )
         self.items[record_id] = item
         return item
 
-    def resolve(self, record_id: str, human_label: int) -> AdjudicationItem:
+    def resolve(
+        self,
+        record_id: str,
+        human_label: int,
+        *,
+        reviewer: str | None = None,
+        protocol_id: str | None = None,
+        resolved_at: datetime | None = None,
+    ) -> AdjudicationItem:
         """Resolve a queued item with the authoritative human ordinal label.
 
         Args:
             record_id: Id of a record previously enqueued.
             human_label: The human adjudicator's ordinal label: -1, 0, or +1.
+            reviewer: Id or pseudonym of the resolving reviewer, for
+                provenance. Optional -- attest never requires reviewer
+                identity to function, only records it when supplied.
+            protocol_id: Id of the `attest.provenance.protocol.AdjudicationProtocol`
+                in force, for provenance.
+            resolved_at: When this resolution occurred; defaults to now (UTC).
 
         Returns:
             The resolved `AdjudicationItem`, with `human_label` now authoritative.
@@ -105,7 +161,13 @@ class AdjudicationQueue:
                 f"record '{record_id}': human_label must be one of {VALID_RATINGS}, "
                 f"got {human_label}"
             )
-        resolved = replace(self.items[record_id], human_label=human_label)
+        resolved = replace(
+            self.items[record_id],
+            human_label=human_label,
+            reviewer=reviewer,
+            protocol_id=protocol_id,
+            resolved_at=resolved_at or datetime.now(UTC),
+        )
         self.items[record_id] = resolved
         return resolved
 

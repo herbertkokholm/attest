@@ -34,7 +34,7 @@ from attest.contracts.input import Record
 from attest.ensemble.votes import Vote, VoteVector
 from attest.io.store import RunStore
 from attest.provenance.config import Config, compute_ensemble_config_id
-from attest.vendors.base import DeterministicRater, EnsembleRun
+from attest.vendors.base import DeterministicRater, EnsembleRun, chunk_records
 
 BatchStatus = Literal["pending", "completed", "failed"]
 
@@ -134,6 +134,8 @@ class BatchRater(Protocol):
         records: Sequence[Record],
         ensemble_config_id: str,
         prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
         """Submit `records` as one vendor batch job.
 
@@ -147,6 +149,14 @@ class BatchRater(Protocol):
                 uses this rater's own prompt, unchanged -- so existing
                 callers that never pass `prompts` see identical behavior to
                 before this parameter existed.
+            batch_size: Maximum number of records packed into a single
+                submitted request (see `Config.batch_size`). At the default
+                of 1, one request per record -- unchanged from before this
+                parameter existed. A rater that has not yet been converted
+                to true multi-record packing must raise `NotImplementedError`
+                for `batch_size > 1` rather than silently submitting one
+                request per record while the caller's hashed `batch_size`
+                claims more.
 
         Returns:
             A `BatchHandle` identifying the submitted job, ready to persist.
@@ -212,9 +222,31 @@ class DeterministicBatchRater:
         records: Sequence[Record],
         ensemble_config_id: str,
         prompts: Mapping[str, str] | None = None,
+        *,
+        batch_size: int = 1,
     ) -> BatchHandle:
-        """Build a handle covering `records`; the simulated batch is already done."""
-        id_map = {record.id: record.id for record in records}
+        """Build a handle covering `records`; the simulated batch is already done.
+
+        At `batch_size > 1`, `records` is grouped by resolved prompt (via
+        `prompts`, preserving order) and split into chunks of at most
+        `batch_size` records; every record id in a chunk maps to that
+        chunk's shared custom id in `id_map` (instead of the bijective
+        `record.id -> record.id` mapping used at `batch_size == 1`), so
+        `fetch` can recover chunk membership -- and thus each record's chunk
+        peers -- purely from `id_map`, mirroring how a real vendor batch
+        adapter's `id_map` groups a chunk's records under one request id
+        (see `attest.vendors.providers.openai.OpenAIBatchRater.submit`).
+        """
+        prompts = prompts or {}
+        if batch_size <= 1:
+            id_map = {record.id: record.id for record in records}
+        else:
+            chunks = chunk_records(records, lambda r: prompts.get(r.id), batch_size)
+            id_map = {}
+            for i, chunk in enumerate(chunks):
+                custom_id = f"item-{i}"
+                for record in chunk:
+                    id_map[record.id] = custom_id
         provider_batch_id = f"deterministic:{self.vendor}:{self.seed}:{ensemble_config_id}"
         return BatchHandle(
             vendor=self.vendor,
@@ -231,10 +263,18 @@ class DeterministicBatchRater:
         return "completed"
 
     def fetch(self, handle: BatchHandle) -> dict[str, tuple[int, Any]]:
-        """Recompute each record's rating from `handle`'s record ids, this rater's
-        seed, and (if present) the prompt resolved for that record at submit time --
-        reproducing exactly what `DeterministicRater.rate` would have returned
-        synchronously, so batch/sync parity holds under per-track prompts too.
+        """Recompute each record's rating from `handle`'s record ids grouped into
+        their original submit-time chunks, this rater's seed, and (if present)
+        the prompt resolved for that record at submit time -- reproducing
+        exactly what `DeterministicRater.rate`/`rate_many` would have returned
+        synchronously, so batch/sync parity holds under per-track prompts and
+        any `batch_size` (chunk membership makes a chunked record's rating
+        sensitive to its peers -- see `DeterministicRater.rate_many`).
+
+        A chunk in `self.fail_record_ids` still has its rating computed (so
+        its peers' ratings stay correct), but any record id in
+        `fail_record_ids` is dropped from the result afterward, simulating a
+        per-item failure within an otherwise-successful batch.
         """
         rater = DeterministicRater(
             vendor=self.vendor,
@@ -242,12 +282,27 @@ class DeterministicBatchRater:
             seed=self.seed,
             request_logprobs=self.request_logprobs,
         )
+        chunks: dict[str, list[str]] = {}
+        for record_id, custom_id in handle.id_map.items():
+            chunks.setdefault(custom_id, []).append(record_id)
+
         results: dict[str, tuple[int, Any]] = {}
-        for record_id in handle.id_map:
-            if record_id in self.fail_record_ids:
-                continue
-            placeholder = Record(id=record_id, title="", abstract="", track="batch")
-            results[record_id] = rater.rate(placeholder, prompt=handle.prompts.get(record_id))
+        for record_ids in chunks.values():
+            prompt = handle.prompts.get(record_ids[0])
+            placeholders = [
+                Record(id=record_id, title="", abstract="", track="batch")
+                for record_id in record_ids
+            ]
+            if len(placeholders) == 1:
+                pairs = [(record_ids[0], rater.rate(placeholders[0], prompt=prompt))]
+            else:
+                pairs = list(
+                    zip(record_ids, rater.rate_many(placeholders, prompt=prompt), strict=True)
+                )
+            for record_id, ordinal_raw in pairs:
+                if record_id in self.fail_record_ids:
+                    continue
+                results[record_id] = ordinal_raw
         return results
 
 
@@ -269,9 +324,10 @@ def submit_batch(
         records: The records to submit for rating.
         batch_raters: The ensemble members to submit a batch to.
         config: The ensemble configuration in force, used to compute the
-            `ensemble_config_id` every submitted batch is stamped with, and
+            `ensemble_config_id` every submitted batch is stamped with,
             -- via `config.prompt_for_track` -- to resolve each record's
-            screening prompt from its `track`.
+            screening prompt from its `track`, and (`config.batch_size`) to
+            size each vendor's request chunks.
         store: The run directory to persist handles into.
 
     Returns:
@@ -302,7 +358,9 @@ def submit_batch(
                     f"the current configuration's id '{ensemble_config_id}'"
                 )
             continue
-        handle = rater.submit(records, ensemble_config_id, prompts=prompts)
+        handle = rater.submit(
+            records, ensemble_config_id, prompts=prompts, batch_size=config.batch_size
+        )
         store.write_batch_handle(handle.vendor, handle.to_dict())
     return ensemble_config_id
 

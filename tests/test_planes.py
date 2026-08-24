@@ -10,15 +10,42 @@ import pytest
 from attest.ensemble.aggregate import g
 from attest.ensemble.confidence import UNSCORED_TIER
 from attest.ensemble.votes import build_vote_vector
-from attest.planes import PLANE_ACTIVE_LEARNING, PLANE_ADJUDICATION, PLANE_RECALL_AUDIT
+from attest.planes import (
+    PLANE_ACTIVE_LEARNING,
+    PLANE_ADJUDICATION,
+    PLANE_INCLUSION_AUDIT,
+    PLANE_RECALL_AUDIT,
+)
 from attest.planes.active_learning import (
+    SELECTION_REASON_BOUNDARY,
+    SELECTION_REASON_DISPERSION,
+    SELECTION_REASON_LOW_CONFIDENCE,
     ActiveLearningError,
+    review_selection,
     select_for_review,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_BOUNDARY as ADJ_SELECTION_REASON_BOUNDARY,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_DISPERSION as ADJ_SELECTION_REASON_DISPERSION,
+)
+from attest.planes.adjudication import (
+    SELECTION_REASON_TIE as ADJ_SELECTION_REASON_TIE,
 )
 from attest.planes.adjudication import (
     AdjudicationError,
     AdjudicationQueue,
     final_label,
+)
+from attest.planes.inclusion_audit import (
+    STATUS_ESCALATED,
+    STATUS_INCLUDED,
+    IncludedRecord,
+    InclusionAuditRow,
+    build_inclusion_strata,
+    draw_inclusion_audit_sample,
+    ingest_inclusion_audit_labels,
 )
 from attest.planes.recall_audit import (
     AuditError,
@@ -27,8 +54,9 @@ from attest.planes.recall_audit import (
     build_strata,
     draw_audit_sample,
     ingest_audit_labels,
+    population_frame_hash,
 )
-from attest.stats.recall import stratified_recall
+from attest.stats.recall import Stratum, stratified_recall, stratified_recall_with_audited_tp
 
 _CONFIG_ID = "config-abc"
 
@@ -115,6 +143,68 @@ def test_queue_resolve_rejects_invalid_human_label() -> None:
 
     with pytest.raises(AdjudicationError):
         queue.resolve("r8", 7)
+
+
+def test_enqueue_records_boundary_selection_reason() -> None:
+    decision = g(_votes("r9", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+
+    item = queue.enqueue("r9", _CONFIG_ID, decision)
+
+    assert item.selection_reason == ADJ_SELECTION_REASON_BOUNDARY
+
+
+def test_enqueue_records_dispersion_selection_reason() -> None:
+    decision = g(_votes("r10", (-1, 0, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+
+    # (-1, 0, 1) is both boundary and high-dispersion; boundary wins as the
+    # more specific reason (see escalation_reason's docstring).
+    item = queue.enqueue("r10", _CONFIG_ID, decision)
+    assert item.selection_reason == ADJ_SELECTION_REASON_BOUNDARY
+
+    # A pure dispersion escalation with no boundary: three vendors split
+    # (-1, 0, -1) around a non-zero, non-boundary mean under a tight tau.
+    dispersion_only = g(_votes("r10b", (-1, 0, -1)), tau=0.1)
+    assert dispersion_only.boundary is False
+    assert dispersion_only.escalate is True
+    item2 = queue.enqueue("r10b", _CONFIG_ID, dispersion_only)
+    assert item2.selection_reason == ADJ_SELECTION_REASON_DISPERSION
+
+
+def test_enqueue_records_tie_selection_reason_for_mean_zero_escalation() -> None:
+    decision = g(_votes("r11", (0, 0)), tau=0.0)
+    assert decision.boundary is False
+    assert decision.dispersion == 0.0
+    queue = AdjudicationQueue()
+
+    item = queue.enqueue("r11", _CONFIG_ID, decision)
+
+    assert item.selection_reason == ADJ_SELECTION_REASON_TIE
+
+
+def test_resolve_records_reviewer_and_protocol_provenance() -> None:
+    decision = g(_votes("r12", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+    queue.enqueue("r12", _CONFIG_ID, decision)
+
+    resolved = queue.resolve("r12", 1, reviewer="reviewer-a", protocol_id="proto-1")
+
+    assert resolved.reviewer == "reviewer-a"
+    assert resolved.protocol_id == "proto-1"
+    assert resolved.resolved_at is not None
+
+
+def test_resolve_without_reviewer_leaves_provenance_fields_none() -> None:
+    decision = g(_votes("r13", (-1, 1)), tau=0.0)
+    queue = AdjudicationQueue()
+    queue.enqueue("r13", _CONFIG_ID, decision)
+
+    resolved = queue.resolve("r13", 1)
+
+    assert resolved.reviewer is None
+    assert resolved.protocol_id is None
+    assert resolved.resolved_at is not None  # always stamped, even without a reviewer id
 
 
 # --- active_learning.py -------------------------------------------------------
@@ -288,6 +378,48 @@ def test_select_for_review_rejects_confidence_threshold_outside_unit_interval() 
         select_for_review([], confidence_threshold=1.5)
 
 
+def test_selection_reason_reports_boundary_and_dispersion() -> None:
+    votes = [_votes("boundary", (-1, 1)), _votes("dispersion", (-1, 0, 1, 1))]
+
+    selections = select_for_review(votes, dispersion_threshold=0.5)
+
+    by_id = {s.record_id: s for s in selections}
+    assert SELECTION_REASON_BOUNDARY in by_id["boundary"].selection_reason
+    assert SELECTION_REASON_DISPERSION in by_id["dispersion"].selection_reason
+    assert SELECTION_REASON_BOUNDARY in by_id["dispersion"].selection_reason
+
+
+def test_selection_reason_reports_low_confidence_for_unanimous_shaky_record() -> None:
+    votes = [_confidence_votes("shaky", (1, 1, 1))]
+    raw_responses = {
+        "shaky": {
+            "openai": _openai_shaped(math.log(0.4)),
+            "mistral": _openai_shaped(math.log(0.4)),
+            "together": _openai_shaped(math.log(0.4)),
+        }
+    }
+
+    [selection] = select_for_review(votes, dispersion_threshold=0.5, raw_responses=raw_responses)
+
+    assert selection.selection_reason == (SELECTION_REASON_LOW_CONFIDENCE,)
+
+
+def test_review_selection_records_reviewer_provenance() -> None:
+    votes = [_votes("r1", (-1, 1))]
+    [selection] = select_for_review(votes)
+
+    review = review_selection(
+        selection, reviewer="reviewer-a", protocol_id="proto-1", notes="prompt needs clarifying"
+    )
+
+    assert review.record_id == "r1"
+    assert review.reviewer == "reviewer-a"
+    assert review.protocol_id == "proto-1"
+    assert review.notes == "prompt needs clarifying"
+    assert review.selection_reason == selection.selection_reason
+    assert review.plane == PLANE_ACTIVE_LEARNING
+
+
 # --- recall_audit.py: drawing -------------------------------------------------
 
 
@@ -437,6 +569,43 @@ def test_ingest_audit_labels_rejects_invalid_label() -> None:
         ingest_audit_labels(rows, {"r1": 5})
 
 
+def test_ingest_audit_labels_records_reviewer_and_blinded_provenance() -> None:
+    rows = [AuditRow(record_id="r1", stratum="all"), AuditRow(record_id="r2", stratum="all")]
+
+    labeled = ingest_audit_labels(rows, {"r1": 1, "r2": -1}, reviewer="auditor-a", blinded=True)
+
+    assert all(r.reviewer == "auditor-a" for r in labeled)
+    assert all(r.blinded is True for r in labeled)
+
+
+def test_ingest_audit_labels_leaves_reviewer_and_blinded_none_when_not_supplied() -> None:
+    rows = [AuditRow(record_id="r1", stratum="all")]
+
+    labeled = ingest_audit_labels(rows, {"r1": 1})
+
+    assert labeled[0].reviewer is None
+    assert labeled[0].blinded is None
+
+
+# --- recall_audit.py: sampling-frame hash --------------------------------------
+
+
+def test_population_frame_hash_is_order_independent() -> None:
+    population = _population(track_a=5, track_b=5)
+
+    forward = population_frame_hash(population)
+    backward = population_frame_hash(list(reversed(population)))
+
+    assert forward == backward
+
+
+def test_population_frame_hash_changes_with_population_membership() -> None:
+    population = _population(track_a=5, track_b=5)
+    narrowed = population[:-1]
+
+    assert population_frame_hash(population) != population_frame_hash(narrowed)
+
+
 def test_build_strata_produces_counts_usable_by_stats_recall() -> None:
     rows = [AuditRow(record_id=f"r{i}", stratum="all") for i in range(20)]
     labels = {f"r{i}": (1 if i < 3 else -1) for i in range(20)}
@@ -489,3 +658,213 @@ def test_build_strata_refuses_adjudication_items() -> None:
 
     with pytest.raises(AuditError):
         build_strata([resolved], population_sizes={PLANE_ADJUDICATION: 10})
+
+
+# --- inclusion_audit.py: drawing -----------------------------------------------
+
+
+def _included_population(track_a: int, track_b: int) -> list[IncludedRecord]:
+    records = [IncludedRecord(record_id=f"a{i}", track="a") for i in range(track_a)]
+    records += [IncludedRecord(record_id=f"b{i}", track="b") for i in range(track_b)]
+    return records
+
+
+def test_draw_inclusion_audit_sample_draws_exactly_n() -> None:
+    population = _included_population(track_a=8, track_b=2)
+
+    rows = draw_inclusion_audit_sample(population, 5, rng=random.Random(0))
+
+    assert len(rows) == 5
+    assert len({r.record_id for r in rows}) == 5
+    assert all(r.plane == PLANE_INCLUSION_AUDIT for r in rows)
+
+
+def test_draw_inclusion_audit_sample_rejects_non_positive_n() -> None:
+    population = _included_population(track_a=5, track_b=0)
+
+    with pytest.raises(AuditError):
+        draw_inclusion_audit_sample(population, 0, rng=random.Random(0))
+
+
+def test_draw_inclusion_audit_sample_rejects_n_exceeding_population() -> None:
+    population = _included_population(track_a=3, track_b=0)
+
+    with pytest.raises(AuditError):
+        draw_inclusion_audit_sample(population, 4, rng=random.Random(0))
+
+
+def test_draw_inclusion_audit_sample_is_deterministic_with_seeded_rng() -> None:
+    population = _included_population(track_a=10, track_b=10)
+
+    first = draw_inclusion_audit_sample(population, 6, rng=random.Random(42))
+    second = draw_inclusion_audit_sample(population, 6, rng=random.Random(42))
+
+    assert [r.record_id for r in first] == [r.record_id for r in second]
+
+
+def test_stratified_inclusion_draw_respects_strata_sizes() -> None:
+    population = _included_population(track_a=8, track_b=2)
+
+    rows = draw_inclusion_audit_sample(population, 5, stratify_by_track=True, rng=random.Random(0))
+
+    by_stratum: dict[str, int] = {}
+    for row in rows:
+        by_stratum[row.stratum] = by_stratum.get(row.stratum, 0) + 1
+
+    assert by_stratum == {"a": 4, "b": 1}
+
+
+def test_stratified_inclusion_draw_never_exceeds_a_strata_population() -> None:
+    population = _included_population(track_a=3, track_b=97)
+
+    rows = draw_inclusion_audit_sample(
+        population, 100, stratify_by_track=True, rng=random.Random(0)
+    )
+
+    by_stratum: dict[str, int] = {}
+    for row in rows:
+        by_stratum[row.stratum] = by_stratum.get(row.stratum, 0) + 1
+
+    assert by_stratum["a"] <= 3
+    assert by_stratum["b"] <= 97
+    assert sum(by_stratum.values()) == 100
+
+
+def _included_population_by_status(included: int, escalated: int) -> list[IncludedRecord]:
+    records = [
+        IncludedRecord(record_id=f"i{i}", track="a", status=STATUS_INCLUDED)
+        for i in range(included)
+    ]
+    records += [
+        IncludedRecord(record_id=f"e{i}", track="a", status=STATUS_ESCALATED)
+        for i in range(escalated)
+    ]
+    return records
+
+
+def test_included_record_rejects_an_invalid_status() -> None:
+    with pytest.raises(AuditError):
+        IncludedRecord(record_id="r1", track="a", status="not-a-real-status")
+
+
+def test_stratified_inclusion_draw_by_status_respects_strata_sizes() -> None:
+    population = _included_population_by_status(included=8, escalated=2)
+
+    rows = draw_inclusion_audit_sample(population, 5, stratify_by_status=True, rng=random.Random(0))
+
+    by_stratum: dict[str, int] = {}
+    for row in rows:
+        by_stratum[row.stratum] = by_stratum.get(row.stratum, 0) + 1
+
+    assert by_stratum == {STATUS_INCLUDED: 4, STATUS_ESCALATED: 1}
+
+
+def test_draw_inclusion_audit_sample_rejects_track_and_status_stratification_together() -> None:
+    population = _included_population_by_status(included=5, escalated=5)
+
+    with pytest.raises(AuditError):
+        draw_inclusion_audit_sample(
+            population, 3, stratify_by_track=True, stratify_by_status=True, rng=random.Random(0)
+        )
+
+
+# --- inclusion_audit.py: ingestion and the firewall ----------------------------
+
+
+def test_ingest_inclusion_audit_labels_attaches_labels_and_keeps_plane_tag() -> None:
+    rows = [
+        InclusionAuditRow(record_id="r1", stratum="all"),
+        InclusionAuditRow(record_id="r2", stratum="all"),
+    ]
+
+    labeled = ingest_inclusion_audit_labels(rows, {"r1": 1, "r2": -1})
+
+    assert [r.human_label for r in labeled] == [1, -1]
+    assert all(r.plane == PLANE_INCLUSION_AUDIT for r in labeled)
+
+
+def test_ingest_inclusion_audit_labels_rejects_missing_label() -> None:
+    rows = [InclusionAuditRow(record_id="r1", stratum="all")]
+
+    with pytest.raises(AuditError):
+        ingest_inclusion_audit_labels(rows, {})
+
+
+def test_ingest_inclusion_audit_labels_rejects_invalid_label() -> None:
+    rows = [InclusionAuditRow(record_id="r1", stratum="all")]
+
+    with pytest.raises(AuditError):
+        ingest_inclusion_audit_labels(rows, {"r1": 5})
+
+
+def test_ingest_inclusion_audit_labels_records_reviewer_and_blinded_provenance() -> None:
+    rows = [
+        InclusionAuditRow(record_id="r1", stratum="all"),
+        InclusionAuditRow(record_id="r2", stratum="all"),
+    ]
+
+    labeled = ingest_inclusion_audit_labels(
+        rows, {"r1": 1, "r2": -1}, reviewer="auditor-a", blinded=True
+    )
+
+    assert all(r.reviewer == "auditor-a" for r in labeled)
+    assert all(r.blinded is True for r in labeled)
+
+
+def test_build_inclusion_strata_produces_counts_usable_by_stats_recall() -> None:
+    rows = [InclusionAuditRow(record_id=f"r{i}", stratum="all") for i in range(20)]
+    labels = {f"r{i}": (1 if i < 15 else -1) for i in range(20)}
+    labeled = ingest_inclusion_audit_labels(rows, labels)
+
+    strata = build_inclusion_strata(labeled, population_sizes={"all": 200})
+
+    assert len(strata) == 1
+    stratum = strata[0]
+    assert stratum.name == "all"
+    assert stratum.n == 20
+    assert stratum.m == 15
+    assert stratum.population == 200
+
+    # The whole point: strata built here plug straight into stratified_recall_with_audited_tp.
+    exclusion_strata = [
+        # A single, disjoint exclusion-audit stratum, just enough to call the joint function.
+        Stratum(name="excl", n=20, m=0, population=200)
+    ]
+    estimate = stratified_recall_with_audited_tp(
+        exclusion_strata, true_positives=150, inclusion_strata=strata
+    )
+    assert 0.0 <= estimate.exact_floor <= estimate.point <= 1.0
+
+
+def test_build_inclusion_strata_rejects_unlabeled_rows() -> None:
+    rows = [InclusionAuditRow(record_id="r1", stratum="all")]
+
+    with pytest.raises(AuditError):
+        build_inclusion_strata(rows, population_sizes={"all": 10})
+
+
+def test_build_inclusion_strata_rejects_unknown_stratum_population() -> None:
+    rows = ingest_inclusion_audit_labels(
+        [InclusionAuditRow(record_id="r1", stratum="all")], {"r1": 1}
+    )
+
+    with pytest.raises(AuditError):
+        build_inclusion_strata(rows, population_sizes={})
+
+
+def test_build_inclusion_strata_refuses_recall_audit_rows() -> None:
+    # A row from the *other* audit plane must not silently count toward TP.
+    rows = ingest_audit_labels([AuditRow(record_id="r1", stratum="all")], {"r1": -1})
+
+    with pytest.raises(AuditError):
+        build_inclusion_strata(rows, population_sizes={"all": 10})
+
+
+def test_build_strata_refuses_inclusion_audit_rows() -> None:
+    # And symmetrically: an inclusion-audit row must not count toward FN.
+    rows = ingest_inclusion_audit_labels(
+        [InclusionAuditRow(record_id="r1", stratum="all")], {"r1": 1}
+    )
+
+    with pytest.raises(AuditError):
+        build_strata(rows, population_sizes={"all": 10})
