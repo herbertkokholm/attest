@@ -1,8 +1,8 @@
 """Google Gemini adapter for the `Rater` and `BatchRater` protocols.
 
-Requires the `google-generativeai` package, gated behind the
-`attest[google]` extra. The SDK is imported lazily inside `_client`, so this
-module itself imports cleanly without the extra installed.
+Requires the `google-genai` package, gated behind the `attest[google]`
+extra. The SDK is imported lazily inside `_client`, so this module itself
+imports cleanly without the extra installed.
 """
 
 from __future__ import annotations
@@ -24,16 +24,19 @@ from attest.vendors.base import (
 )
 from attest.vendors.batch import BatchHandle, BatchStatus
 
+_BATCH_TERMINAL_STATES = frozenset({"JOB_STATE_SUCCEEDED", "JOB_STATE_PARTIALLY_SUCCEEDED"})
+_BATCH_FAILED_STATES = frozenset({"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"})
+
 
 def _serialize_logprobs(logprobs_result: Any) -> Any:
     """Best-effort plain-data conversion of a Gemini `logprobs_result`.
 
-    The `google-generativeai` SDK's response objects are protobuf-backed,
-    not uniformly pydantic like OpenAI's/Mistral's, so no single method name
-    is guaranteed to exist; this tries the common ones in order and falls
-    back to `str()` rather than raising, since the raw response is retained
-    for audit/debugging only (see `attest.vendors.base.Rater.rate`) and
-    should never block a run.
+    `google-genai`'s response objects are uniformly pydantic, so
+    `model_dump` should always succeed; `to_dict` is tried first only for
+    forward compatibility with SDK versions that might expose it, and
+    `str()` is the last-resort fallback rather than raising, since the raw
+    response is retained for audit/debugging only (see
+    `attest.vendors.base.Rater.rate`) and should never block a run.
     """
     for method_name in ("to_dict", "model_dump"):
         method = getattr(logprobs_result, method_name, None)
@@ -44,7 +47,7 @@ def _serialize_logprobs(logprobs_result: Any) -> Any:
 
 @dataclass
 class GoogleRater:
-    """Rates records with a Google Gemini model via `google-generativeai`.
+    """Rates records with a Google Gemini model via `google-genai`.
 
     Attributes:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
@@ -56,18 +59,19 @@ class GoogleRater:
             `attest.vendors.base.check_model_version`, which every other
             provider's `rate` calls but this one cannot).
         temperature: Sampling temperature passed to `generate_content` via
-            `generation_config`.
+            `config`.
         api_key: API key to use; defaults to the SDK's own environment
-            lookup (``GOOGLE_API_KEY``) when None.
+            lookup (``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``)
+            when None.
         prompt: Screening criteria text, or None to use the kernel's generic
             fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
         max_output_tokens: Maximum tokens to request in the reply.
         request_logprobs: If True, request per-token log probabilities
-            (`response_logprobs`/`logprobs` in `generation_config`) and
-            retain the vendor's own, un-normalized logprob structure in the
-            raw response under `"logprobs"`. Mirrors
+            (`response_logprobs`/`logprobs` in `config`) and retain the
+            vendor's own, un-normalized logprob structure in the raw
+            response under `"logprobs"`. Mirrors
             `attest.vendors.providers.openai.OpenAIRater.request_logprobs`
             -- see there for why this is not a `VendorSpec` field. Support
             is model-family-dependent on Gemini and unverified here; check
@@ -86,17 +90,15 @@ class GoogleRater:
     top_logprobs: int = 5
     vendor: str = field(default="google", init=False)
 
-    def _client(self, prompt: str) -> Any:
+    def _client(self) -> Any:
         try:
-            import google.generativeai as genai
+            from google import genai
         except ImportError as exc:
             raise ImportError(
-                "the 'google-generativeai' package is required to use GoogleRater; "
+                "the 'google-genai' package is required to use GoogleRater; "
                 "install it with: pip install 'attest[google]'"
             ) from exc
-        if self.api_key is not None:
-            genai.configure(api_key=self.api_key)
-        return genai.GenerativeModel(model_name=self.model, system_instruction=prompt)
+        return genai.Client(api_key=self.api_key)
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by calling the Gemini `generate_content` API.
@@ -109,16 +111,18 @@ class GoogleRater:
             The parsed ordinal rating and the raw response payload.
         """
         system_prompt = compose_system_prompt(prompt if prompt is not None else self.prompt)
-        generation_config: dict[str, Any] = {
+        config: dict[str, Any] = {
+            "system_instruction": system_prompt,
             "max_output_tokens": self.max_output_tokens,
             "temperature": self.temperature,
         }
         if self.request_logprobs:
-            generation_config["response_logprobs"] = True
-            generation_config["logprobs"] = self.top_logprobs
-        response = self._client(system_prompt).generate_content(
-            f"Title: {record.title}\nAbstract: {record.abstract}",
-            generation_config=generation_config,
+            config["response_logprobs"] = True
+            config["logprobs"] = self.top_logprobs
+        response = self._client().models.generate_content(
+            model=self.model,
+            contents=f"Title: {record.title}\nAbstract: {record.abstract}",
+            config=config,
         )
         text = response.text
         ordinal = parse_ordinal_response(text)
@@ -154,13 +158,15 @@ class GoogleRater:
         """
         record_ids = [record.id for record in records]
         system_prompt = compose_batch_system_prompt(prompt if prompt is not None else self.prompt)
-        generation_config: dict[str, Any] = {
+        config: dict[str, Any] = {
+            "system_instruction": system_prompt,
             "max_output_tokens": max(self.max_output_tokens, 16 * len(records)),
             "temperature": self.temperature,
         }
-        response = self._client(system_prompt).generate_content(
-            compose_batch_user_message(records),
-            generation_config=generation_config,
+        response = self._client().models.generate_content(
+            model=self.model,
+            contents=compose_batch_user_message(records),
+            config=config,
         )
         text = response.text
         ratings = parse_batch_response(text, record_ids)
@@ -183,9 +189,16 @@ class GoogleBatchRater:
     `generate_content` API `GoogleRater` uses, and -- like the other batch
     adapters -- this class is not exercised against a live API in this
     codebase's tests, only `attest.vendors.batch.DeterministicBatchRater` is.
-    The method names below match `google-generativeai`'s batch job surface
-    as of this writing; adjust `_client`/`submit`/`poll`/`fetch` if an
-    installed SDK version has renamed them.
+    The method names below match `google-genai`'s batch job surface as of
+    this writing; adjust `_client`/`submit`/`poll`/`fetch` if an installed
+    SDK version has renamed them.
+
+    `fetch` correlates each inlined response back to the request that
+    produced it purely by position -- `client.batches.get`'s
+    `dest.inlined_responses` is documented to come back in the same order
+    as the submitted `inlined_requests` -- rather than by any per-request
+    identifier, since inlined batch requests/responses carry only a free-form
+    `metadata` dict with no guaranteed round-trip semantics.
 
     Attributes:
         model: Gemini model identifier (e.g. "gemini-1.5-pro").
@@ -193,10 +206,10 @@ class GoogleBatchRater:
             ensemble configuration's hash/audit trail only -- see
             `GoogleRater.model_version` for why this batch surface cannot be
             checked against a vendor-reported value either.
-        temperature: Sampling temperature passed to each request's
-            `generation_config`.
+        temperature: Sampling temperature passed to each request's `config`.
         api_key: API key to use; defaults to the SDK's own environment
-            lookup (``GOOGLE_API_KEY``) when None.
+            lookup (``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``)
+            when None.
         prompt: Screening criteria text, or None to use the kernel's generic
             fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
             only -- `compose_system_prompt` appends the output contract, so
@@ -224,49 +237,37 @@ class GoogleBatchRater:
 
     def _client(self) -> Any:
         try:
-            import google.generativeai as genai
+            from google import genai
         except ImportError as exc:
             raise ImportError(
-                "the 'google-generativeai' package is required to use GoogleBatchRater; "
+                "the 'google-genai' package is required to use GoogleBatchRater; "
                 "install it with: pip install 'attest[google]'"
             ) from exc
-        if self.api_key is not None:
-            genai.configure(api_key=self.api_key)
-        return genai
+        return genai.Client(api_key=self.api_key)
 
-    def _request(self, record: Record, custom_id: str, prompt: str | None) -> dict[str, Any]:
-        generation_config: dict[str, Any] = {
+    def _request(self, record: Record, prompt: str | None) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "system_instruction": compose_system_prompt(prompt),
             "max_output_tokens": self.max_output_tokens,
             "temperature": self.temperature,
         }
         if self.request_logprobs:
-            generation_config["response_logprobs"] = True
-            generation_config["logprobs"] = self.top_logprobs
+            config["response_logprobs"] = True
+            config["logprobs"] = self.top_logprobs
         return {
-            "key": custom_id,
-            "request": {
-                "contents": [
-                    {"parts": [{"text": f"Title: {record.title}\nAbstract: {record.abstract}"}]}
-                ],
-                "system_instruction": {"parts": [{"text": compose_system_prompt(prompt)}]},
-                "generation_config": generation_config,
-            },
+            "contents": [f"Title: {record.title}\nAbstract: {record.abstract}"],
+            "config": config,
         }
 
-    def _batch_request(
-        self, records: Sequence[Record], custom_id: str, prompt: str | None
-    ) -> dict[str, Any]:
-        generation_config: dict[str, Any] = {
+    def _batch_request(self, records: Sequence[Record], prompt: str | None) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "system_instruction": compose_batch_system_prompt(prompt),
             "max_output_tokens": max(self.max_output_tokens, 16 * len(records)),
             "temperature": self.temperature,
         }
         return {
-            "key": custom_id,
-            "request": {
-                "contents": [{"parts": [{"text": compose_batch_user_message(records)}]}],
-                "system_instruction": {"parts": [{"text": compose_batch_system_prompt(prompt)}]},
-                "generation_config": generation_config,
-            },
+            "contents": [compose_batch_user_message(records)],
+            "config": config,
         }
 
     def submit(
@@ -286,8 +287,8 @@ class GoogleBatchRater:
         inlined request is submitted per chunk (a singleton chunk still uses
         the single-record request, byte-identical to the `batch_size == 1`
         case), and `id_map` maps every record id in a chunk to that chunk's
-        shared `key`, so `fetch` can split the chunk's one response back
-        into per-record votes.
+        shared `key` (in submission order), so `fetch` can zip the job's
+        positionally-ordered responses back against the right records.
 
         Args:
             records: The records to rate in this batch.
@@ -301,12 +302,11 @@ class GoogleBatchRater:
             A `BatchHandle` identifying the submitted batch job.
         """
         prompts = prompts or {}
-        genai = self._client()
+        client = self._client()
         if batch_size <= 1:
             id_map = {record.id: f"item-{i}" for i, record in enumerate(records)}
             requests = [
-                self._request(record, id_map[record.id], prompts.get(record.id, self.prompt))
-                for record in records
+                self._request(record, prompts.get(record.id, self.prompt)) for record in records
             ]
         else:
             chunks = chunk_records(records, lambda r: prompts.get(r.id), batch_size)
@@ -318,10 +318,10 @@ class GoogleBatchRater:
                     id_map[record.id] = custom_id
                 chunk_prompt = prompts.get(chunk[0].id, self.prompt)
                 if len(chunk) == 1:
-                    requests.append(self._request(chunk[0], custom_id, chunk_prompt))
+                    requests.append(self._request(chunk[0], chunk_prompt))
                 else:
-                    requests.append(self._batch_request(chunk, custom_id, chunk_prompt))
-        job = genai.GenerativeModel(model_name=self.model).batches.create(requests=requests)
+                    requests.append(self._batch_request(chunk, chunk_prompt))
+        job = client.batches.create(model=self.model, src=requests)
         return BatchHandle(
             vendor=self.vendor,
             model=self.model,
@@ -333,10 +333,10 @@ class GoogleBatchRater:
 
     def poll(self, handle: BatchHandle) -> BatchStatus:
         """Check the batch job's `state`."""
-        job = self._client().get_batch(handle.provider_batch_id)
-        if job.state == "BATCH_STATE_SUCCEEDED":
+        job = self._client().batches.get(name=handle.provider_batch_id)
+        if job.state in _BATCH_TERMINAL_STATES:
             return "completed"
-        if job.state in ("BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED"):
+        if job.state in _BATCH_FAILED_STATES:
             return "failed"
         return "pending"
 
@@ -352,14 +352,15 @@ class GoogleBatchRater:
         response covers, so if any of them is unparseable the whole chunk's
         records are omitted together.
         """
-        job = self._client().get_batch(handle.provider_batch_id)
+        job = self._client().batches.get(name=handle.provider_batch_id)
         chunks: dict[str, list[str]] = {}
         for record_id, custom_id in handle.id_map.items():
             chunks.setdefault(custom_id, []).append(record_id)
+        inlined_responses = job.dest.inlined_responses if job.dest is not None else None
         results: dict[str, tuple[int, Any]] = {}
-        for entry in job.dest.inlined_responses:
-            record_ids = chunks.get(entry.key)
-            if not record_ids or entry.response is None:
+        for custom_id, entry in zip(chunks.keys(), inlined_responses or (), strict=False):
+            record_ids = chunks[custom_id]
+            if entry.response is None:
                 continue
             text = entry.response.text
             if len(record_ids) == 1:
@@ -367,7 +368,7 @@ class GoogleBatchRater:
                     ordinal = parse_ordinal_response(text)
                 except VendorResponseError:
                     continue
-                raw: dict[str, Any] = {"text": text, "key": entry.key}
+                raw: dict[str, Any] = {"text": text, "key": custom_id}
                 if self.request_logprobs:
                     logprobs_result = getattr(entry.response.candidates[0], "logprobs_result", None)
                     if logprobs_result is not None:
@@ -381,6 +382,6 @@ class GoogleBatchRater:
                 for record_id in record_ids:
                     results[record_id] = (
                         ratings[record_id],
-                        {"text": text, "key": entry.key, "record_id": record_id},
+                        {"text": text, "key": custom_id, "record_id": record_id},
                     )
         return results
