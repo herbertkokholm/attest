@@ -482,6 +482,73 @@ def test_build_raters_send_temperature_defaults_to_true() -> None:
     assert rater.send_temperature is True  # type: ignore[attr-defined]
 
 
+def test_build_raters_forwards_base_url_to_openmodel() -> None:
+    config = Config(
+        vendors={
+            "openmodel": VendorSpec(
+                model="qwen3.5-397b",
+                model_version="qwen3.5-397b",
+                prompt_version="p1",
+                temperature=0.0,
+                base_url="https://inference.alexandra.dk/v1",
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.base_url == "https://inference.alexandra.dk/v1"  # type: ignore[attr-defined]
+
+
+def test_build_raters_openmodel_base_url_defaults_to_local_server() -> None:
+    from attest.vendors.providers.openmodel import DEFAULT_BASE_URL
+
+    config = Config(
+        vendors={
+            "openmodel": VendorSpec(
+                model="local-model", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.base_url == DEFAULT_BASE_URL  # type: ignore[attr-defined]
+
+
+def test_build_raters_resolves_api_key_env_for_openmodel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALEX_API_KEY", "secret-value")
+    config = Config(
+        vendors={
+            "openmodel": VendorSpec(
+                model="qwen3.5-397b",
+                model_version="qwen3.5-397b",
+                prompt_version="p1",
+                temperature=0.0,
+                api_key_env="ALEX_API_KEY",
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.api_key == "secret-value"  # type: ignore[attr-defined]
+
+
+def test_build_raters_openmodel_api_key_defaults_to_none_without_api_key_env() -> None:
+    config = Config(
+        vendors={
+            "openmodel": VendorSpec(
+                model="local-model", model_version="v1", prompt_version="p1", temperature=0.0
+            )
+        }
+    )
+
+    [rater] = build_raters(config)
+
+    assert rater.api_key is None  # type: ignore[attr-defined]
+
+
 def test_openai_batch_rater_request_line_omits_reasoning_effort_by_default() -> None:
     from attest.vendors.providers.openai import OpenAIBatchRater
 

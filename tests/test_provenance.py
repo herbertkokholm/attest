@@ -68,6 +68,8 @@ def test_vendor_spec_to_dict_omits_reasoning_effort_and_send_temperature_at_defa
 
     assert "reasoning_effort" not in payload
     assert "send_temperature" not in payload
+    assert "base_url" not in payload
+    assert "api_key_env" not in payload
 
 
 def test_vendor_spec_to_dict_includes_reasoning_effort_when_set() -> None:
@@ -92,6 +94,72 @@ def test_vendor_spec_to_dict_includes_send_temperature_when_false() -> None:
     ).to_dict()
 
     assert payload["send_temperature"] is False
+
+
+def test_vendor_spec_to_dict_includes_base_url_when_set() -> None:
+    payload = VendorSpec(
+        model="qwen3.5-397b",
+        model_version="qwen3.5-397b",
+        prompt_version="p1",
+        temperature=0.0,
+        base_url="https://inference.alexandra.dk/v1",
+    ).to_dict()
+
+    assert payload["base_url"] == "https://inference.alexandra.dk/v1"
+
+
+def test_vendor_spec_to_dict_never_includes_api_key_env() -> None:
+    # api_key_env names where a secret lives, not a value that changes what
+    # the vendor samples -- it must never become provenance, at any value.
+    payload = VendorSpec(
+        model="qwen3.5-397b",
+        model_version="qwen3.5-397b",
+        prompt_version="p1",
+        temperature=0.0,
+        api_key_env="ALEX_API_KEY",
+    ).to_dict()
+
+    assert "api_key_env" not in payload
+
+
+def test_base_url_changes_the_ensemble_config_id() -> None:
+    base = _config()
+    with_base_url = Config(
+        vendors={
+            **base.vendors,
+            "openai": VendorSpec(
+                model=base.vendors["openai"].model,
+                model_version=base.vendors["openai"].model_version,
+                prompt_version=base.vendors["openai"].prompt_version,
+                temperature=base.vendors["openai"].temperature,
+                base_url="https://inference.alexandra.dk/v1",
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) != compute_ensemble_config_id(with_base_url)
+
+
+def test_api_key_env_does_not_change_the_ensemble_config_id() -> None:
+    base = _config()
+    with_api_key_env = Config(
+        vendors={
+            **base.vendors,
+            "openai": VendorSpec(
+                model=base.vendors["openai"].model,
+                model_version=base.vendors["openai"].model_version,
+                prompt_version=base.vendors["openai"].prompt_version,
+                temperature=base.vendors["openai"].temperature,
+                api_key_env="ALEX_API_KEY",
+            ),
+        },
+        aggregation=base.aggregation,
+        tau=base.tau,
+    )
+
+    assert compute_ensemble_config_id(base) == compute_ensemble_config_id(with_api_key_env)
 
 
 def test_reasoning_effort_changes_the_ensemble_config_id() -> None:

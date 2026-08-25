@@ -12,8 +12,9 @@ than being versioned/hashed metadata the rater never sees.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
 from attest.provenance.config import Config, VendorSpec
 from attest.vendors.base import Rater
@@ -81,12 +82,24 @@ def _build_openmodel(spec: VendorSpec, *, request_logprobs: bool = False) -> Rat
     # OpenModelRater does not yet expose the field -- see
     # AnthropicRater/_build_anthropic for why an unforwarded kwarg here is
     # preferable to a field that may not be honored.
+    #
+    # base_url/api_key_env are the only VendorSpec fields not passed
+    # unconditionally: OpenModelRater.base_url defaults to a local server, so
+    # passing None here (rather than omitting the kwarg) would incorrectly
+    # override that default with the literal value None. api_key_env names
+    # an environment variable -- see VendorSpec.api_key_env for why the key
+    # itself is never stored on the spec.
+    kwargs: dict[str, Any] = {}
+    if spec.base_url is not None:
+        kwargs["base_url"] = spec.base_url
     return OpenModelRater(
         model=spec.model,
         model_version=spec.model_version,
         temperature=spec.temperature,
         send_temperature=spec.send_temperature,
         reasoning_effort=spec.reasoning_effort,
+        api_key=os.environ[spec.api_key_env] if spec.api_key_env else None,
+        **kwargs,
     )
 
 

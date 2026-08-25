@@ -135,9 +135,14 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
         path: Path to a JSON file with "vendors" (mapping of vendor name to
             an object with "model", "model_version", "prompt_version",
             "temperature", and optionally "reasoning_effort" (string,
-            forwarded to OpenAI raters only -- see `VendorSpec.reasoning_effort`)
-            and "send_temperature" (bool, default true, consumed by Anthropic
-            raters only -- see `VendorSpec.send_temperature`)), "aggregation",
+            forwarded to OpenAI and openmodel raters only -- see
+            `VendorSpec.reasoning_effort`), "send_temperature" (bool, default
+            true, consumed by Anthropic and openmodel raters only -- see
+            `VendorSpec.send_temperature`), "base_url" (string, consumed by
+            openmodel raters only -- see `VendorSpec.base_url`), and
+            "api_key_env" (string, name of the environment variable holding
+            the vendor's API key, consumed by openmodel raters only -- see
+            `VendorSpec.api_key_env`)), "aggregation",
             "tau", and optionally "batch_size"
             (int -- the maximum number of records `attest screen` packs into
             one vendor request, see `EnsembleConfig.batch_size`; default 1,
@@ -172,6 +177,8 @@ def _load_ensemble_config(path: Path) -> EnsembleConfig:
             temperature=float(spec["temperature"]),
             reasoning_effort=spec.get("reasoning_effort"),
             send_temperature=bool(spec.get("send_temperature", True)),
+            base_url=spec.get("base_url"),
+            api_key_env=spec.get("api_key_env"),
         )
         for name, spec in payload["vendors"].items()
     }

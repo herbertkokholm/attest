@@ -90,6 +90,34 @@ class VendorSpec:
             provenance (the value that was requested, for a model that
             silently cannot honor it) and other providers still consume it
             directly.
+        base_url: Forwarded to `attest.vendors.providers.openmodel`'s raters
+            as the OpenAI-compatible server to call; ignored by every other
+            provider, whose endpoint is fixed by their own SDK. `None` (the
+            default) leaves `OpenModelRater.base_url` at its own default
+            (a local server), reproducing prior behavior exactly. Unlike
+            `api_key_env`, this is hash-versioned: which server actually
+            answers can mean different weights, quantization, or serving
+            stack behind the same nominal `model` name, exactly the drift
+            `model_version`/`check_model_version` exists to catch -- so
+            pointing `openmodel` at a different `base_url` opens a new
+            epoch. Omitted from `to_dict()` when `None`, so a config that
+            never sets it hashes identically to before this field existed.
+        api_key_env: Name of the environment variable to read this vendor's
+            API key from, forwarded to
+            `attest.vendors.providers.openmodel`'s raters; ignored by every
+            other provider, each of which reads its own fixed env var
+            (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) via its SDK's own
+            default lookup. `openmodel` has no SDK and thus no fixed vendor
+            identity to hang a fixed env var name off of, so the variable
+            name itself is named here instead. Deliberately never included
+            in `to_dict()` -- unlike every other field on this class, it is
+            not provenance: it names where a secret lives, not a value that
+            changes what the vendor samples, and hashing it would open a
+            phantom epoch merely by moving the same key to a differently
+            named variable. The key's actual value is never read into this
+            frozen, JSON-serializable, hash-versioned config -- only looked
+            up from the environment at rater-construction time, the same as
+            every other provider's credential.
     """
 
     model: str
@@ -98,6 +126,8 @@ class VendorSpec:
     temperature: float
     reasoning_effort: str | None = None
     send_temperature: bool = True
+    base_url: str | None = None
+    api_key_env: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -115,10 +145,12 @@ class VendorSpec:
     def to_dict(self) -> dict[str, Any]:
         """Return this vendor spec as a plain dict.
 
-        `reasoning_effort` and `send_temperature` are included only when set
-        to something other than their no-op default (`None` and `True`
-        respectively), so a `VendorSpec` that never touches either hashes
-        identically to one constructed before these fields existed.
+        `reasoning_effort`, `send_temperature`, and `base_url` are included
+        only when set to something other than their no-op default (`None`,
+        `True`, and `None` respectively), so a `VendorSpec` that never
+        touches any of them hashes identically to one constructed before
+        these fields existed. `api_key_env` is never included, at any value
+        -- see its docstring for why it is deliberately not provenance.
         """
         payload: dict[str, Any] = {
             "model": self.model,
@@ -130,6 +162,8 @@ class VendorSpec:
             payload["reasoning_effort"] = self.reasoning_effort
         if self.send_temperature is not True:
             payload["send_temperature"] = self.send_temperature
+        if self.base_url is not None:
+            payload["base_url"] = self.base_url
         return payload
 
 

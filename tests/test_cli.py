@@ -68,6 +68,14 @@ def test_load_ensemble_config_parses_reasoning_effort_and_send_temperature(
                         "prompt_version": "p1",
                         "temperature": 0.0,
                     },
+                    "openmodel": {
+                        "model": "qwen3.5-397b",
+                        "model_version": "qwen3.5-397b",
+                        "prompt_version": "p1",
+                        "temperature": 0.0,
+                        "base_url": "https://inference.alexandra.dk/v1",
+                        "api_key_env": "ALEX_API_KEY",
+                    },
                 },
                 "aggregation": "boundary_dispersion",
                 "tau": 0.5,
@@ -83,6 +91,11 @@ def test_load_ensemble_config_parses_reasoning_effort_and_send_temperature(
     # Unset in the JSON -- must resolve to the no-op defaults, not crash.
     assert config.vendors["mistral"].reasoning_effort is None
     assert config.vendors["mistral"].send_temperature is True
+    assert config.vendors["openmodel"].base_url == "https://inference.alexandra.dk/v1"
+    assert config.vendors["openmodel"].api_key_env == "ALEX_API_KEY"
+    # Unset in the JSON -- must resolve to None, not crash.
+    assert config.vendors["mistral"].base_url is None
+    assert config.vendors["mistral"].api_key_env is None
 
 
 def test_end_to_end_screen_audit_validate(
