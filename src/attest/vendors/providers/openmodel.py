@@ -37,7 +37,15 @@ class OpenModelRater:
             field, so this is checked against it after every call, the same
             way `attest.vendors.providers.openai.OpenAIRater` checks a live
             OpenAI response (see `attest.vendors.base.check_model_version`).
-        temperature: Sampling temperature included in the request payload.
+        temperature: Sampling temperature included in the request payload,
+            unless `send_temperature` is `False`.
+        send_temperature: When `False`, `temperature` is omitted from the
+            request body entirely instead of being sent. Some reasoning
+            models behind an OpenAI-compatible endpoint reject an explicit
+            non-default `temperature` outright, the same way current-generation
+            Claude and some OpenAI models do -- see
+            `attest.vendors.providers.anthropic.AnthropicRater.send_temperature`
+            and `attest.provenance.config.VendorSpec.send_temperature`.
         base_url: Base URL of the OpenAI-compatible server, without the
             trailing `/chat/completions` path.
         api_key: Optional bearer token for the endpoint, if it requires one.
@@ -45,19 +53,48 @@ class OpenModelRater:
             fallback (`attest.vendors.base.SCREENING_TASK_PREAMBLE`). Criteria
             only -- `compose_system_prompt` appends the output contract, so
             this must never itself already contain a copy of it.
-        max_tokens: Maximum tokens to request in the reply.
+        max_tokens: Maximum tokens to request in the reply. Reasoning models
+            behind an OpenAI-compatible endpoint spend part of this budget on
+            a hidden reasoning phase (echoed back, if at all, in a
+            `reasoning_content` field alongside `content`) before ever
+            emitting the actual answer, so a low value tuned for a
+            non-reasoning model can silently starve `content` to empty --
+            confirmed against Alexandra Institute's `qwen3.5-397b` endpoint,
+            2026-08-25, where `content` came back `""` at the previous
+            default of 8.
+        reasoning_effort: Forwarded as the request body's `reasoning_effort`
+            field when not `None`; omitted entirely otherwise, reproducing
+            prior behavior exactly. On the one OpenAI-compatible reasoning
+            model this has been checked against (`qwen3.5-397b` via
+            Alexandra Institute, 2026-08-25), `"none"` disables the hidden
+            reasoning phase outright (cutting completion tokens for a
+            single-letter answer from roughly 950 to 2), while `"low"`,
+            `"medium"`, and `"high"` were all indistinguishable from each
+            other and from omitting the field -- i.e. this endpoint exposes
+            no graduated effort control, only on/off. Whether any given
+            OpenAI-compatible server honors this key at all, and whether it
+            offers real graduation, is a per-deployment empirical question --
+            see `attest.provenance.config.VendorSpec.reasoning_effort`.
         timeout: Request timeout in seconds.
     """
 
     model: str
     model_version: str
     temperature: float
+    send_temperature: bool = True
     base_url: str = DEFAULT_BASE_URL
     api_key: str | None = None
     prompt: str | None = None
     max_tokens: int = 8
+    reasoning_effort: str | None = None
     timeout: float = 30.0
     vendor: str = field(default="openmodel", init=False)
+
+    def _temperature_kwargs(self) -> dict[str, Any]:
+        return {"temperature": self.temperature} if self.send_temperature else {}
+
+    def _reasoning_effort_kwargs(self) -> dict[str, Any]:
+        return {} if self.reasoning_effort is None else {"reasoning_effort": self.reasoning_effort}
 
     def rate(self, record: Record, *, prompt: str | None = None) -> tuple[int, dict[str, Any]]:
         """Rate `record` by POSTing a chat completion request to `base_url`.
@@ -76,7 +113,6 @@ class OpenModelRater:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "messages": [
                 {
                     "role": "system",
@@ -87,6 +123,8 @@ class OpenModelRater:
                     "content": f"Title: {record.title}\nAbstract: {record.abstract}",
                 },
             ],
+            **self._temperature_kwargs(),
+            **self._reasoning_effort_kwargs(),
         }
         headers = {"Content-Type": "application/json"}
         if self.api_key is not None:
@@ -135,7 +173,6 @@ class OpenModelRater:
         payload = {
             "model": self.model,
             "max_tokens": max(self.max_tokens, 16 * len(records)),
-            "temperature": self.temperature,
             "messages": [
                 {
                     "role": "system",
@@ -145,6 +182,8 @@ class OpenModelRater:
                 },
                 {"role": "user", "content": compose_batch_user_message(records)},
             ],
+            **self._temperature_kwargs(),
+            **self._reasoning_effort_kwargs(),
         }
         headers = {"Content-Type": "application/json"}
         if self.api_key is not None:

@@ -82,7 +82,11 @@ def _build_openmodel(spec: VendorSpec, *, request_logprobs: bool = False) -> Rat
     # AnthropicRater/_build_anthropic for why an unforwarded kwarg here is
     # preferable to a field that may not be honored.
     return OpenModelRater(
-        model=spec.model, model_version=spec.model_version, temperature=spec.temperature
+        model=spec.model,
+        model_version=spec.model_version,
+        temperature=spec.temperature,
+        send_temperature=spec.send_temperature,
+        reasoning_effort=spec.reasoning_effort,
     )
 
 

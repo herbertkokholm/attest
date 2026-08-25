@@ -58,9 +58,10 @@ class VendorSpec:
             `ensemble_config_id` and opens a new epoch, the same as a model
             or prompt change would.
         reasoning_effort: Forwarded to `attest.vendors.providers.openai`'s
-            raters as the Chat Completions API's `reasoning_effort`
-            parameter when not `None`; ignored by every other provider.
-            Exists because some current-generation OpenAI models reject an
+            and `attest.vendors.providers.openmodel`'s raters as the Chat
+            Completions API's `reasoning_effort` parameter when not `None`;
+            ignored by every other provider. Exists because some
+            current-generation OpenAI models reject an
             explicit non-default `temperature` outright (HTTP 400) unless
             paired with `reasoning_effort="none"` -- confirmed empirically
             against `gpt-5.6-terra` on 2026-08-24, not assumed from
@@ -72,10 +73,11 @@ class VendorSpec:
             when `None`, so a config that never sets it hashes identically
             to before this field existed.
         send_temperature: When `False`, `attest.vendors.providers.anthropic`'s
-            raters omit `temperature` from the Messages API request entirely
-            instead of sending `self.temperature` and letting the vendor
-            reject it. Exists because Claude Sonnet 5 (and the rest of the
-            Claude 4.6+ generation) returns HTTP 400 on any explicit
+            and `attest.vendors.providers.openmodel`'s raters omit
+            `temperature` from the request entirely instead of sending
+            `self.temperature` and letting the vendor reject it. Exists
+            because Claude Sonnet 5 (and the rest of the Claude 4.6+
+            generation) returns HTTP 400 on any explicit
             `temperature`/`top_p`/`top_k` value -- confirmed against
             Anthropic's own current model documentation, 2026-08-24 -- with
             no parameter analogous to OpenAI's `reasoning_effort="none"` that
