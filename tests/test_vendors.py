@@ -549,6 +549,80 @@ def test_build_raters_openmodel_api_key_defaults_to_none_without_api_key_env() -
     assert rater.api_key is None  # type: ignore[attr-defined]
 
 
+def test_build_raters_rejects_base_url_on_a_vendor_that_does_not_consume_it() -> None:
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                base_url="https://inference.alexandra.dk/v1",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="anthropic.*base_url"):
+        build_raters(config)
+
+
+def test_build_raters_rejects_api_key_env_on_a_vendor_that_does_not_consume_it() -> None:
+    config = Config(
+        vendors={
+            "openai": VendorSpec(
+                model="gpt-5",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                api_key_env="ALEX_API_KEY",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="openai.*api_key_env"):
+        build_raters(config)
+
+
+def test_build_batch_raters_rejects_base_url_on_any_vendor() -> None:
+    config = Config(
+        vendors={
+            "together": VendorSpec(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                base_url="https://inference.alexandra.dk/v1",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="together.*base_url"):
+        build_batch_raters(config)
+
+
+def test_build_raters_allows_base_url_via_a_custom_factories_override() -> None:
+    # A caller-supplied factories override takes on full responsibility for
+    # whatever VendorSpec fields it reads -- the guard must not second-guess it.
+    config = Config(
+        vendors={
+            "anthropic": VendorSpec(
+                model="claude-sonnet-5",
+                model_version="v1",
+                prompt_version="p1",
+                temperature=0.0,
+                base_url="https://inference.alexandra.dk/v1",
+            )
+        }
+    )
+
+    def _custom_factory(spec: VendorSpec, **_: Any) -> DeterministicRater:
+        return DeterministicRater(vendor="anthropic", seed=1)
+
+    [rater] = build_raters(config, factories={"anthropic": _custom_factory})
+
+    assert isinstance(rater, DeterministicRater)
+
+
 def test_openai_batch_rater_request_line_omits_reasoning_effort_by_default() -> None:
     from attest.vendors.providers.openai import OpenAIBatchRater
 

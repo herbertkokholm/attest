@@ -231,6 +231,41 @@ _BATCH_PROVIDER_FACTORIES: dict[str, BatchRaterFactory] = {
 }
 
 
+def _reject_unrouted_connection_fields(
+    vendor: str,
+    spec: VendorSpec,
+    factory: object,
+    builtin: Mapping[str, object],
+    supported_vendors: frozenset[str],
+) -> None:
+    """Raise if `spec.base_url`/`api_key_env` is set but `vendor`'s *built-in*
+    factory does not consume it.
+
+    Only `_build_openmodel` reads these two `VendorSpec` fields; every other
+    built-in factory would silently ignore them, leaving the vendor talking
+    to its own SDK's fixed endpoint and default credential lookup exactly as
+    if they had never been set -- except `base_url` is still hash-versioned
+    (see `VendorSpec.base_url`), so it would open a new `ensemble_config_id`
+    epoch for a change with no actual effect on what was requested.
+
+    Scoped to built-in factories only (`factory is builtin.get(vendor)`): a
+    caller-supplied `factories` override takes on full responsibility for
+    whatever `VendorSpec` fields it chooses to read, the same as it already
+    does for `request_logprobs`.
+    """
+    if spec.base_url is None and spec.api_key_env is None:
+        return
+    if factory is not builtin.get(vendor):
+        return
+    if vendor in supported_vendors:
+        return
+    raise ValueError(
+        f"vendor '{vendor}' has base_url and/or api_key_env set on its VendorSpec, "
+        f"but its built-in factory does not consume them (only {sorted(supported_vendors)} "
+        "do) -- remove the field, or configure this vendor under one of those names instead"
+    )
+
+
 def build_raters(
     config: Config,
     *,
@@ -265,6 +300,10 @@ def build_raters(
     Raises:
         KeyError: If a vendor named in `config.vendors` has no matching
             factory, built-in or supplied via `factories`.
+        ValueError: If a vendor's `VendorSpec` sets `base_url` or
+            `api_key_env` but is routed to a built-in factory other than
+            `openmodel`'s, which would silently ignore them (see
+            `_reject_unrouted_connection_fields`).
     """
     merged: dict[str, RaterFactory] = {
         **_PROVIDER_FACTORIES,
@@ -276,6 +315,9 @@ def build_raters(
         if factory is None:
             known = sorted(merged)
             raise KeyError(f"no rater factory for vendor '{vendor}'; known vendors: {known}")
+        _reject_unrouted_connection_fields(
+            vendor, spec, factory, _PROVIDER_FACTORIES, frozenset({"openmodel"})
+        )
         rater = (
             factory(spec, request_logprobs=request_logprobs) if request_logprobs else factory(spec)
         )
@@ -316,6 +358,9 @@ def build_batch_raters(
             "openmodel", which has no built-in batch adapter since
             self-hosted OpenAI-compatible servers do not generally expose a
             batch endpoint.
+        ValueError: If a vendor's `VendorSpec` sets `base_url` or
+            `api_key_env` and is routed to a built-in batch factory, none of
+            which consume them (see `_reject_unrouted_connection_fields`).
     """
     merged: dict[str, BatchRaterFactory] = {
         **_BATCH_PROVIDER_FACTORIES,
@@ -327,6 +372,9 @@ def build_batch_raters(
         if factory is None:
             known = sorted(merged)
             raise KeyError(f"no batch rater factory for vendor '{vendor}'; known vendors: {known}")
+        _reject_unrouted_connection_fields(
+            vendor, spec, factory, _BATCH_PROVIDER_FACTORIES, frozenset()
+        )
         rater = (
             factory(spec, request_logprobs=request_logprobs) if request_logprobs else factory(spec)
         )
