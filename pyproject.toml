@@ -21,14 +21,14 @@ attest = "attest.cli:main"
 dev = ["ruff", "mypy", "pytest", "pytest-cov"]
 anthropic = ["anthropic>=0.121.0"]
 openai = ["openai>=2.53.0"]
-google = ["google-genai>=1.0.0"]
+google = ["google-genai>=2.20.0"]
 mistral = ["mistralai>=2.9.3"]
 fireworks = ["fireworks-ai>=1.2.9"]
 together = ["together>=2.31.0"]
 all = [
     "anthropic>=0.121.0",
     "openai>=2.53.0",
-    "google-genai>=1.0.0",
+    "google-genai>=2.20.0",
     "mistralai>=2.9.3",
     "fireworks-ai>=1.2.9",
     "together>=2.31.0",
