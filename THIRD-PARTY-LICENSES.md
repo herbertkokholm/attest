@@ -24,10 +24,10 @@ license terms.
 | aiohttp                            | 3.14.5          | Apache-2.0 AND MIT                                 | https://github.com/aio-libs/aiohttp                                                                 |
 | aiosignal                          | 1.4.0           | Apache Software License                            | https://github.com/aio-libs/aiosignal                                                               |
 | annotated-types                    | 0.8.0           | MIT                                                | https://github.com/annotated-types/annotated-types                                                  |
-| anthropic                          | 1.13.0          | MIT License                                        | https://github.com/anthropics/anthropic-sdk-python                                                  |
+| anthropic                          | 1.15.0          | MIT License                                        | https://github.com/anthropics/anthropic-sdk-python                                                  |
 | anyio                              | 4.15.1          | MIT                                                | https://anyio.readthedocs.io/en/stable/versionhistory.html                                          |
 | attrs                              | 26.1.0          | MIT                                                | https://www.attrs.org/en/stable/changelog.html                                                      |
-| certifi                            | 2026.7.22       | Mozilla Public License 2.0 (MPL 2.0)               | https://github.com/certifi/python-certifi                                                           |
+| certifi                            | 2026.10.18      | Mozilla Public License 2.0 (MPL 2.0)               | https://github.com/certifi/python-certifi                                                           |
 | cffi                               | 2.1.1           | MIT-0                                              | https://cffi.readthedocs.io/en/latest/whatsnew.html                                                 |
 | charset-normalizer                 | 3.5.2           | UNKNOWN                                            | https://github.com/jawah/charset_normalizer/blob/master/CHANGELOG.md                                |
 | cryptography                       | 50.0.2          | Apache-2.0 OR BSD-3-Clause                         | https://github.com/pyca/cryptography                                                                |
@@ -37,16 +37,16 @@ license terms.
 | docstring_parser                   | 0.18.0          | MIT License                                        | https://github.com/rr-/docstring_parser                                                             |
 | eval_type_backport                 | 0.4.0           | MIT License                                        | https://github.com/alexmojaki/eval_type_backport                                                    |
 | filelock                           | 3.32.7          | MIT                                                | https://github.com/tox-dev/py-filelock                                                              |
-| fireworks-ai                       | 1.2.22          | Apache Software License                            | https://github.com/fw-ai-external/python-sdk                                                        |
+| fireworks-ai                       | 1.2.27          | Apache Software License                            | https://github.com/fw-ai-external/python-sdk                                                        |
 | frozenlist                         | 1.8.0           | UNKNOWN                                            | https://github.com/aio-libs/frozenlist                                                              |
-| google-auth                        | 2.61.0          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/google-auth                    |
-| google-genai                       | 2.29.0          | Apache-2.0                                         | https://github.com/googleapis/python-genai                                                          |
+| google-auth                        | 2.62.0          | Apache Software License                            | https://github.com/googleapis/google-cloud-python/tree/main/packages/google-auth                    |
+| google-genai                       | 2.31.0          | Apache-2.0                                         | https://github.com/googleapis/python-genai                                                          |
 | h11                                | 0.16.0          | MIT License                                        | https://github.com/python-hyper/h11                                                                 |
 | httpcore                           | 1.0.9           | BSD-3-Clause                                       | https://www.encode.io/httpcore/                                                                     |
-| httpcore2                          | 2.13.1          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
+| httpcore2                          | 2.14.0          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
 | httpx                              | 0.28.1          | BSD License                                        | https://github.com/encode/httpx                                                                     |
 | httpx-aiohttp                      | 0.2.0           | UNKNOWN                                            | https://karpetrosyan.github.io/httpx-aiohttp/                                                       |
-| httpx2                             | 2.13.1          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
+| httpx2                             | 2.14.0          | BSD-3-Clause                                       | https://github.com/pydantic/httpx2                                                                  |
 | idna                               | 3.20            | BSD-3-Clause                                       | https://github.com/kjd/idna                                                                         |
 | jiter                              | 0.17.0          | MIT                                                | https://github.com/pydantic/jiter/                                                                  |
 | jsonpath-python                    | 1.1.6           | MIT License                                        | https://github.com/sean2077/jsonpath-python                                                         |
@@ -56,7 +56,7 @@ license terms.
 | mistralai                          | 3.2.0           | UNKNOWN                                            | https://github.com/mistralai/client-python.git                                                      |
 | multidict                          | 7.1.0           | Apache-2.0                                         | https://github.com/aio-libs/multidict                                                               |
 | numpy                              | 2.4.6           | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | https://numpy.org                                                                                   |
-| openai                             | 3.29.0          | Apache-2.0                                         | https://github.com/openai/openai-python                                                             |
+| openai                             | 3.35.1          | Apache-2.0                                         | https://github.com/openai/openai-python                                                             |
 | opentelemetry-api                  | 1.45.1          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-api                  |
 | opentelemetry-semantic-conventions | 0.66b1          | Apache-2.0                                         | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-semantic-conventions |
 | propcache                          | 0.5.4           | UNKNOWN                                            | https://github.com/aio-libs/propcache                                                               |
@@ -73,8 +73,8 @@ license terms.
 | six                                | 1.17.0          | MIT License                                        | https://github.com/benjaminp/six                                                                    |
 | sniffio                            | 1.3.1           | Apache Software License; MIT License               | https://github.com/python-trio/sniffio                                                              |
 | tenacity                           | 9.1.4           | Apache Software License                            | https://github.com/jd/tenacity                                                                      |
-| together                           | 2.40.0          | Apache Software License                            | https://github.com/togethercomputer/together-py                                                     |
-| truststore                         | 0.10.4          | MIT                                                | https://github.com/sethmlarson/truststore                                                           |
+| together                           | 2.42.0          | Apache Software License                            | https://github.com/togethercomputer/together-py                                                     |
+| truststore                         | 0.10.5          | MIT                                                | https://github.com/sethmlarson/truststore                                                           |
 | types-PyYAML                       | 6.0.12.20260906 | Apache-2.0                                         | https://github.com/python/typeshed                                                                  |
 | typing-inspection                  | 0.4.4           | MIT                                                | https://github.com/pydantic/typing-inspection                                                       |
 | typing_extensions                  | 4.16.0          | PSF-2.0                                            | https://github.com/python/typing_extensions                                                         |
